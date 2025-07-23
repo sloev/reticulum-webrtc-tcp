@@ -1,5 +1,4 @@
 import sodium from 'libsodium-wrappers';
-import { v4 as uuidv4 } from 'uuid';
 
 export class RNS {
   constructor() {
@@ -15,7 +14,8 @@ export class RNS {
     const keypair = sodium.crypto_sign_keypair();
     this.secretKey = keypair.privateKey;
     this.publicKey = keypair.publicKey;
-    this.rid = sodium.crypto_generichash(20, this.publicKey).toString('hex');
+    this.rid = sodium.to_hex(sodium.crypto_generichash(20, this.publicKey));
+    console.log("rns init", this)
   }
 
   setInterface({ sendPacket }) {

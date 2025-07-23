@@ -6,6 +6,7 @@ const log = (txt) => {
 };
 
 const rns = new RNS();
+await rns.ready
 const webrtc = new WebRTCBrowser((from, data) => {
   rns.receivePacket(data, from);
 });
@@ -14,8 +15,8 @@ rns.setInterface({
   sendPacket: (peerId, packet) => webrtc.send(peerId, packet)
 });
 
-document.getElementById('rid').textContent = rns.rid;
-
+document.getElementById('rid').textContent = `${rns.rid}`;
+console.log(document.getElementById('rid'), rns.rid)
 rns.onReceive = (from, data) => {
   const msg = new TextDecoder().decode(data);
   log(`From ${from.slice(0, 6)}...: ${msg}`);
