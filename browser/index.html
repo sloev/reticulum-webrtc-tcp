@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Reticulum Mesh</title>
+  <style>
+    body { font-family: sans-serif; padding: 1em; }
+    textarea { width: 100%; height: 80px; }
+  </style>
+</head>
+<body>
+  <h1>Reticulum WebRTC Mesh</h1>
+  <p>Your RID: <span id="rid"></span></p>
+  <textarea id="log" readonly></textarea><br/>
+  <input id="dest" placeholder="Destination RID" />
+  <input id="msg" placeholder="Message" />
+  <button onclick="send()">Send</button>
+  <script type="module" src="./main.js"></script>
+</body>
+</html>
