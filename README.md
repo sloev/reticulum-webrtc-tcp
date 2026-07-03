@@ -44,8 +44,9 @@ None of this has been checked for byte-level compatibility with the reference Re
 
 `shared/webrtc-rns-interface.js` defines an `Interface` whose `sendData` writes to every open `RTCDataChannel` and whose received bytes are handed back into the `Reticulum` router. `browser/webrtc-browser.js` and `node/webrtc-node.js` extend it with the connection setup logic:
 
-- Peers discover each other by publishing a Nostr `kind 30000` parameterized-replaceable event tagged `reticulum-webrtc-mesh` every 60 seconds (`shared/nostr-signaling.js`), and connect to `wss://relay.damus.io` and `wss://nos.lol` by default.
-- WebRTC offers, answers, and ICE candidates are exchanged as NIP-04 encrypted direct messages (`kind 4`) addressed by Nostr public key.
+- Peers discover each other by publishing a Nostr `kind 30000` parameterized-replaceable event tagged `reticulum-webrtc-mesh` every 60 seconds (`shared/nostr-signaling.js`), and connect to four public relays by default (`wss://relay.damus.io`, `wss://nos.lol`, `wss://relay.nostr.band`, `wss://nostr.mom`).
+- WebRTC offers and answers are exchanged as NIP-04 encrypted direct messages (`kind 4`) addressed by Nostr public key, with each side waiting (up to 3s) for local ICE candidate gathering before sending — one message per offer/answer instead of one per ICE candidate, since some public relays rate-limit high-frequency publishing from a single key.
+- `RTCPeerConnection` is configured with a public STUN server (`stun:stun.l.google.com:19302`) so peers behind NAT can discover a reachable address for each other; there is no TURN server, so peers behind strict/symmetric NATs may still fail to connect directly.
 - Offer collisions between two peers connecting simultaneously are resolved with the "polite/impolite" perfect-negotiation pattern, decided by comparing Nostr public keys.
 - Each peer caps itself to `k = 4` simultaneous outgoing connections, so the mesh stays sparse rather than fully connected.
 
@@ -110,7 +111,7 @@ In short: this is a self-contained protocol subset for peers running this codeba
 - No compatibility guarantee with the reference Reticulum implementation's wire format, even for the parts it does implement — this stack has only been verified end-to-end against itself.
 - No multi-hop transport or path finding; reachability depends entirely on the local sparse-mesh topology (`k = 4`) actually connecting two peers, directly or via a bridging interface like the TCP gateway.
 - Identities, the announce/identity cache, and links are in-memory only and are lost on restart.
-- Signaling depends on two public Nostr relays by default; relay operators can observe connection metadata (who is signaling whom, and when) even though offer/answer/ICE payloads are NIP-04 encrypted.
+- Signaling depends on public Nostr relays; relay operators can observe connection metadata (who is signaling whom, and when) even though offer/answer payloads are NIP-04 encrypted, and any of them may still rate-limit a busy key.
 - `node-datachannel` (used for `RTCPeerConnection` in Node) ships prebuilt native binaries per platform; if none is available for your platform/Node version, `npm install` needs to build it from source.
 - The browser UI in `browser/` is a minimal demo for exercising the stack, not a finished chat client.
 

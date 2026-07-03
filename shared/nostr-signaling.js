@@ -1,7 +1,7 @@
 import { SimplePool, generateSecretKey, getPublicKey, finalizeEvent, nip04 } from 'nostr-tools';
 
 export class NostrSignaling {
-    constructor(relays = ['wss://relay.damus.io', 'wss://nos.lol']) {
+    constructor(relays = ['wss://relay.damus.io', 'wss://nos.lol', 'wss://relay.nostr.band', 'wss://nostr.mom']) {
         this.relays = relays;
         this.pool = new SimplePool();
         this.secretKey = generateSecretKey();
@@ -54,6 +54,15 @@ export class NostrSignaling {
         setInterval(() => this.announce(), 60000);
     }
 
+    // pool.publish() returns one promise per relay; a relay rejecting (e.g. rate
+    // limiting) must not become an unhandled rejection as long as at least one
+    // relay accepts the event.
+    _publish(signedEvent) {
+        for (const result of this.pool.publish(this.relays, signedEvent)) {
+            result.catch((e) => console.warn('[NostrSignaling] Relay rejected event:', e?.message || e));
+        }
+    }
+
     async announce() {
         const event = {
             kind: 30000,
@@ -65,7 +74,7 @@ export class NostrSignaling {
             content: '',
         };
         const signedEvent = finalizeEvent(event, this.secretKey);
-        this.pool.publish(this.relays, signedEvent);
+        this._publish(signedEvent);
     }
 
     async send(toPubkey, msg) {
@@ -77,6 +86,6 @@ export class NostrSignaling {
             content: encrypted,
         };
         const signedEvent = finalizeEvent(event, this.secretKey);
-        this.pool.publish(this.relays, signedEvent);
+        this._publish(signedEvent);
     }
 }
