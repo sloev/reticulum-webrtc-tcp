@@ -164,6 +164,10 @@ export function message_decrypt(packet, receiver_pub, ratchets) {
   return null;
 }
 
+// Mimics LXMF's basic envelope shape (source hash, signature, msgpacked
+// [timestamp, title, content, fields]) only. No propagation-node protocol, no
+// proof-of-work propagation stamp, no compression/node-sync negotiation — not
+// wire-compatible with real LXMF or accepted by official LXMF clients/nodes.
 export function lxmf_build(content, source_priv, destination_hash, source_hash, timestamp, title) {
     timestamp = timestamp || Date.now() / 1000;
     title = title || new Uint8Array(0);

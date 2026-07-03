@@ -3,7 +3,7 @@
 A JavaScript reimplementation of a subset of the [Reticulum Network Stack](https://reticulum.network/) (RNS) wire protocol, using WebRTC data channels as the peer-to-peer transport and public [Nostr](https://nostr.com/) 
 relays for connection signaling. Peers run in the browser or in Node.js and form a sparse mesh; a TCP gateway on the Node.js side bridges raw TCP connections into the mesh.
 
-This is a from-scratch implementation, not a port of or a wrapper around the reference [`rns`](https://github.com/markqvist/Reticulum) Python implementation. See [Known limitations](#known-limitations) before relying on it for anything.
+This is a from-scratch implementation, not a port of or a wrapper around the reference [`rns`](https://github.com/markqvist/Reticulum) Python implementation, and it is **not compliant with Reticulum v1.0+ or with LXMF**. It does not interoperate with the official Reticulum network, with official LXMF clients (Sideband, NomadNet), or with LXMF propagation nodes — it only talks to other peers running this exact codebase. See [Compliance](#compliance) and [Known limitations](#known-limitations) before relying on it for anything.
 
 **Live demo:** https://sloev.github.io/reticulum-webrtc-tcp/ — the browser peer, built and deployed straight from `browser/` (see [Deploying the demo](#deploying-the-demo)). Open it in two tabs (or send someone the link) to form a mesh link over public Nostr relays and exchange messages.
 
@@ -36,7 +36,7 @@ Implements enough of Reticulum's wire format to interoperate between the peers i
 - Announces: Ed25519-signed packets that broadcast an identity's public key and X25519 ratchet key; peers cache these to know who they can talk to.
 - Single-destination data: X25519 ECDH with the announced ratchet key, HKDF-derived AES-CBC key + HMAC-SHA256 authentication.
 - Links: an ephemeral X25519 handshake (link request/proof) followed by per-link AES-CBC + HMAC encrypted data packets.
-- A minimal LXMF-style message envelope (msgpack-encoded `[timestamp, title, content, fields]`, Ed25519-signed).
+- A minimal LXMF-style message envelope (msgpack-encoded `[timestamp, title, content, fields]`, Ed25519-signed) — this mimics LXMF's basic header shape only; see [Compliance](#compliance).
 
 None of this has been checked for byte-level compatibility with the reference Reticulum implementation — treat it as protocol-compatible in spirit only, verified against itself.
 
@@ -95,9 +95,19 @@ No local signaling server is needed — signaling happens over the public Nostr 
 
 One-time setup for a fork or new repo: in **Settings → Pages**, set **Source** to **GitHub Actions**. After that, pushes to `main` deploy automatically.
 
+## Compliance
+
+This project is **not compliant with Reticulum v1.0+ or with LXMF**, and cannot join or exchange traffic with the official Reticulum/LXMF network. Specifically:
+
+- Reticulum v1.0+ requires full persistent link-state management (path requests, transport tables, multi-hop routing) and a complete encrypted tunneling implementation. This stack only exchanges announces and single-hop data/link packets directly between interfaces on one local peer — there is no transport layer, no path requests, and no multi-hop routing (see [Routing](#routing)).
+- The `lxmf_build`/`lxmf_parse` functions in `shared/rns/protocol.js` produce an envelope that mimics LXMF's basic header shape (source hash, signature, msgpacked `[timestamp, title, content, fields]`) but do **not** implement the real LXMF protocol: no propagation-node protocol, no proof-of-work propagation stamps (required by LXMF v0.9.x+ before propagation nodes will route a message), and no compression or node-syncing negotiation.
+- Because of the above, a message produced by this stack sent to an official LXMF client (Sideband, NomadNet) or propagation node would be rejected as malformed — it is missing required fields and proofs those implementations expect.
+
+In short: this is a self-contained protocol subset for peers running this codebase to talk to each other, modeled on Reticulum/LXMF's shapes and cryptographic primitives, not an implementation of either protocol.
+
 ## Known limitations
 
-- No compatibility guarantee with the reference Reticulum implementation's wire format — this stack has only been verified end-to-end against itself.
+- No compatibility guarantee with the reference Reticulum implementation's wire format, even for the parts it does implement — this stack has only been verified end-to-end against itself.
 - No multi-hop transport or path finding; reachability depends entirely on the local sparse-mesh topology (`k = 4`) actually connecting two peers, directly or via a bridging interface like the TCP gateway.
 - Identities, the announce/identity cache, and links are in-memory only and are lost on restart.
 - Signaling depends on two public Nostr relays by default; relay operators can observe connection metadata (who is signaling whom, and when) even though offer/answer/ICE payloads are NIP-04 encrypted.
