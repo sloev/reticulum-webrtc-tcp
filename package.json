@@ -1,7 +1,7 @@
 {
-  "name": "reticulum-demo",
+  "name": "reticulum-webrtc-tcp",
   "version": "1.0.0",
-  "description": "Sparse WebRTC mesh for Reticulum with TCP gateway",
+  "description": "Reticulum Network Stack (RNS) transport over WebRTC, signaled via Nostr relays, with a TCP gateway interface",
   "main": "index.js",
   "type": "module",
   "scripts": {
@@ -10,17 +10,14 @@
     "build": "vite build"
   },
   "dependencies": {
+    "@noble/ciphers": "^2.2.0",
     "@noble/curves": "^2.2.0",
     "@noble/hashes": "^2.2.0",
-    "@roamhq/wrtc": "^0.9.0",
     "buffer": "^6.0.3",
     "crypto-browserify": "^3.12.1",
     "events": "^3.3.0",
-    "libsodium-wrappers": "^0.7.15",
     "msgpackr": "^2.0.4",
     "node-datachannel": "^0.32.3",
-    "node-fetch": "^3.3.2",
-    "nomadnet": "^0.0.5",
     "nostr-tools": "^2.23.9",
     "process": "^0.11.10",
     "stream-browserify": "^3.0.0",
@@ -36,9 +33,9 @@
     "type": "git",
     "url": "git+https://github.com/sloev/reticulum-webrtc-tcp.git"
   },
-  "keywords": [],
+  "keywords": ["reticulum", "rns", "webrtc", "nostr", "mesh"],
   "author": "",
-  "license": "ISC",
+  "license": "MIT",
   "bugs": {
     "url": "https://github.com/sloev/reticulum-webrtc-tcp/issues"
   },
