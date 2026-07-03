@@ -1,10 +1,16 @@
 import { Interface } from "./rns/index.js";
+import { EventEmitter } from "events";
 
 export class WebRTCInterface extends Interface {
     constructor(name) {
         super(name);
         this.peers = new Map();
         this.dataChannels = new Map();
+        this.events = new EventEmitter();
+    }
+
+    on(name, listener) {
+        this.events.on(name, listener);
     }
 
     connect() {
@@ -15,6 +21,7 @@ export class WebRTCInterface extends Interface {
         this.peers.set(peerId, pc);
         this.dataChannels.set(peerId, dc);
         dc.binaryType = 'arraybuffer';
+        this.events.emit('peer-connected', peerId);
 
         dc.onmessage = (event) => {
             let data;
@@ -32,6 +39,7 @@ export class WebRTCInterface extends Interface {
             this.peers.delete(peerId);
             this.dataChannels.delete(peerId);
             console.log(`[WebRTCInterface] Peer ${peerId} disconnected`);
+            this.events.emit('peer-disconnected', peerId);
         };
     }
 

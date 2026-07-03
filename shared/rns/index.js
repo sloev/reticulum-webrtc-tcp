@@ -51,7 +51,7 @@ export class Reticulum extends EventEmitter {
                         ratchet: announce.ratchet,
                         app_data: announce.app_data
                     });
-                    this.emit('announce', announce);
+                    this.emit('announce', { ...announce, destination_hash: packet.destination_hash });
                     // Rebroadcast to other interfaces
                     for (const iface of this.interfaces) {
                         if (iface !== receivingInterface) {
