@@ -68,7 +68,9 @@ export class WebRTCBrowser extends WebRTCInterface {
     }
 
     _createPeer(id, initiator) {
-        const pc = new RTCPeerConnection();
+        const pc = new RTCPeerConnection({
+            iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
+        });
         let dc;
 
         if (initiator) {
