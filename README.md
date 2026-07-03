@@ -5,6 +5,8 @@ relays for connection signaling. Peers run in the browser or in Node.js and form
 
 This is a from-scratch implementation, not a port of or a wrapper around the reference [`rns`](https://github.com/markqvist/Reticulum) Python implementation. See [Known limitations](#known-limitations) before relying on it for anything.
 
+**Live demo:** https://sloev.github.io/reticulum-webrtc-tcp/ — the browser peer, built and deployed straight from `browser/` (see [Deploying the demo](#deploying-the-demo)). Open it in two tabs (or send someone the link) to form a mesh link over public Nostr relays and exchange messages.
+
 ## Architecture
 
 ```
@@ -16,7 +18,7 @@ shared/rns/                 Protocol implementation (transport-agnostic)
 shared/webrtc-rns-interface.js  RNS Interface backed by RTCDataChannel peers (shared by browser + Node)
 shared/nostr-signaling.js       Peer discovery and WebRTC offer/answer/ICE exchange over Nostr relays
 
-browser/                    Browser peer: WebRTC glue (webrtc-browser.js) + a minimal chat demo UI
+browser/                    Browser peer: WebRTC glue (webrtc-browser.js) + a chat demo UI (main.js, style.css)
 node/
   webrtc-node.js               Node peer: same WebRTC glue, using node-datachannel for RTCPeerConnection
   tcp-gateway.js                RNS Interface that bridges a TCP listener into the mesh
@@ -85,7 +87,13 @@ No local signaling server is needed — signaling happens over the public Nostr 
 
 ### Browser demo
 
-`browser/index.html` shows your peer's 16-byte destination hash (RID). To message another peer, enter their RID and a message; the message is sent as an LXMF-style message once you've received an announce from that peer's identity (announces are sent automatically every 10 seconds).
+`browser/index.html` shows your peer's 16-byte destination hash (RID), a copy button, and live mesh status: the number of open WebRTC links and the RIDs of peers you've received an announce from (click one to fill in the destination field). Enter a destination RID and a message and send; the message goes out as an LXMF-style message once you've received an announce from that peer's identity (your own identity is announced automatically every 10 seconds).
+
+## Deploying the demo
+
+`.github/workflows/deploy-pages.yml` builds `browser/` with Vite and publishes it to GitHub Pages on every push to `main` (or manually via "Run workflow"). It builds with `--base=/<repo-name>/` so asset paths resolve correctly under `https://<owner>.github.io/<repo>/`, and installs dependencies with `--ignore-scripts` since the Pages build only needs the browser bundle, not `node-datachannel`'s native binary.
+
+One-time setup for a fork or new repo: in **Settings → Pages**, set **Source** to **GitHub Actions**. After that, pushes to `main` deploy automatically.
 
 ## Known limitations
 
