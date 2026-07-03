@@ -15,9 +15,34 @@ export const CONTEXT_NONE = 0x00;
 export const CONTEXT_LRRTT = 0xfe;
 export const CONTEXT_LRPROOF = 0xff;
 
+// Matches RNS.Identity.truncated_hash(identity_pub): sha256(pubkey)[:16].
+// This is RNS's "identity hash", distinct from a destination hash.
+export function identity_hash(identity_pub) {
+    return crypto.sha256(identity_pub).slice(0, 16);
+}
+
+export function name_hash(full_name) {
+    return crypto.sha256(new TextEncoder().encode(full_name)).slice(0, 10);
+}
+
+// Matches RNS.Destination.hash(): sha256(name_hash + identity_hash)[:16].
+// Verified byte-for-byte against the reference `rns` package (destination
+// hash, announce signed_data/signature, and packet bytes all matched for a
+// fixed test identity).
 export function get_identity_destination_hash(identity_pub, full_name) {
-    const name_hash = crypto.sha256(new TextEncoder().encode(full_name)).slice(0, 10);
-    return crypto.sha256(crypto.concat(name_hash, identity_pub)).slice(0, 16);
+    return crypto.sha256(crypto.concat(name_hash(full_name), identity_hash(identity_pub))).slice(0, 16);
+}
+
+// Matches Python's int(time.time()).to_bytes(5, "big"): a 40-bit big-endian
+// Unix timestamp, used as half of an announce's random_hash field.
+function timestamp5() {
+    let t = Math.floor(Date.now() / 1000);
+    const buf = new Uint8Array(5);
+    for (let i = 4; i >= 0; i--) {
+        buf[i] = t % 256;
+        t = Math.floor(t / 256);
+    }
+    return buf;
 }
 
 export function packet_pack(packet) {
@@ -73,15 +98,16 @@ export function packet_unpack(bytes) {
 }
 
 export function build_announce(identity_priv, identity_pub, destination_hash, ratchet_priv, ratchet_pub, full_name, app_data = new Uint8Array(0)) {
-  const name_hash = crypto.sha256(new TextEncoder().encode(full_name)).slice(0, 10);
-  const random_hash = crypto.randomBytes(10);
+  const name_hash_bytes = name_hash(full_name);
+  // Matches RNS.Identity.get_random_hash()[0:5] + int(time.time()).to_bytes(5, "big").
+  const random_hash = crypto.concat(crypto.randomBytes(5), timestamp5());
 
   const context_flag = ratchet_pub.length > 0 ? 1 : 0;
 
-  const signed_data = crypto.concat(destination_hash, identity_pub, name_hash, random_hash, ratchet_pub, app_data);
+  const signed_data = crypto.concat(destination_hash, identity_pub, name_hash_bytes, random_hash, ratchet_pub, app_data);
   const signature = crypto.ed25519_sign(identity_priv.slice(32), signed_data);
 
-  let data = crypto.concat(identity_pub, name_hash, random_hash);
+  let data = crypto.concat(identity_pub, name_hash_bytes, random_hash);
   if (ratchet_pub.length > 0) data = crypto.concat(data, ratchet_pub);
   data = crypto.concat(data, signature, app_data);
 
@@ -95,7 +121,7 @@ export function validate_announce(packet) {
   let offset = 0;
   const public_key = packet.data.slice(offset, offset + 64);
   offset += 64;
-  const name_hash = packet.data.slice(offset, offset + 10);
+  const name_hash_bytes = packet.data.slice(offset, offset + 10);
   offset += 10;
   const random_hash = packet.data.slice(offset, offset + 10);
   offset += 10;
@@ -110,21 +136,27 @@ export function validate_announce(packet) {
   offset += 64;
   const app_data = packet.data.slice(offset);
 
-  const signed_data = crypto.concat(packet.destination_hash, public_key, name_hash, random_hash, ratchet, app_data);
+  const signed_data = crypto.concat(packet.destination_hash, public_key, name_hash_bytes, random_hash, ratchet, app_data);
   if (!crypto.ed25519_validate(signature, signed_data, public_key.slice(32))) return false;
 
-  return { public_key, name_hash, random_hash, ratchet, signature, app_data };
+  return { public_key, name_hash: name_hash_bytes, random_hash, ratchet, signature, app_data };
 }
 
 export function build_data(plaintext, receiver_identity_pub, receiver_ratchet_pub, full_name) {
   const destination_hash = get_identity_destination_hash(receiver_identity_pub, full_name);
-  const identity_hash = crypto.sha256(receiver_identity_pub).slice(0, 16);
+  const salt = identity_hash(receiver_identity_pub);
 
   const ephemeral_priv = crypto.private_ratchet();
   const ephemeral_pub = crypto.public_ratchet(ephemeral_priv);
 
-  const shared_secret = crypto.x25519_exchange(ephemeral_priv, receiver_ratchet_pub);
-  const derived_key = crypto.hkdf(shared_secret, 64, identity_hash);
+  // Matches RNS.Identity.encrypt(): use the announced ratchet if the sender
+  // has one, otherwise fall back to the receiver's primary X25519 key.
+  const target_pub = (receiver_ratchet_pub && receiver_ratchet_pub.length > 0)
+      ? receiver_ratchet_pub
+      : receiver_identity_pub.slice(0, 32);
+
+  const shared_secret = crypto.x25519_exchange(ephemeral_priv, target_pub);
+  const derived_key = crypto.hkdf(shared_secret, 64, salt);
 
   const iv = crypto.randomBytes(16);
   const ciphertext = crypto.aes_cbc_encrypt(derived_key.slice(32), iv, plaintext);
@@ -140,9 +172,13 @@ export function build_data(plaintext, receiver_identity_pub, receiver_ratchet_pu
   });
 }
 
+// `ratchets` should list candidate X25519 private keys to try, in priority
+// order. Matches RNS.Identity.decrypt(): try each ratchet, then fall back to
+// the receiver's own primary X25519 private key — callers should append that
+// key (identity.private.slice(0, 32)) as the last entry in `ratchets`.
 export function message_decrypt(packet, receiver_pub, ratchets) {
   if (packet.data.length < 49) return null;
-  const identity_hash = crypto.sha256(receiver_pub).slice(0, 16);
+  const salt = identity_hash(receiver_pub);
   const peer_pub = packet.data.slice(0, 32);
   const rest = packet.data.slice(32);
   if (rest.length < 48) return null;
@@ -152,7 +188,7 @@ export function message_decrypt(packet, receiver_pub, ratchets) {
 
   for (const ratchet of ratchets) {
       try {
-          const derived_key = crypto.hkdf(crypto.x25519_exchange(ratchet, peer_pub), 64, identity_hash);
+          const derived_key = crypto.hkdf(crypto.x25519_exchange(ratchet, peer_pub), 64, salt);
           const expected_hmac = crypto.hmac_sha256(derived_key.slice(0, 32), signed_data);
           let match = true;
           for (let i = 0; i < 32; i++) if (expected_hmac[i] !== received_hmac[i]) match = false;

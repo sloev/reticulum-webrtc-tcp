@@ -1,5 +1,10 @@
 import net from 'net';
 import { Interface } from '../shared/rns/index.js';
+import { hdlcFrame, HdlcFrameDecoder } from './hdlc.js';
+
+// Matches RNS.Reticulum.HEADER_MINSIZE (2 + 1 + 16 bytes): TCPInterface silently
+// drops frames at or below this size rather than passing them on.
+const HEADER_MINSIZE = 19;
 
 export class TCPServerInterface extends Interface {
   constructor(port) {
@@ -11,12 +16,14 @@ export class TCPServerInterface extends Interface {
   connect() {
     this.server = net.createServer((socket) => {
       this.clients.add(socket);
+      const decoder = new HdlcFrameDecoder();
 
       socket.on('data', (data) => {
-        // TCP interfaces in reticulum send raw frames or packets directly
-        // We will pass the raw byte buffer straight into the RNS stack
-        if (this.rns) {
-           this.rns.onPacketReceived(new Uint8Array(data), this);
+        if (!this.rns) return;
+        for (const frame of decoder.push(data)) {
+          if (frame.length > HEADER_MINSIZE) {
+            this.rns.onPacketReceived(new Uint8Array(frame), this);
+          }
         }
       });
 
@@ -35,11 +42,13 @@ export class TCPServerInterface extends Interface {
   }
 
   sendData(data) {
-    // Write out the raw reticulum packet to all TCP clients (bridging)
-    const buf = Buffer.from(data);
+    // Frame each outgoing packet HDLC-style, matching TCPInterface, so a real
+    // Reticulum node's TCP interface (or this gateway itself) can find frame
+    // boundaries in the byte stream.
+    const framed = hdlcFrame(Buffer.from(data));
     for (const socket of this.clients) {
       if (socket.writable) {
-        socket.write(buf);
+        socket.write(framed);
       }
     }
   }
