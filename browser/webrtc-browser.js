@@ -1,5 +1,5 @@
 import { NostrSignaling } from '../shared/nostr-signaling.js';
-import { WebRTCInterface } from '../shared/webrtc-rns-interface.js';
+import { WebRTCInterface, waitForIceGatheringComplete } from '../shared/webrtc-rns-interface.js';
 
 export class WebRTCBrowser extends WebRTCInterface {
     constructor() {
@@ -33,15 +33,10 @@ export class WebRTCBrowser extends WebRTCInterface {
                 await pc.setRemoteDescription(new RTCSessionDescription(msg.offer));
                 const answer = await pc.createAnswer();
                 await pc.setLocalDescription(answer);
-                this.signaling.send(from, { type: 'answer', answer });
+                await waitForIceGatheringComplete(pc);
+                this.signaling.send(from, { type: 'answer', answer: pc.localDescription });
             } else if (msg.type === 'answer') {
                 await pc?.setRemoteDescription(new RTCSessionDescription(msg.answer));
-            } else if (msg.type === 'candidate') {
-                try {
-                    await pc?.addIceCandidate(new RTCIceCandidate(msg.candidate));
-                } catch (e) {
-                    if (!this.ignoreOffer) console.error("Error adding ICE candidate", e);
-                }
             }
         };
 
@@ -61,7 +56,8 @@ export class WebRTCBrowser extends WebRTCInterface {
         try {
             const offer = await pc.createOffer();
             await pc.setLocalDescription(offer);
-            this.signaling.send(peerPubkey, { type: 'offer', offer });
+            await waitForIceGatheringComplete(pc);
+            this.signaling.send(peerPubkey, { type: 'offer', offer: pc.localDescription });
         } finally {
             this.makingOffer = false;
         }
@@ -87,10 +83,6 @@ export class WebRTCBrowser extends WebRTCInterface {
                 };
             };
         }
-
-        pc.onicecandidate = (e) => {
-            if (e.candidate) this.signaling.send(id, { type: 'candidate', candidate: e.candidate });
-        };
 
         pc.oniceconnectionstatechange = () => {
             if (pc.iceConnectionState === 'disconnected' || pc.iceConnectionState === 'failed') {

@@ -88,6 +88,10 @@ export class Identity {
         this.public = crypto.public_identity(this.private);
         this.ratchetPrivate = crypto.private_ratchet();
         this.ratchetPublic = crypto.public_ratchet(this.ratchetPrivate);
+        // Matches RNS.Identity.hash: sha256(public_key)[:16]. Used to derive
+        // destination hashes and as the HKDF salt for single-destination
+        // encryption (see protocol.identity_hash).
+        this.hash = protocol.identity_hash(this.public);
     }
     static create() {
         return new Identity();
@@ -155,7 +159,10 @@ export class Destination extends EventEmitter {
     onData(packet) {
         if (this.direction === Destination.OUT) return;
 
-        const decrypted = protocol.message_decrypt(packet, this.identity.public, [this.identity.ratchetPrivate]);
+        // Try the destination's current ratchet first, then fall back to the
+        // identity's own X25519 key, matching RNS.Identity.decrypt()'s fallback
+        // for senders who didn't have (or use) an announced ratchet.
+        const decrypted = protocol.message_decrypt(packet, this.identity.public, [this.identity.ratchetPrivate, this.identity.private.slice(0, 32)]);
         if (decrypted) {
             const knownIdentities = Array.from(this.rns.identities.values());
             let parsedLxmf = null;

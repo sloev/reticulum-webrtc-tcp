@@ -1,6 +1,29 @@
 import { Interface } from "./rns/index.js";
 import { EventEmitter } from "events";
 
+// Waits for ICE candidate gathering to finish so the full candidate set is
+// embedded in pc.localDescription, instead of trickling each candidate over
+// signaling as it's found (one Nostr publish per candidate). Bounded by
+// timeoutMs: if the configured STUN server is slow or unreachable, gathering
+// can otherwise take tens of seconds (or hang) before reaching 'complete'.
+// Whatever candidates have been found by the deadline (host candidates
+// typically resolve almost immediately) are sent as-is.
+export function waitForIceGatheringComplete(pc, timeoutMs = 3000) {
+    if (pc.iceGatheringState === 'complete') return Promise.resolve();
+    return new Promise((resolve) => {
+        const done = () => {
+            pc.removeEventListener('icegatheringstatechange', check);
+            clearTimeout(timer);
+            resolve();
+        };
+        const check = () => {
+            if (pc.iceGatheringState === 'complete') done();
+        };
+        const timer = setTimeout(done, timeoutMs);
+        pc.addEventListener('icegatheringstatechange', check);
+    });
+}
+
 export class WebRTCInterface extends Interface {
     constructor(name) {
         super(name);
