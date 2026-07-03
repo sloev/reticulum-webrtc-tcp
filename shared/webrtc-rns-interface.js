@@ -1,5 +1,4 @@
-import Interface from "@liamcottle/rns.js/src/interfaces/interface.js";
-import { Packet } from "@liamcottle/rns.js";
+import { Interface } from "./rns/index.js";
 
 export class WebRTCInterface extends Interface {
     constructor(name) {
@@ -9,15 +8,24 @@ export class WebRTCInterface extends Interface {
     }
 
     connect() {
-        // Automatically connected when added to RNS, but connections are managed externally
+        // Automatically connected when added to RNS
     }
 
     addPeer(peerId, pc, dc) {
         this.peers.set(peerId, pc);
         this.dataChannels.set(peerId, dc);
+        dc.binaryType = 'arraybuffer';
 
         dc.onmessage = (event) => {
-            const data = new Uint8Array(event.data);
+            let data;
+            if (event.data instanceof ArrayBuffer) {
+                data = new Uint8Array(event.data);
+            } else if (Buffer.isBuffer(event.data)) {
+                data = new Uint8Array(event.data);
+            } else {
+                // Try converting blob/text
+                data = new Uint8Array(event.data);
+            }
             this.onDataReceived(data);
         };
         dc.onclose = () => {
@@ -43,16 +51,10 @@ export class WebRTCInterface extends Interface {
     }
 
     onDataReceived(data) {
-        // fixme: skipping ifac packets for now
-        if ((data[0] & 0x80) === 0x80) {
-            console.log("IFAC packet received. SKIPPING FOR NOW");
-            return;
-        }
-
         try {
-            const packet = Packet.fromBytes(data);
             if (this.rns) {
-                this.rns.onPacketReceived(packet, this);
+                // Pass everything to the RNS stack exactly as it arrived
+                this.rns.onPacketReceived(data, this);
             }
         } catch (e) {
             console.error("Failed to parse packet", e);

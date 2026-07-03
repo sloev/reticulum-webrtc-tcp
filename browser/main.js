@@ -1,5 +1,6 @@
-import { Reticulum, Destination, Identity } from '@liamcottle/rns.js';
+import { Reticulum, Destination, Identity } from '../shared/rns/index.js';
 import { WebRTCBrowser } from './webrtc-browser.js';
+import * as crypto from '../shared/rns/crypto.js';
 
 const log = (txt) => {
   document.getElementById('log').value += txt + '\n';
@@ -11,15 +12,36 @@ const webrtc = new WebRTCBrowser();
 rns.addInterface(webrtc);
 
 const identity = Identity.create();
-const dest = rns.registerDestination(identity, Destination.IN, Destination.SINGLE, "webrtc_demo", "chat");
+const dest = new Destination(rns, identity, Destination.IN, Destination.SINGLE, "webrtc_demo", "chat");
 
+// Handle standard data packets
 dest.on("packet", (event) => {
-    const msg = event.data.toString();
-    log(`From ${event.packet.destinationHash.toString('hex').slice(0, 6)}...: ${msg}`);
+    try {
+        const msg = new TextDecoder().decode(event.data);
+        log(`From mesh: ${msg}`);
+    } catch(e) {
+        log(`From mesh: [Binary Data]`);
+    }
 });
 
-document.getElementById('rid').textContent = dest.hash.toString('hex');
-console.log('My RID:', dest.hash.toString('hex'));
+// Handle LXMF messages
+dest.on("lxmf", (lxmf) => {
+    try {
+        const msg = new TextDecoder().decode(lxmf.content);
+        log(`[LXMF] From ${crypto.bytesToHex(lxmf.source_hash).slice(0, 6)}...: ${msg}`);
+    } catch(e) {
+        log(`[LXMF] [Binary Data]`);
+    }
+});
+
+const ridHex = crypto.bytesToHex(dest.hash);
+document.getElementById('rid').textContent = ridHex;
+console.log('My RID:', ridHex);
+console.log('My Public Key:', crypto.bytesToHex(identity.public));
+
+// Periodically announce so others can cache our identity for encryption
+setInterval(() => dest.announce(), 10000);
+dest.announce();
 
 window.send = () => {
   const toHex = document.getElementById('dest').value;
@@ -27,13 +49,21 @@ window.send = () => {
 
   if (!toHex) return;
 
-  const toHash = Buffer.from(toHex, 'hex');
-  const payload = Buffer.from(msg);
+  const toHash = crypto.hexToBytes(toHex);
+  const outDest = new Destination(rns, identity, Destination.OUT, Destination.SINGLE, "webrtc_demo", "chat");
+  outDest.hash = toHash;
 
-  // Create an OUT destination to send the packet
-  const outDest = rns.registerDestination(null, Destination.OUT, Destination.SINGLE, "webrtc_demo", "chat");
-  outDest.hash = toHash; // Hack to set hash since identity is unknown
+  const payload = new TextEncoder().encode(msg);
 
-  outDest.send(payload);
-  log(`Sent to ${toHex.slice(0, 6)}...: ${msg}`);
+  const known = rns.identities.get(toHex);
+  if (known) {
+      // Send as LXMF
+      outDest.sendLXMF("Chat", payload);
+      log(`Sent LXMF to ${toHex.slice(0, 6)}...: ${msg}`);
+  } else {
+      // We don't have their pub key, we'll try to broadcast announce
+      log(`Waiting for announce from ${toHex.slice(0, 6)}... to send encrypted message.`);
+      // Send an announce to prompt them (a real implementation would send a path request)
+      dest.announce();
+  }
 };

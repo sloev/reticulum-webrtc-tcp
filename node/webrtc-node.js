@@ -1,6 +1,4 @@
-import polyfill from 'node-datachannel/polyfill';
-const { RTCPeerConnection, RTCSessionDescription, RTCIceCandidate } = polyfill;
-
+import 'node-datachannel/polyfill';
 import { NostrSignaling } from '../shared/nostr-signaling.js';
 import { WebRTCInterface } from '../shared/webrtc-rns-interface.js';
 
@@ -10,22 +8,40 @@ export class WebRTCNode extends WebRTCInterface {
         this.signaling = new NostrSignaling();
         this.k = 4; // Max outgoing connections
         this.outgoingConnections = 0;
+        this.makingOffer = false;
+        this.ignoreOffer = false;
     }
 
     async connect() {
         this.signaling.onMessage = async (from, msg) => {
+            let pc = this.peers.get(from);
+
+            const polite = this.signaling.publicKey.localeCompare(from) > 0;
+
             if (msg.type === 'offer') {
-                const pc = this._createPeer(from, false);
-                await pc.setRemoteDescription(new RTCSessionDescription(msg.offer));
+                const offerCollision = this.makingOffer || (pc && pc.signalingState !== 'stable');
+                this.ignoreOffer = !polite && offerCollision;
+                if (this.ignoreOffer) {
+                    console.log(`[WebRTC] Ignoring offer from ${from} due to collision (impolite)`);
+                    return;
+                }
+
+                if (!pc) {
+                    pc = this._createPeer(from, false);
+                }
+
+                await pc.setRemoteDescription(new global.RTCSessionDescription(msg.offer));
                 const answer = await pc.createAnswer();
                 await pc.setLocalDescription(answer);
                 this.signaling.send(from, { type: 'answer', answer });
             } else if (msg.type === 'answer') {
-                const pc = this.peers.get(from);
-                await pc?.setRemoteDescription(new RTCSessionDescription(msg.answer));
+                await pc?.setRemoteDescription(new global.RTCSessionDescription(msg.answer));
             } else if (msg.type === 'candidate') {
-                const pc = this.peers.get(from);
-                await pc?.addIceCandidate(new RTCIceCandidate(msg.candidate));
+                try {
+                    await pc?.addIceCandidate(new global.RTCIceCandidate(msg.candidate));
+                } catch (e) {
+                    if (!this.ignoreOffer) console.error("Error adding ICE candidate", e);
+                }
             }
         };
 
@@ -41,13 +57,18 @@ export class WebRTCNode extends WebRTCInterface {
 
     async connectTo(peerPubkey) {
         const pc = this._createPeer(peerPubkey, true);
-        const offer = await pc.createOffer();
-        await pc.setLocalDescription(offer);
-        this.signaling.send(peerPubkey, { type: 'offer', offer });
+        this.makingOffer = true;
+        try {
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+            this.signaling.send(peerPubkey, { type: 'offer', offer });
+        } finally {
+            this.makingOffer = false;
+        }
     }
 
     _createPeer(id, initiator) {
-        const pc = new RTCPeerConnection();
+        const pc = new global.RTCPeerConnection();
         let dc;
 
         if (initiator) {
