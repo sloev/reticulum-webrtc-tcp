@@ -1,60 +1,84 @@
-import wrtc from '@roamhq/wrtc';
-import WebSocket from 'ws';
-import { v4 as uuidv4 } from 'uuid';
+import polyfill from 'node-datachannel/polyfill';
+const { RTCPeerConnection, RTCSessionDescription, RTCIceCandidate } = polyfill;
 
-export class WebRTCNode {
-  constructor(onData) {
-    this.id = uuidv4();
-    this.onData = onData;
-    this.peers = new Map();
-    this.ws = new WebSocket('ws://localhost:8888');
+import { NostrSignaling } from '../shared/nostr-signaling.js';
+import { WebRTCInterface } from '../shared/webrtc-rns-interface.js';
 
-    this.ws.on('message', async (data) => {
-      const msg = JSON.parse(data);
-      if (msg.type === 'welcome') {
-        this.id = msg.id;
-      } else if (msg.type === 'offer') {
-        const pc = this._createPeer(msg.from);
-        await pc.setRemoteDescription(new wrtc.RTCSessionDescription(msg.offer));
-        const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
-        this._send(msg.from, { type: 'answer', answer });
-      } else if (msg.type === 'answer') {
-        const pc = this.peers.get(msg.from)?.pc;
-        await pc?.setRemoteDescription(new wrtc.RTCSessionDescription(msg.answer));
-      } else if (msg.type === 'candidate') {
-        const pc = this.peers.get(msg.from)?.pc;
-        await pc?.addIceCandidate(new wrtc.RTCIceCandidate(msg.candidate));
-      }
-    });
+export class WebRTCNode extends WebRTCInterface {
+    constructor() {
+        super("WebRTCNode");
+        this.signaling = new NostrSignaling();
+        this.k = 4; // Max outgoing connections
+        this.outgoingConnections = 0;
+    }
 
-    this.ws.on('open', () => console.log('[WebRTCNode] Signaling connected'));
-  }
+    async connect() {
+        this.signaling.onMessage = async (from, msg) => {
+            if (msg.type === 'offer') {
+                const pc = this._createPeer(from, false);
+                await pc.setRemoteDescription(new RTCSessionDescription(msg.offer));
+                const answer = await pc.createAnswer();
+                await pc.setLocalDescription(answer);
+                this.signaling.send(from, { type: 'answer', answer });
+            } else if (msg.type === 'answer') {
+                const pc = this.peers.get(from);
+                await pc?.setRemoteDescription(new RTCSessionDescription(msg.answer));
+            } else if (msg.type === 'candidate') {
+                const pc = this.peers.get(from);
+                await pc?.addIceCandidate(new RTCIceCandidate(msg.candidate));
+            }
+        };
 
-  async connectTo(peerId) {
-    const pc = this._createPeer(peerId);
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-    this._send(peerId, { type: 'offer', offer });
-  }
+        this.signaling.onPeerDiscovered = async (peerPubkey) => {
+            if (this.outgoingConnections < this.k && !this.peers.has(peerPubkey)) {
+                this.outgoingConnections++;
+                this.connectTo(peerPubkey);
+            }
+        };
 
-  _createPeer(id) {
-    const pc = new wrtc.RTCPeerConnection();
-    const dc = pc.createDataChannel('rns');
-    dc.onmessage = (e) => this.onData(id, new Uint8Array(e.data));
-    dc.onopen = () => console.log('[Peer]', id, 'connected');
-    pc.onicecandidate = (e) => {
-      if (e.candidate) this._send(id, { type: 'candidate', candidate: e.candidate });
-    };
-    this.peers.set(id, { pc, dc });
-    return pc;
-  }
+        await this.signaling.connect();
+    }
 
-  send(peerId, data) {
-    this.peers.get(peerId)?.dc.send(data);
-  }
+    async connectTo(peerPubkey) {
+        const pc = this._createPeer(peerPubkey, true);
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        this.signaling.send(peerPubkey, { type: 'offer', offer });
+    }
 
-  _send(to, msg) {
-    this.ws.send(JSON.stringify({ ...msg, to }));
-  }
+    _createPeer(id, initiator) {
+        const pc = new RTCPeerConnection();
+        let dc;
+
+        if (initiator) {
+            dc = pc.createDataChannel('rns');
+            dc.onopen = () => {
+                console.log('[Node] Link to', id);
+                this.addPeer(id, pc, dc);
+            };
+        } else {
+            pc.ondatachannel = (event) => {
+                dc = event.channel;
+                dc.onopen = () => {
+                    console.log('[Node] Link to', id);
+                    this.addPeer(id, pc, dc);
+                };
+            };
+        }
+
+        pc.onicecandidate = (e) => {
+            if (e.candidate) this.signaling.send(id, { type: 'candidate', candidate: e.candidate });
+        };
+
+        pc.oniceconnectionstatechange = () => {
+            if (pc.iceConnectionState === 'disconnected' || pc.iceConnectionState === 'failed') {
+                if (initiator) this.outgoingConnections--;
+                this.peers.delete(id);
+                this.dataChannels.delete(id);
+            }
+        };
+
+        this.peers.set(id, pc);
+        return pc;
+    }
 }

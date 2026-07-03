@@ -5,16 +5,43 @@
   "main": "index.js",
   "type": "module",
   "scripts": {
-    "signalling": "node node/signaling-server.js",
     "gateway": "node node/index.js",
     "dev": "vite serve browser",
     "build": "vite build"
   },
   "dependencies": {
+    "@liamcottle/rns.js": "^0.0.4",
+    "@noble/curves": "^2.2.0",
+    "@noble/hashes": "^2.2.0",
     "@roamhq/wrtc": "^0.9.0",
+    "buffer": "^6.0.3",
+    "crypto-browserify": "^3.12.1",
+    "events": "^3.3.0",
     "libsodium-wrappers": "^0.7.15",
+    "msgpackr": "^2.0.4",
+    "node-datachannel": "^0.32.3",
+    "node-fetch": "^3.3.2",
+    "nomadnet": "^0.0.5",
+    "nostr-tools": "^2.23.9",
+    "process": "^0.11.10",
+    "stream-browserify": "^3.0.0",
+    "string_decoder": "^1.3.0",
+    "util": "^0.12.5",
     "uuid": "^11.1.0",
     "vite": "^6.3.5",
+    "vm-browserify": "^1.1.2",
+    "webrtc-adapter": "^9.0.6",
     "ws": "^8.18.3"
-  }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sloev/reticulum-webrtc-tcp.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/sloev/reticulum-webrtc-tcp/issues"
+  },
+  "homepage": "https://github.com/sloev/reticulum-webrtc-tcp#readme"
 }
