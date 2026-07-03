@@ -68,7 +68,9 @@ export class WebRTCNode extends WebRTCInterface {
     }
 
     _createPeer(id, initiator) {
-        const pc = new global.RTCPeerConnection();
+        const pc = new global.RTCPeerConnection({
+            iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
+        });
         let dc;
 
         if (initiator) {
