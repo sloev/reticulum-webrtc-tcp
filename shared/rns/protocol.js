@@ -40,15 +40,52 @@ export function name_hash(full_name) {
     return crypto.sha256(new TextEncoder().encode(full_name)).slice(0, 10);
 }
 
-// Matches RNS.Packet.getTruncatedHash(): sha256(hashable_part)[:16], where
 // hashable_part is (flags & 0x0F) followed by everything after the hops
-// byte. Used as a Request/Response's request_id (the hash of the packed,
-// encrypted REQUEST packet's raw bytes, computed identically by sender and
-// receiver since the ciphertext is unchanged in transit).
-export function packet_truncated_hash(raw_packet) {
+// byte — shared by RNS.Packet.get_hash()/getTruncatedHash() and
+// RNS.Link.link_id_from_lr_packet(): the hop count is deliberately excluded
+// so the hash stays the same as a packet's hops field is incremented in
+// transit, while everything else about a relayed link_id or delivery proof
+// still ties back to the original packet.
+function packet_hashable_part(raw_packet) {
     const flags = raw_packet[0];
-    const hashable_part = crypto.concat(new Uint8Array([flags & 0x0f]), raw_packet.slice(2));
-    return crypto.sha256(hashable_part).slice(0, 16);
+    return crypto.concat(new Uint8Array([flags & 0x0f]), raw_packet.slice(2));
+}
+
+// Matches RNS.Packet.get_hash(): full (untruncated) SHA-256 of the hashable
+// part. Used as the value an explicit/implicit delivery proof signs (see
+// build_packet_proof/validate_packet_proof below).
+export function packet_full_hash(raw_packet) {
+    return crypto.sha256(packet_hashable_part(raw_packet));
+}
+
+// Matches RNS.Packet.getTruncatedHash(): sha256(hashable_part)[:16]. Used as
+// a Request/Response's request_id (the hash of the packed, encrypted
+// REQUEST packet's raw bytes, computed identically by sender and receiver
+// since the ciphertext is unchanged in transit).
+export function packet_truncated_hash(raw_packet) {
+    return packet_full_hash(raw_packet).slice(0, 16);
+}
+
+// --- RNS.Packet delivery proofs (Packet.prove()/PacketReceipt.validate_proof()) ---
+// Implicit form only (RNS's default: Reticulum.should_use_implicit_proof()),
+// where the proof payload is just the destination identity's Ed25519
+// signature over the original packet's full hash — no explicit hash needed
+// in the payload, since the proof packet's own destination_hash (the first
+// 16 bytes of that same hash) is already how the original sender recognizes
+// which pending packet this proves. Requires the original sender to already
+// know the destination's identity (from an earlier announce), same as
+// sending to it in the first place.
+export function build_packet_proof(original_packet_full_hash, destination_identity_priv) {
+    const signature = crypto.ed25519_sign(destination_identity_priv.slice(32), original_packet_full_hash);
+    return packet_pack({
+        header_type: 0, context_flag: 0, transport_type: 0, destination_type: DEST_SINGLE,
+        packet_type: PACKET_PROOF, hops: 0, destination_hash: original_packet_full_hash.slice(0, 16), context: CONTEXT_NONE, data: signature,
+    });
+}
+
+export function validate_packet_proof(proof_packet, original_packet_full_hash, destination_identity_pub) {
+    if (proof_packet.data.length !== 64) return false;
+    return crypto.ed25519_validate(proof_packet.data, original_packet_full_hash, destination_identity_pub.slice(32));
 }
 
 // Matches RNS.Destination.hash(): sha256(name_hash + identity_hash)[:16].

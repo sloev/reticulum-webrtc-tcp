@@ -20,6 +20,19 @@ export class Reticulum extends EventEmitter {
         // packets — not full RNS.Transport routing (see protocol.js's
         // Transport section and README's Compliance section).
         this.pathTable = new Map(); // hash hex -> { hops, receivingInterface, fromPeerId, packet, timestamp }
+
+        // Per-link routing table for relaying a Link handshake (and
+        // everything that flows over it afterward) through an intermediate
+        // peer that owns neither endpoint — a link_id can't use pathTable
+        // since it isn't a real, announced destination. See
+        // _forwardLinkRequest()/_forwardLinkTraffic().
+        this.linkTable = new Map(); // link_id hex -> { ifaceA, peerA, ifaceB, peerB }
+
+        // Pending Destination.send({ requestProof: true }) calls awaiting a
+        // delivery proof, keyed by the proof's own destination_hash (the
+        // first 16 bytes of the original packet's full hash — see
+        // protocol.js's "RNS.Packet delivery proofs" section).
+        this.pendingProofs = new Map(); // hash hex -> { packetFullHash, destinationIdentityPub, resolve, timer }
     }
 
     addInterface(iface) {
@@ -78,27 +91,36 @@ export class Reticulum extends EventEmitter {
                     this._broadcastExcept(forwarded, receivingInterface, fromPeerId);
                 }
             } else if (packet.packet_type === protocol.PACKET_LINKREQUEST) {
-                if (destination) destination.onLinkRequest(packet, data);
-                // Not forwarded: relaying a link handshake through an
-                // intermediate peer needs a separate "link table" to route
-                // the eventual PROOF and eventual link traffic back through
-                // the same relay, which isn't implemented (see README).
+                if (destination) {
+                    destination.onLinkRequest(packet, data);
+                } else {
+                    this._forwardLinkRequest(packet, data, receivingInterface, fromPeerId, forwarded);
+                }
             } else if (packet.packet_type === protocol.PACKET_DATA) {
                 if (packet.destination_type === protocol.DEST_LINK) {
                     const link = this.links.get(destHex);
-                    if (link) link.onPacket(packet, data);
-                    // Not forwarded, for the same reason as LINKREQUEST above.
+                    if (link) {
+                        link.onPacket(packet, data);
+                    } else {
+                        this._forwardLinkTraffic(destHex, receivingInterface, fromPeerId, forwarded, packet.context === protocol.CONTEXT_LINKCLOSE);
+                    }
                 } else if (packet.destination_type === protocol.DEST_PLAIN && destHex === crypto.bytesToHex(protocol.PATH_REQUEST_DEST_HASH)) {
                     this._handlePathRequest(packet);
                 } else if (destination) {
-                    destination.onData(packet);
+                    destination.onData(packet, data);
                 } else {
                     this._forward(destHex, receivingInterface, fromPeerId, forwarded);
                 }
             } else if (packet.packet_type === protocol.PACKET_PROOF) {
                 if (packet.destination_type === protocol.DEST_LINK) {
                     const link = this.links.get(destHex);
-                    if (link) link.onProof(packet);
+                    if (link) {
+                        link.onProof(packet);
+                    } else {
+                        this._forwardLinkTraffic(destHex, receivingInterface, fromPeerId, forwarded, false);
+                    }
+                } else if (this.pendingProofs.has(destHex)) {
+                    this._handlePacketProof(destHex, packet);
                 } else if (destination) {
                     destination.onProof(packet);
                 } else {
@@ -135,6 +157,63 @@ export class Reticulum extends EventEmitter {
         if (!path) return;
         if (path.receivingInterface === receivingInterface && path.fromPeerId === fromPeerId) return;
         path.receivingInterface.sendDataToPeer(path.fromPeerId, forwardedData);
+    }
+
+    // Lets a Link handshake pass through an intermediate peer that owns
+    // neither endpoint, using the same path-table-based next-hop lookup as
+    // _forward() above. Remembers, keyed by link_id (computed the same way
+    // both endpoints will, without needing to decrypt anything), which two
+    // neighbors this LINKREQUEST is being relayed between — since a link_id
+    // isn't a real, announced destination, later link traffic (the PROOF,
+    // and everything that flows over the link afterward) has no path-table
+    // entry to look up and needs this dedicated table instead.
+    _forwardLinkRequest(packet, rawData, receivingInterface, fromPeerId, forwardedData) {
+        const destHex = crypto.bytesToHex(packet.destination_hash);
+        const path = this.pathTable.get(destHex);
+        if (!path) return;
+        if (path.receivingInterface === receivingInterface && path.fromPeerId === fromPeerId) return;
+
+        const linkId = protocol.link_id_from_request(rawData, packet.data.length);
+        this.linkTable.set(crypto.bytesToHex(linkId), {
+            ifaceA: receivingInterface, peerA: fromPeerId,
+            ifaceB: path.receivingInterface, peerB: path.fromPeerId,
+        });
+
+        path.receivingInterface.sendDataToPeer(path.fromPeerId, forwardedData);
+    }
+
+    // Relays a PROOF, or any later DATA packet addressed to an established
+    // link (application data, Request/Response, KEEPALIVE, LINKCLOSE), for a
+    // link_id this node is relaying but is neither endpoint of — routing it
+    // to whichever of the two remembered neighbors it *didn't* just arrive
+    // from. Cleans up the table entry once a LINKCLOSE has passed through.
+    _forwardLinkTraffic(linkIdHex, receivingInterface, fromPeerId, forwardedData, isClose) {
+        const entry = this.linkTable.get(linkIdHex);
+        if (!entry) return;
+
+        if (entry.ifaceA === receivingInterface && entry.peerA === fromPeerId) {
+            entry.ifaceB.sendDataToPeer(entry.peerB, forwardedData);
+        } else if (entry.ifaceB === receivingInterface && entry.peerB === fromPeerId) {
+            entry.ifaceA.sendDataToPeer(entry.peerA, forwardedData);
+        } else {
+            return;
+        }
+
+        if (isClose) this.linkTable.delete(linkIdHex);
+    }
+
+    // Resolves a pending Destination.send({ requestProof: true }) once a
+    // valid delivery proof for it arrives (see protocol.js's "RNS.Packet
+    // delivery proofs" section) — a no-op if the signature doesn't check
+    // out against the destination identity the sender already knew.
+    _handlePacketProof(proofDestHex, packet) {
+        const pending = this.pendingProofs.get(proofDestHex);
+        if (!pending) return;
+        if (!protocol.validate_packet_proof(packet, pending.packetFullHash, pending.destinationIdentityPub)) return;
+
+        clearTimeout(pending.timer);
+        this.pendingProofs.delete(proofDestHex);
+        pending.resolve({ packetFullHash: pending.packetFullHash });
     }
 
     // Answers a path request either with a fresh, locally-signed announce
@@ -206,7 +285,12 @@ export class Destination extends EventEmitter {
         }
     }
 
-    send(data) {
+    // requestProof: true asks for a delivery confirmation (RNS.Packet.prove()/
+    // PacketReceipt, implicit form only — see protocol.js's "RNS.Packet
+    // delivery proofs" section). Returns a Promise resolving once a valid
+    // proof is seen, or rejecting on timeout; without requestProof, returns
+    // undefined immediately, matching a fire-and-forget send.
+    send(data, { requestProof = false, timeout = 10000 } = {}) {
         if (this.direction !== Destination.OUT) {
             throw new Error("Can only send to OUT destinations directly without a Link.");
         }
@@ -214,11 +298,27 @@ export class Destination extends EventEmitter {
         const knownIdentity = this.rns.identities.get(crypto.bytesToHex(this.hash));
         if (!knownIdentity) {
             console.error("Cannot send data: Destination identity/ratchet not known. Waiting for announce.");
-            return;
+            return requestProof ? Promise.reject(new Error("Destination identity/ratchet not known.")) : undefined;
         }
 
         const dataPacket = protocol.build_data(data, knownIdentity.public_key, knownIdentity.ratchet, this.fullName);
         this.rns.sendData(dataPacket);
+
+        if (!requestProof) return;
+
+        const fullHash = protocol.packet_full_hash(dataPacket);
+        const proofDestHex = crypto.bytesToHex(fullHash.slice(0, 16));
+        return new Promise((resolve, reject) => {
+            const timer = setTimeout(() => {
+                this.rns.pendingProofs.delete(proofDestHex);
+                reject(new Error("Packet was not proven within timeout."));
+            }, timeout);
+            this.rns.pendingProofs.set(proofDestHex, {
+                packetFullHash: fullHash,
+                destinationIdentityPub: knownIdentity.public_key,
+                resolve, timer,
+            });
+        });
     }
 
     // Sends an LXMF message to this (OUT) destination, signed by `source` —
@@ -248,7 +348,7 @@ export class Destination extends EventEmitter {
         this.rns.sendData(dataPacket);
     }
 
-    onData(packet) {
+    onData(packet, rawBytes) {
         if (this.direction === Destination.OUT) return;
 
         // Try the destination's current ratchet first, then fall back to the
@@ -273,7 +373,15 @@ export class Destination extends EventEmitter {
             if (parsedLxmf) {
                 this.emit('lxmf', parsedLxmf);
             } else {
-                this.emit('packet', { data: decrypted, packet });
+                // Sends an explicit delivery confirmation back to whoever
+                // sent this packet (RNS.Packet.prove(), implicit form) — opt-
+                // in, since not every packet a destination receives needs
+                // (or should get) a proof sent back.
+                const prove = () => {
+                    const proofPacket = protocol.build_packet_proof(protocol.packet_full_hash(rawBytes), this.identity.private);
+                    this.rns.sendData(proofPacket);
+                };
+                this.emit('packet', { data: decrypted, packet, prove });
             }
         }
     }
