@@ -1,6 +1,7 @@
 import * as protocol from './protocol.js';
 import { EventEmitter } from 'events';
 import * as crypto from './crypto.js';
+import { pack, unpack } from 'msgpackr';
 
 export class Reticulum extends EventEmitter {
     constructor() {
@@ -11,6 +12,14 @@ export class Reticulum extends EventEmitter {
 
         // Cache to store known public keys and ratchets from announcements
         this.identities = new Map(); // hash hex -> { public_key, ratchet, app_data }
+
+        // Lowest hop count seen to each destination, for answering path
+        // requests and for single-destination forwarding (see _forward()).
+        // Scoped to single-hop-aware flood propagation for announces, plus
+        // simple next-hop forwarding for single-destination DATA/PROOF
+        // packets — not full RNS.Transport routing (see protocol.js's
+        // Transport section and README's Compliance section).
+        this.pathTable = new Map(); // hash hex -> { hops, receivingInterface, fromPeerId, packet, timestamp }
     }
 
     addInterface(iface) {
@@ -25,19 +34,25 @@ export class Reticulum extends EventEmitter {
         }
     }
 
-    onPacketReceived(data, receivingInterface) {
+    // fromPeerId identifies which neighbor on receivingInterface a packet
+    // arrived from (e.g. a specific WebRTC peer connection or TCP socket),
+    // when that interface has more than one; null for interfaces that don't
+    // distinguish neighbors.
+    onPacketReceived(data, receivingInterface, fromPeerId = null) {
         try {
             if ((data[0] & 0x80) === 0x80) {
-               for (const iface of this.interfaces) {
-                   if (iface !== receivingInterface) {
-                       iface.sendData(data);
-                   }
-               }
+               this._broadcastExcept(data, receivingInterface, fromPeerId);
                return;
             }
 
             const packet = protocol.packet_unpack(data);
             if (!packet) return;
+
+            // Matches RNS.Transport.inbound(): every packet gains one hop
+            // upon receipt, whether or not we do anything with that count.
+            packet.hops = (packet.hops + 1) & 0xff;
+            const forwarded = new Uint8Array(data);
+            forwarded[1] = packet.hops;
 
             const destHex = crypto.bytesToHex(packet.destination_hash);
             const destination = this.destinations.get(destHex);
@@ -45,28 +60,40 @@ export class Reticulum extends EventEmitter {
             if (packet.packet_type === protocol.PACKET_ANNOUNCE) {
                 const announce = protocol.validate_announce(packet);
                 if (announce) {
-                    const idHash = crypto.bytesToHex(packet.destination_hash);
-                    this.identities.set(idHash, {
+                    this.identities.set(destHex, {
                         public_key: announce.public_key,
                         ratchet: announce.ratchet,
                         app_data: announce.app_data
                     });
-                    this.emit('announce', { ...announce, destination_hash: packet.destination_hash });
-                    // Rebroadcast to other interfaces
-                    for (const iface of this.interfaces) {
-                        if (iface !== receivingInterface) {
-                            iface.sendData(data);
-                        }
+
+                    const existing = this.pathTable.get(destHex);
+                    if (!existing || packet.hops <= existing.hops) {
+                        this.pathTable.set(destHex, { hops: packet.hops, receivingInterface, fromPeerId, packet: forwarded, timestamp: Date.now() });
                     }
+
+                    this.emit('announce', { ...announce, destination_hash: packet.destination_hash });
+                    // Rebroadcast to every other neighbor (whether on this
+                    // same interface or a different one), with the
+                    // incremented hop count.
+                    this._broadcastExcept(forwarded, receivingInterface, fromPeerId);
                 }
             } else if (packet.packet_type === protocol.PACKET_LINKREQUEST) {
                 if (destination) destination.onLinkRequest(packet, data);
+                // Not forwarded: relaying a link handshake through an
+                // intermediate peer needs a separate "link table" to route
+                // the eventual PROOF and eventual link traffic back through
+                // the same relay, which isn't implemented (see README).
             } else if (packet.packet_type === protocol.PACKET_DATA) {
                 if (packet.destination_type === protocol.DEST_LINK) {
                     const link = this.links.get(destHex);
-                    if (link) link.onData(packet, data);
+                    if (link) link.onPacket(packet, data);
+                    // Not forwarded, for the same reason as LINKREQUEST above.
+                } else if (packet.destination_type === protocol.DEST_PLAIN && destHex === crypto.bytesToHex(protocol.PATH_REQUEST_DEST_HASH)) {
+                    this._handlePathRequest(packet);
                 } else if (destination) {
                     destination.onData(packet);
+                } else {
+                    this._forward(destHex, receivingInterface, fromPeerId, forwarded);
                 }
             } else if (packet.packet_type === protocol.PACKET_PROOF) {
                 if (packet.destination_type === protocol.DEST_LINK) {
@@ -74,11 +101,67 @@ export class Reticulum extends EventEmitter {
                     if (link) link.onProof(packet);
                 } else if (destination) {
                     destination.onProof(packet);
+                } else {
+                    this._forward(destHex, receivingInterface, fromPeerId, forwarded);
                 }
             }
         } catch (e) {
             console.error("Error processing packet:", e);
         }
+    }
+
+    // Floods data to every neighbor except the one it just arrived from —
+    // whether that neighbor is on a different Interface entirely, or is
+    // another peer on the same multi-peer interface (e.g. two WebRTC
+    // connections on one browser peer relaying between each other).
+    _broadcastExcept(data, receivingInterface, fromPeerId) {
+        for (const iface of this.interfaces) {
+            if (iface === receivingInterface) {
+                iface.sendDataExcluding(fromPeerId, data);
+            } else {
+                iface.sendData(data);
+            }
+        }
+    }
+
+    // Forwards a DATA/PROOF packet addressed to a single destination that
+    // isn't local, toward the next hop recorded in the path table (learned
+    // from that destination's announces) — a simplified, single-destination-
+    // only analog of RNS.Transport's hop-by-hop packet routing. Does nothing
+    // if the destination is unknown, or if forwarding would just echo the
+    // packet back to whoever just sent it to us.
+    _forward(destHex, receivingInterface, fromPeerId, forwardedData) {
+        const path = this.pathTable.get(destHex);
+        if (!path) return;
+        if (path.receivingInterface === receivingInterface && path.fromPeerId === fromPeerId) return;
+        path.receivingInterface.sendDataToPeer(path.fromPeerId, forwardedData);
+    }
+
+    // Answers a path request either with a fresh, locally-signed announce
+    // (if we own the requested destination) or by re-broadcasting the best
+    // cached announce we know of (if we've merely heard of it) — matching
+    // RNS.Transport.path_request(), minus its interface-timing/roaming-mode
+    // rebroadcast delays, which don't apply to this project's WebRTC mesh.
+    _handlePathRequest(packet) {
+        const parsed = protocol.parse_path_request(packet);
+        if (!parsed) return;
+        const destHex = crypto.bytesToHex(parsed.destination_hash);
+
+        const localDestination = this.destinations.get(destHex);
+        if (localDestination) {
+            localDestination.announce({ pathResponse: true });
+            return;
+        }
+
+        const known = this.pathTable.get(destHex);
+        if (known) this.sendData(known.packet);
+    }
+
+    // Broadcasts a path request for a destination hash, matching the
+    // non-transport-enabled form of RNS.Transport.request_path() (this
+    // project has no persistent "transport identity" concept).
+    requestPath(destination_hash, tag = crypto.randomBytes(16)) {
+        this.sendData(protocol.build_path_request(destination_hash, tag));
     }
 }
 
@@ -138,9 +221,20 @@ export class Destination extends EventEmitter {
         this.rns.sendData(dataPacket);
     }
 
-    sendLXMF(title, content) {
+    // Sends an LXMF message to this (OUT) destination, signed by `source` —
+    // your own local (IN) destination, since `this.identity` on an OUT
+    // destination is the *recipient's* identity (used to encrypt to them),
+    // not yours. Matches LXMF's OPPORTUNISTIC delivery method: a single
+    // packet, opportunistically encrypted exactly like a normal DATA packet
+    // (see protocol.js's "LXMF" section for the wire format and README's
+    // Compliance section for what's not implemented, e.g. propagation nodes
+    // and Resource-based transfer for oversized messages).
+    sendLXMF(source, title, content, fields = {}) {
         if (this.direction !== Destination.OUT) {
-            throw new Error("Can only send to OUT destinations.");
+            throw new Error("Can only send LXMF to OUT destinations.");
+        }
+        if (!source || source.direction !== Destination.IN) {
+            throw new Error("LXMF source must be your own IN destination.");
         }
 
         const knownIdentity = this.rns.identities.get(crypto.bytesToHex(this.hash));
@@ -149,9 +243,7 @@ export class Destination extends EventEmitter {
             return;
         }
 
-        const sourcePriv = this.identity ? this.identity.private : crypto.private_identity();
-
-        const lxmfMsg = protocol.lxmf_build(content, sourcePriv, this.hash, null, null, title);
+        const lxmfMsg = protocol.lxmf_build(content, source.identity.private, this.hash, source.hash, null, title, fields);
         const dataPacket = protocol.build_data(lxmfMsg, knownIdentity.public_key, knownIdentity.ratchet, this.fullName);
         this.rns.sendData(dataPacket);
     }
@@ -164,16 +256,17 @@ export class Destination extends EventEmitter {
         // for senders who didn't have (or use) an announced ratchet.
         const decrypted = protocol.message_decrypt(packet, this.identity.public, [this.identity.ratchetPrivate, this.identity.private.slice(0, 32)]);
         if (decrypted) {
-            const knownIdentities = Array.from(this.rns.identities.values());
+            // An LXMF payload embeds its own sender's destination hash as its
+            // first 16 bytes; look up that specific identity (learned from an
+            // earlier announce) rather than brute-forcing every known
+            // identity, and require a *valid* signature against it before
+            // treating the payload as LXMF rather than plain Destination.send() data.
             let parsedLxmf = null;
-            let senderPub = null;
-
-            for (const id of knownIdentities) {
-                const parsed = protocol.lxmf_parse(decrypted, this.hash, id.public_key);
-                if (parsed && parsed.valid) {
-                    parsedLxmf = parsed;
-                    senderPub = id.public_key;
-                    break;
+            if (decrypted.length >= 16) {
+                const senderIdentity = this.rns.identities.get(crypto.bytesToHex(decrypted.slice(0, 16)));
+                if (senderIdentity) {
+                    const parsed = protocol.lxmf_parse(decrypted, this.hash, senderIdentity.public_key);
+                    if (parsed && parsed.valid) parsedLxmf = parsed;
                 }
             }
 
@@ -186,116 +279,276 @@ export class Destination extends EventEmitter {
     }
 
     onLinkRequest(packet, rawBytes) {
-        const link = new Link(this.rns, this, false);
-        link.accept(packet, rawBytes);
+        const link = Link.fromRequest(this.rns, this, packet, rawBytes);
+        if (link) this.emit('link', link);
+    }
+
+    // Registers a handler for requests made over any Link to this
+    // destination, matching RNS.Destination.register_request_handler() in
+    // its simplest form: handler(data, requestId, link) is called
+    // synchronously and its return value (if not undefined) is sent back as
+    // the response. Unlike RNS, there's no allow-list/identity-based access
+    // control or async/file-response support.
+    registerRequestHandler(path, handler) {
+        if (!this.requestHandlers) this.requestHandlers = new Map();
+        this.requestHandlers.set(crypto.bytesToHex(protocol.request_path_hash(path)), { path, handler });
     }
 
     onProof(packet) {
         this.emit('proof', packet);
     }
 
-    announce() {
+    announce({ pathResponse = false } = {}) {
         if (this.identity) {
-            const packet = protocol.build_announce(this.identity.private, this.identity.public, this.hash, this.identity.ratchetPrivate, this.identity.ratchetPublic, this.fullName);
+            const context = pathResponse ? protocol.CONTEXT_PATH_RESPONSE : protocol.CONTEXT_NONE;
+            const packet = protocol.build_announce(
+                this.identity.private, this.identity.public, this.hash,
+                this.identity.ratchetPrivate, this.identity.ratchetPublic, this.fullName,
+                new Uint8Array(0), context
+            );
             this.rns.sendData(packet);
         }
     }
 }
 
+// Wire-compatible with RNS.Link's core handshake (LINKREQUEST -> PROOF ->
+// LRRTT), per-link Token encryption, KEEPALIVE, and LINKCLOSE — verified
+// byte-for-byte against the real `rns` package (see protocol.js's "RNS.Link
+// wire format" section and test/rns-compliance.test.js).
+//
+// Request/Response is implemented for the direct-packet (fits-in-one-packet)
+// form only. Not implemented: RNS.Link's exact RTT-adaptive keepalive/
+// stale/timeout state machine (this uses simple fixed intervals instead),
+// Resource transfers (including the Request/Response fallback to one when a
+// request or response doesn't fit in a single packet), Channel, and
+// packet-level delivery proofs (RNS.Packet.prove()/link.validate()). See
+// README's Compliance section.
 export class Link extends EventEmitter {
-    constructor(rns, destination, initiator=true) {
+    static PENDING = 0;
+    static HANDSHAKE = 1;
+    static ACTIVE = 2;
+    static CLOSED = 4;
+
+    static DEFAULT_MTU = 500;
+    static ESTABLISHMENT_TIMEOUT_MS = 15000;
+    static KEEPALIVE_INTERVAL_MS = 30000;
+    static STALE_AFTER_MS = Link.KEEPALIVE_INTERVAL_MS * 2.5;
+
+    // Use Link.fromRequest() to construct a responder-side link from an
+    // incoming LINKREQUEST packet; use `new Link(rns, destination)` directly
+    // to initiate one.
+    constructor(rns, destination) {
         super();
         this.rns = rns;
         this.destination = destination;
-        this.initiator = initiator;
-        this.status = 'PENDING';
-        this.hash = new Uint8Array(16); // Will be set to link ID
-        this.shared_key = null;
+        this.status = Link.PENDING;
+        this.mtu = Link.DEFAULT_MTU;
+        this.derivedKey = null;
+        this._keepaliveTimer = null;
+        this._establishmentTimer = null;
+        this.pendingRequests = new Map(); // request_id hex -> { resolve, reject, timer }
+
+        this.initiator = true;
+        this.xPrivate = crypto.private_ratchet();
+        this.xPublic = crypto.x25519_pubkey(this.xPrivate);
+        // Fresh ephemeral signing key per link, unlinkable to the initiator's
+        // real identity (matches RNS.Link generating a throwaway Ed25519 key
+        // instead of reusing owner.identity.sig_prv, which only the
+        // *responder* side does).
+        this.sigPrivate = crypto.randomBytes(32);
+        this.sigPublic = crypto.ed25519_pubkey(this.sigPrivate);
+
+        const requestRaw = protocol.build_link_request(destination.hash, this.xPublic, this.sigPublic, this.mtu);
+        const unpacked = protocol.packet_unpack(requestRaw);
+        this.linkId = protocol.link_id_from_request(requestRaw, unpacked.data.length);
+        this.hash = this.linkId;
+
+        this.rns.links.set(crypto.bytesToHex(this.linkId), this);
+        this.requestTime = Date.now();
+        this.rns.sendData(requestRaw);
+        this._armEstablishmentTimeout();
     }
 
-    async accept(link_request_packet, raw_bytes) {
-        this.peer_pub = link_request_packet.data.slice(0, 32);
-        this.hash = crypto.sha256(raw_bytes).slice(0, 16);
-        this.rns.links.set(crypto.bytesToHex(this.hash), this);
+    static fromRequest(rns, destination, packet, rawBytes) {
+        const parsed = protocol.parse_link_request(packet);
+        if (!parsed) return null;
 
-        // Generate ephemeral key for this link
-        const ephemeral_priv = crypto.private_ratchet();
-        const ephemeral_pub = crypto.public_ratchet(ephemeral_priv);
+        const link = Object.create(Link.prototype);
+        EventEmitter.call(link);
+        link.rns = rns;
+        link.destination = destination;
+        link.status = Link.HANDSHAKE;
+        link.initiator = false;
+        link.mtu = parsed.mtu || Link.DEFAULT_MTU;
+        link._keepaliveTimer = null;
+        link._establishmentTimer = null;
+        link.pendingRequests = new Map();
 
-        // Compute shared secret
-        const shared_secret = crypto.x25519_exchange(ephemeral_priv, this.peer_pub);
-        this.shared_key = crypto.hkdf(shared_secret, 64, this.hash);
+        link.peerXPublic = parsed.peer_x_pub;
+        link.peerSigPublic = parsed.peer_sig_pub;
 
-        // Build link proof packet
-        const proofData = crypto.concat(ephemeral_pub, crypto.ed25519_sign(this.destination.identity.private.slice(32), this.hash));
+        link.xPrivate = crypto.private_ratchet();
+        link.xPublic = crypto.x25519_pubkey(link.xPrivate);
+        // Reuse the destination identity's real signing key, matching
+        // RNS.Link (self.sig_prv = self.owner.identity.sig_prv for a
+        // responder) — the destination's identity is already public via
+        // its announces, so there's no anonymity to preserve here.
+        link.sigPrivate = destination.identity.private.slice(32);
+        link.sigPublic = crypto.ed25519_pubkey(link.sigPrivate);
 
-        const packet = {
-            header_type: 0,
-            context_flag: 0,
-            transport_type: 0,
-            destination_type: protocol.DEST_LINK,
-            packet_type: protocol.PACKET_PROOF,
-            hops: 0,
-            destination_hash: this.hash,
-            context: protocol.CONTEXT_LRPROOF,
-            data: proofData
-        };
-        this.rns.sendData(protocol.packet_pack(packet));
-        this.status = 'ACTIVE';
-        this.destination.emit('link', this);
+        link.linkId = protocol.link_id_from_request(rawBytes, packet.data.length);
+        link.hash = link.linkId;
+        link.derivedKey = protocol.link_handshake(link.xPrivate, link.peerXPublic, link.linkId);
+
+        link.rns.links.set(crypto.bytesToHex(link.linkId), link);
+        link.requestTime = Date.now();
+
+        const proofRaw = protocol.build_link_proof(link.linkId, destination.identity.private, link.xPublic, link.mtu);
+        link.rns.sendData(proofRaw);
+        link._armEstablishmentTimeout();
+
+        return link;
+    }
+
+    _armEstablishmentTimeout() {
+        clearTimeout(this._establishmentTimer);
+        this._establishmentTimer = setTimeout(() => {
+            if (this.status !== Link.ACTIVE) this.close();
+        }, Link.ESTABLISHMENT_TIMEOUT_MS);
+    }
+
+    // Initiator-side: called when a PROOF (context=LRPROOF) packet addressed
+    // to this link arrives.
+    onProof(packet) {
+        if (this.status !== Link.PENDING || !this.initiator) return;
+
+        const validated = protocol.validate_link_proof(packet, this.linkId, this.destination.identity.public.slice(32));
+        if (!validated) return;
+
+        this.peerXPublic = validated.peer_x_pub;
+        this.mtu = validated.mtu || this.mtu;
+        this.derivedKey = protocol.link_handshake(this.xPrivate, this.peerXPublic, this.linkId);
+        this.rtt = (Date.now() - this.requestTime) / 1000;
+        this.status = Link.ACTIVE;
+        clearTimeout(this._establishmentTimer);
+
+        let rttData = pack(this.rtt);
+        if (!(rttData instanceof Uint8Array)) rttData = new Uint8Array(rttData);
+        const rttPacket = protocol.build_link_packet(this.linkId, this.derivedKey, rttData, protocol.CONTEXT_LRRTT);
+        this.rns.sendData(rttPacket);
+
+        this._startKeepalive();
+        this.emit('established', this);
+    }
+
+    // Dispatches an incoming DATA packet addressed to this link by context:
+    // application data (NONE), the initiator's RTT report (LRRTT),
+    // KEEPALIVE ping/pong, LINKCLOSE teardown, or a REQUEST/RESPONSE.
+    // `rawBytes` is needed (only for REQUEST) to compute the request_id.
+    onPacket(packet, rawBytes) {
+        if (this.status === Link.CLOSED) return;
+
+        if (packet.context === protocol.CONTEXT_KEEPALIVE) {
+            if (!this.initiator && packet.data.length === 1 && packet.data[0] === 0xff) {
+                this.rns.sendData(protocol.build_link_packet(this.linkId, this.derivedKey, new Uint8Array([0xfe]), protocol.CONTEXT_KEEPALIVE));
+            }
+            return;
+        }
+
+        if (!this.derivedKey) return;
+        const plaintext = protocol.link_decrypt(this.derivedKey, packet.data);
+        if (plaintext === null) return;
+
+        if (packet.context === protocol.CONTEXT_NONE) {
+            this.emit('packet', plaintext);
+        } else if (packet.context === protocol.CONTEXT_LRRTT && !this.initiator) {
+            const reportedRtt = unpack(plaintext);
+            this.rtt = Math.max((Date.now() - this.requestTime) / 1000, reportedRtt);
+            this.status = Link.ACTIVE;
+            clearTimeout(this._establishmentTimer);
+            this._startKeepalive();
+            this.emit('established', this);
+        } else if (packet.context === protocol.CONTEXT_LINKCLOSE) {
+            if (crypto.bytesToHex(plaintext) === crypto.bytesToHex(this.linkId)) this._teardown();
+        } else if (packet.context === protocol.CONTEXT_REQUEST) {
+            this._handleRequest(protocol.packet_truncated_hash(rawBytes), plaintext);
+        } else if (packet.context === protocol.CONTEXT_RESPONSE) {
+            const { request_id, response_data } = protocol.parse_response_payload(plaintext);
+            const key = crypto.bytesToHex(request_id);
+            const pending = this.pendingRequests.get(key);
+            if (pending) {
+                clearTimeout(pending.timer);
+                this.pendingRequests.delete(key);
+                pending.resolve(response_data);
+            }
+        }
+    }
+
+    // Sends a request to whichever peer is on the other end of this link,
+    // and resolves with the response data once it's received (or rejects
+    // on timeout). Only the direct-packet form is implemented — a request or
+    // response that doesn't fit in a single packet has no fallback here
+    // (real RNS falls back to a Resource transfer; see README).
+    request(path, data, { timeout = 10000 } = {}) {
+        if (this.status !== Link.ACTIVE) return Promise.reject(new Error('Link is not active'));
+
+        const payload = protocol.build_request_payload(path, data);
+        const requestPacket = protocol.build_link_packet(this.linkId, this.derivedKey, payload, protocol.CONTEXT_REQUEST);
+        const requestId = protocol.packet_truncated_hash(requestPacket);
+        const key = crypto.bytesToHex(requestId);
+
+        return new Promise((resolve, reject) => {
+            const timer = setTimeout(() => {
+                this.pendingRequests.delete(key);
+                reject(new Error(`Request to ${path} timed out`));
+            }, timeout);
+            this.pendingRequests.set(key, { resolve, reject, timer });
+            this.rns.sendData(requestPacket);
+        });
+    }
+
+    // Looks up a handler registered on this link's destination via
+    // Destination.registerRequestHandler() and, if it returns a value,
+    // sends it back as a RESPONSE packet.
+    _handleRequest(requestId, plaintext) {
+        const { path_hash, data } = protocol.parse_request_payload(plaintext);
+        const handlerEntry = this.destination?.requestHandlers?.get(crypto.bytesToHex(path_hash));
+        if (!handlerEntry) return;
+
+        const response = handlerEntry.handler(data, requestId, this);
+        if (response === undefined) return;
+
+        const payload = protocol.build_response_payload(requestId, response);
+        this.rns.sendData(protocol.build_link_packet(this.linkId, this.derivedKey, payload, protocol.CONTEXT_RESPONSE));
     }
 
     send(data) {
-        if (this.status !== 'ACTIVE' || !this.shared_key) return;
-
-        const hmac_key = this.shared_key.slice(0, 32);
-        const aes_key = this.shared_key.slice(32);
-
-        const iv = crypto.randomBytes(16);
-        const ciphertext = crypto.aes_cbc_encrypt(aes_key, iv, data);
-        const signed_data = crypto.concat(iv, ciphertext);
-        const message_hmac = crypto.hmac_sha256(hmac_key, signed_data);
-
-        const packet_data = crypto.concat(signed_data, message_hmac);
-
-        const packet = {
-            header_type: 0,
-            context_flag: 0,
-            transport_type: 0,
-            destination_type: protocol.DEST_LINK,
-            packet_type: protocol.PACKET_DATA,
-            hops: 0,
-            destination_hash: this.hash,
-            context: protocol.CONTEXT_NONE,
-            data: packet_data
-        };
-        this.rns.sendData(protocol.packet_pack(packet));
+        if (this.status !== Link.ACTIVE) return;
+        this.rns.sendData(protocol.build_link_packet(this.linkId, this.derivedKey, data, protocol.CONTEXT_NONE));
     }
 
-    onData(packet, raw_bytes) {
-        if (!this.shared_key) return;
+    _startKeepalive() {
+        clearInterval(this._keepaliveTimer);
+        if (!this.initiator) return;
+        this._keepaliveTimer = setInterval(() => {
+            this.rns.sendData(protocol.build_link_packet(this.linkId, this.derivedKey, new Uint8Array([0xff]), protocol.CONTEXT_KEEPALIVE));
+        }, Link.KEEPALIVE_INTERVAL_MS);
+    }
 
-        const hmac_key = this.shared_key.slice(0, 32);
-        const aes_key = this.shared_key.slice(32);
-
-        const rest = packet.data;
-        if (rest.length < 48) return;
-
-        const signed_data = rest.slice(0, -32);
-        const received_hmac = rest.slice(-32);
-        const expected_hmac = crypto.hmac_sha256(hmac_key, signed_data);
-
-        let hmac_match = true;
-        for (let i=0; i<32; i++) {
-            if (expected_hmac[i] !== received_hmac[i]) hmac_match = false;
+    close() {
+        if (this.status === Link.CLOSED) return;
+        if (this.status !== Link.PENDING && this.derivedKey) {
+            this.rns.sendData(protocol.build_link_packet(this.linkId, this.derivedKey, this.linkId, protocol.CONTEXT_LINKCLOSE));
         }
-        if (!hmac_match) return;
+        this._teardown();
+    }
 
-        const iv = signed_data.slice(0, 16);
-        const ciphertext = signed_data.slice(16);
-        const decrypted = crypto.aes_cbc_decrypt(aes_key, iv, ciphertext);
-
-        this.emit('packet', decrypted);
+    _teardown() {
+        this.status = Link.CLOSED;
+        clearTimeout(this._establishmentTimer);
+        clearInterval(this._keepaliveTimer);
+        this.rns.links.delete(crypto.bytesToHex(this.linkId));
+        this.emit('closed', this);
     }
 }
 
@@ -306,4 +559,20 @@ export class Interface {
     }
     connect() {}
     sendData(data) { throw new Error("Not implemented"); }
+    // Interfaces that can address one specific neighbor out of several (e.g.
+    // one of many WebRTC peer connections) should override this for
+    // point-to-point next-hop forwarding; the default just broadcasts.
+    sendDataToPeer(peerId, data) { this.sendData(data); }
+    // Broadcasts to every neighbor on this interface except one — needed so
+    // that flooding (announces, opaque relay) can relay between two peers on
+    // the *same* multi-peer interface (e.g. two WebRTC connections on one
+    // browser peer acting as a relay) without echoing back to whoever just
+    // sent it. Interfaces that don't distinguish neighbors (the common case:
+    // one Interface object per link) can't tell "the sender" apart from
+    // "everyone on this interface" — since the sender IS the only neighbor,
+    // the safe default is to send to no one, matching the old behavior of
+    // simply never rebroadcasting back out the interface a packet arrived
+    // on. Broadcasting here would echo the packet straight back to whoever
+    // just sent it.
+    sendDataExcluding(excludedPeerId, data) {}
 }
