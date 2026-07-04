@@ -1,6 +1,7 @@
 import * as protocol from './protocol.js';
 import { EventEmitter } from 'events';
 import * as crypto from './crypto.js';
+import { pack, unpack } from 'msgpackr';
 
 export class Reticulum extends EventEmitter {
     constructor() {
@@ -64,7 +65,7 @@ export class Reticulum extends EventEmitter {
             } else if (packet.packet_type === protocol.PACKET_DATA) {
                 if (packet.destination_type === protocol.DEST_LINK) {
                     const link = this.links.get(destHex);
-                    if (link) link.onData(packet, data);
+                    if (link) link.onPacket(packet);
                 } else if (destination) {
                     destination.onData(packet);
                 }
@@ -186,8 +187,8 @@ export class Destination extends EventEmitter {
     }
 
     onLinkRequest(packet, rawBytes) {
-        const link = new Link(this.rns, this, false);
-        link.accept(packet, rawBytes);
+        const link = Link.fromRequest(this.rns, this, packet, rawBytes);
+        if (link) this.emit('link', link);
     }
 
     onProof(packet) {
@@ -202,100 +203,189 @@ export class Destination extends EventEmitter {
     }
 }
 
+// Wire-compatible with RNS.Link's core handshake (LINKREQUEST -> PROOF ->
+// LRRTT), per-link Token encryption, KEEPALIVE, and LINKCLOSE — verified
+// byte-for-byte against the real `rns` package (see protocol.js's "RNS.Link
+// wire format" section and test/rns-compliance.test.js).
+//
+// Not implemented: RNS.Link's exact RTT-adaptive keepalive/stale/timeout
+// state machine (this uses simple fixed intervals instead), Resource
+// transfers, Request/Response, Channel, and packet-level delivery proofs
+// (RNS.Packet.prove()/link.validate()). See README's Compliance section.
 export class Link extends EventEmitter {
-    constructor(rns, destination, initiator=true) {
+    static PENDING = 0;
+    static HANDSHAKE = 1;
+    static ACTIVE = 2;
+    static CLOSED = 4;
+
+    static DEFAULT_MTU = 500;
+    static ESTABLISHMENT_TIMEOUT_MS = 15000;
+    static KEEPALIVE_INTERVAL_MS = 30000;
+    static STALE_AFTER_MS = Link.KEEPALIVE_INTERVAL_MS * 2.5;
+
+    // Use Link.fromRequest() to construct a responder-side link from an
+    // incoming LINKREQUEST packet; use `new Link(rns, destination)` directly
+    // to initiate one.
+    constructor(rns, destination) {
         super();
         this.rns = rns;
         this.destination = destination;
-        this.initiator = initiator;
-        this.status = 'PENDING';
-        this.hash = new Uint8Array(16); // Will be set to link ID
-        this.shared_key = null;
+        this.status = Link.PENDING;
+        this.mtu = Link.DEFAULT_MTU;
+        this.derivedKey = null;
+        this._keepaliveTimer = null;
+        this._establishmentTimer = null;
+
+        this.initiator = true;
+        this.xPrivate = crypto.private_ratchet();
+        this.xPublic = crypto.x25519_pubkey(this.xPrivate);
+        // Fresh ephemeral signing key per link, unlinkable to the initiator's
+        // real identity (matches RNS.Link generating a throwaway Ed25519 key
+        // instead of reusing owner.identity.sig_prv, which only the
+        // *responder* side does).
+        this.sigPrivate = crypto.randomBytes(32);
+        this.sigPublic = crypto.ed25519_pubkey(this.sigPrivate);
+
+        const requestRaw = protocol.build_link_request(destination.hash, this.xPublic, this.sigPublic, this.mtu);
+        const unpacked = protocol.packet_unpack(requestRaw);
+        this.linkId = protocol.link_id_from_request(requestRaw, unpacked.data.length);
+        this.hash = this.linkId;
+
+        this.rns.links.set(crypto.bytesToHex(this.linkId), this);
+        this.requestTime = Date.now();
+        this.rns.sendData(requestRaw);
+        this._armEstablishmentTimeout();
     }
 
-    async accept(link_request_packet, raw_bytes) {
-        this.peer_pub = link_request_packet.data.slice(0, 32);
-        this.hash = crypto.sha256(raw_bytes).slice(0, 16);
-        this.rns.links.set(crypto.bytesToHex(this.hash), this);
+    static fromRequest(rns, destination, packet, rawBytes) {
+        const parsed = protocol.parse_link_request(packet);
+        if (!parsed) return null;
 
-        // Generate ephemeral key for this link
-        const ephemeral_priv = crypto.private_ratchet();
-        const ephemeral_pub = crypto.public_ratchet(ephemeral_priv);
+        const link = Object.create(Link.prototype);
+        EventEmitter.call(link);
+        link.rns = rns;
+        link.destination = destination;
+        link.status = Link.HANDSHAKE;
+        link.initiator = false;
+        link.mtu = parsed.mtu || Link.DEFAULT_MTU;
+        link._keepaliveTimer = null;
+        link._establishmentTimer = null;
 
-        // Compute shared secret
-        const shared_secret = crypto.x25519_exchange(ephemeral_priv, this.peer_pub);
-        this.shared_key = crypto.hkdf(shared_secret, 64, this.hash);
+        link.peerXPublic = parsed.peer_x_pub;
+        link.peerSigPublic = parsed.peer_sig_pub;
 
-        // Build link proof packet
-        const proofData = crypto.concat(ephemeral_pub, crypto.ed25519_sign(this.destination.identity.private.slice(32), this.hash));
+        link.xPrivate = crypto.private_ratchet();
+        link.xPublic = crypto.x25519_pubkey(link.xPrivate);
+        // Reuse the destination identity's real signing key, matching
+        // RNS.Link (self.sig_prv = self.owner.identity.sig_prv for a
+        // responder) — the destination's identity is already public via
+        // its announces, so there's no anonymity to preserve here.
+        link.sigPrivate = destination.identity.private.slice(32);
+        link.sigPublic = crypto.ed25519_pubkey(link.sigPrivate);
 
-        const packet = {
-            header_type: 0,
-            context_flag: 0,
-            transport_type: 0,
-            destination_type: protocol.DEST_LINK,
-            packet_type: protocol.PACKET_PROOF,
-            hops: 0,
-            destination_hash: this.hash,
-            context: protocol.CONTEXT_LRPROOF,
-            data: proofData
-        };
-        this.rns.sendData(protocol.packet_pack(packet));
-        this.status = 'ACTIVE';
-        this.destination.emit('link', this);
+        link.linkId = protocol.link_id_from_request(rawBytes, packet.data.length);
+        link.hash = link.linkId;
+        link.derivedKey = protocol.link_handshake(link.xPrivate, link.peerXPublic, link.linkId);
+
+        link.rns.links.set(crypto.bytesToHex(link.linkId), link);
+        link.requestTime = Date.now();
+
+        const proofRaw = protocol.build_link_proof(link.linkId, destination.identity.private, link.xPublic, link.mtu);
+        link.rns.sendData(proofRaw);
+        link._armEstablishmentTimeout();
+
+        return link;
+    }
+
+    _armEstablishmentTimeout() {
+        clearTimeout(this._establishmentTimer);
+        this._establishmentTimer = setTimeout(() => {
+            if (this.status !== Link.ACTIVE) this.close();
+        }, Link.ESTABLISHMENT_TIMEOUT_MS);
+    }
+
+    // Initiator-side: called when a PROOF (context=LRPROOF) packet addressed
+    // to this link arrives.
+    onProof(packet) {
+        if (this.status !== Link.PENDING || !this.initiator) return;
+
+        const validated = protocol.validate_link_proof(packet, this.linkId, this.destination.identity.public.slice(32));
+        if (!validated) return;
+
+        this.peerXPublic = validated.peer_x_pub;
+        this.mtu = validated.mtu || this.mtu;
+        this.derivedKey = protocol.link_handshake(this.xPrivate, this.peerXPublic, this.linkId);
+        this.rtt = (Date.now() - this.requestTime) / 1000;
+        this.status = Link.ACTIVE;
+        clearTimeout(this._establishmentTimer);
+
+        let rttData = pack(this.rtt);
+        if (!(rttData instanceof Uint8Array)) rttData = new Uint8Array(rttData);
+        const rttPacket = protocol.build_link_packet(this.linkId, this.derivedKey, rttData, protocol.CONTEXT_LRRTT);
+        this.rns.sendData(rttPacket);
+
+        this._startKeepalive();
+        this.emit('established', this);
+    }
+
+    // Dispatches an incoming DATA packet addressed to this link by context:
+    // application data (NONE), the initiator's RTT report (LRRTT),
+    // KEEPALIVE ping/pong, or LINKCLOSE teardown.
+    onPacket(packet) {
+        if (this.status === Link.CLOSED) return;
+
+        if (packet.context === protocol.CONTEXT_KEEPALIVE) {
+            if (!this.initiator && packet.data.length === 1 && packet.data[0] === 0xff) {
+                this.rns.sendData(protocol.build_link_packet(this.linkId, this.derivedKey, new Uint8Array([0xfe]), protocol.CONTEXT_KEEPALIVE));
+            }
+            return;
+        }
+
+        if (!this.derivedKey) return;
+        const plaintext = protocol.link_decrypt(this.derivedKey, packet.data);
+        if (plaintext === null) return;
+
+        if (packet.context === protocol.CONTEXT_NONE) {
+            this.emit('packet', plaintext);
+        } else if (packet.context === protocol.CONTEXT_LRRTT && !this.initiator) {
+            const reportedRtt = unpack(plaintext);
+            this.rtt = Math.max((Date.now() - this.requestTime) / 1000, reportedRtt);
+            this.status = Link.ACTIVE;
+            clearTimeout(this._establishmentTimer);
+            this._startKeepalive();
+            this.emit('established', this);
+        } else if (packet.context === protocol.CONTEXT_LINKCLOSE) {
+            if (crypto.bytesToHex(plaintext) === crypto.bytesToHex(this.linkId)) this._teardown();
+        }
     }
 
     send(data) {
-        if (this.status !== 'ACTIVE' || !this.shared_key) return;
-
-        const hmac_key = this.shared_key.slice(0, 32);
-        const aes_key = this.shared_key.slice(32);
-
-        const iv = crypto.randomBytes(16);
-        const ciphertext = crypto.aes_cbc_encrypt(aes_key, iv, data);
-        const signed_data = crypto.concat(iv, ciphertext);
-        const message_hmac = crypto.hmac_sha256(hmac_key, signed_data);
-
-        const packet_data = crypto.concat(signed_data, message_hmac);
-
-        const packet = {
-            header_type: 0,
-            context_flag: 0,
-            transport_type: 0,
-            destination_type: protocol.DEST_LINK,
-            packet_type: protocol.PACKET_DATA,
-            hops: 0,
-            destination_hash: this.hash,
-            context: protocol.CONTEXT_NONE,
-            data: packet_data
-        };
-        this.rns.sendData(protocol.packet_pack(packet));
+        if (this.status !== Link.ACTIVE) return;
+        this.rns.sendData(protocol.build_link_packet(this.linkId, this.derivedKey, data, protocol.CONTEXT_NONE));
     }
 
-    onData(packet, raw_bytes) {
-        if (!this.shared_key) return;
+    _startKeepalive() {
+        clearInterval(this._keepaliveTimer);
+        if (!this.initiator) return;
+        this._keepaliveTimer = setInterval(() => {
+            this.rns.sendData(protocol.build_link_packet(this.linkId, this.derivedKey, new Uint8Array([0xff]), protocol.CONTEXT_KEEPALIVE));
+        }, Link.KEEPALIVE_INTERVAL_MS);
+    }
 
-        const hmac_key = this.shared_key.slice(0, 32);
-        const aes_key = this.shared_key.slice(32);
-
-        const rest = packet.data;
-        if (rest.length < 48) return;
-
-        const signed_data = rest.slice(0, -32);
-        const received_hmac = rest.slice(-32);
-        const expected_hmac = crypto.hmac_sha256(hmac_key, signed_data);
-
-        let hmac_match = true;
-        for (let i=0; i<32; i++) {
-            if (expected_hmac[i] !== received_hmac[i]) hmac_match = false;
+    close() {
+        if (this.status === Link.CLOSED) return;
+        if (this.status !== Link.PENDING && this.derivedKey) {
+            this.rns.sendData(protocol.build_link_packet(this.linkId, this.derivedKey, this.linkId, protocol.CONTEXT_LINKCLOSE));
         }
-        if (!hmac_match) return;
+        this._teardown();
+    }
 
-        const iv = signed_data.slice(0, 16);
-        const ciphertext = signed_data.slice(16);
-        const decrypted = crypto.aes_cbc_decrypt(aes_key, iv, ciphertext);
-
-        this.emit('packet', decrypted);
+    _teardown() {
+        this.status = Link.CLOSED;
+        clearTimeout(this._establishmentTimer);
+        clearInterval(this._keepaliveTimer);
+        this.rns.links.delete(crypto.bytesToHex(this.linkId));
+        this.emit('closed', this);
     }
 }
 

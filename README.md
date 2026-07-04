@@ -3,7 +3,7 @@
 A JavaScript reimplementation of a subset of the [Reticulum Network Stack](https://reticulum.network/) (RNS) wire protocol, using WebRTC data channels as the peer-to-peer transport and public [Nostr](https://nostr.com/) 
 relays for connection signaling. Peers run in the browser or in Node.js and form a sparse mesh; a TCP gateway on the Node.js side bridges raw TCP connections into the mesh.
 
-This is a from-scratch implementation, not a port of or a wrapper around the reference [`rns`](https://github.com/markqvist/Reticulum) Python implementation. Packet framing, identity/destination hashing, announces, and single-destination encryption are now verified byte-for-byte against the real `rns` package; `Link`, `Transport` (path-finding/multi-hop routing), and LXMF are not yet compliant. It still does not interoperate with the official Reticulum network, official LXMF clients (Sideband, NomadNet), or LXMF propagation nodes. See [Compliance](#compliance) and [Known limitations](#known-limitations) before relying on it for anything.
+This is a from-scratch implementation, not a port of or a wrapper around the reference [`rns`](https://github.com/markqvist/Reticulum) Python implementation. Packet framing, identity/destination hashing, announces, single-destination encryption, and the core `Link` handshake are now verified byte-for-byte against the real `rns` package; `Transport` (path-finding/multi-hop routing), `Resource`/`Channel`/`Request`-`Response`, and LXMF are not yet compliant. It still does not interoperate with the official Reticulum network, official LXMF clients (Sideband, NomadNet), or LXMF propagation nodes. See [Compliance](#compliance) and [Known limitations](#known-limitations) before relying on it for anything.
 
 **Live demo:** https://sloev.github.io/reticulum-webrtc-tcp/ — the browser peer, built and deployed straight from `browser/` (see [Deploying the demo](#deploying-the-demo)). Open it in two tabs (or send someone the link) to form a mesh link over public Nostr relays and exchange messages.
 
@@ -37,10 +37,11 @@ Implements enough of Reticulum's wire format to interoperate between the peers i
 - Destination hashing: `SHA-256(name_hash || identity_hash)`, where `identity_hash = SHA-256(identity_public_key)[:16]`, each truncated to 16 bytes.
 - Announces: Ed25519-signed packets that broadcast an identity's public key and X25519 ratchet key; peers cache these to know who they can talk to.
 - Single-destination data: X25519 ECDH with the announced ratchet key (or the destination's primary key, if no ratchet is known), HKDF-derived AES-256-CBC key with PKCS7 padding, and HMAC-SHA256 authentication.
+- `Link` (`shared/rns/index.js`): the core handshake — LINKREQUEST (ephemeral X25519 + Ed25519 keys, MTU/mode signalling), the responder's Ed25519-signed PROOF, the ECDH+HKDF handshake keyed by the link ID, and per-link Token-encrypted DATA/LRRTT/KEEPALIVE/LINKCLOSE packets.
 
 Not yet verified or compliant:
 
-- Links: an ephemeral X25519 handshake (link request/proof) followed by per-link AES-CBC + HMAC encrypted data packets — this is a rough approximation, not checked against `RNS.Link`.
+- `Link`'s exact RTT-adaptive keepalive/stale/timeout state machine (this uses simple fixed intervals instead — see [Compliance](#compliance)), and packet-level delivery proofs (`RNS.Packet.prove()`/`link.validate()`).
 - A minimal LXMF-style message envelope (msgpack-encoded `[timestamp, title, content, fields]`, Ed25519-signed) — this mimics LXMF's basic header shape only; see [Compliance](#compliance).
 
 ### Transport (WebRTC) and signaling (Nostr)
@@ -114,16 +115,20 @@ This project is a from-scratch reimplementation, checked against the real [`rns`
 - Identity hash (`SHA-256(public_key)[:16]`) and destination hash (`SHA-256(name_hash + identity_hash)[:16]`). An earlier version of this hashed the raw public key directly instead of the identity hash, producing destination hashes that were never compatible with real Reticulum — this is now fixed.
 - Announces: field layout, signed data, and the Ed25519 signature itself all match byte-for-byte. Ed25519 signing is deterministic, so a matching signature over the same message is strong evidence the entire preceding computation is correct, not just superficially similar.
 - Single-destination encryption (`RNS.Identity.encrypt`/`decrypt`): X25519 ECDH, HKDF (salt = identity hash), AES-256-CBC with PKCS7 padding, HMAC-SHA256 authentication, and the token layout (`ephemeral_pubkey + iv + ciphertext + hmac`) — including the fallback path used when no ratchet is available, where encryption goes directly to the destination's primary X25519 key.
+- `Link`'s core handshake (`RNS.Link`): the LINKREQUEST packet (ephemeral X25519 + Ed25519 public keys plus 3-byte MTU/mode signalling), `link_id` derivation, the responder's PROOF packet (signed with the destination identity's real Ed25519 key, not an ephemeral one), the ECDH+HKDF handshake keyed by the link ID, and the Token-encrypted LRRTT/KEEPALIVE/LINKCLOSE/application-data packets that flow over an established link — all checked byte-for-byte, including the Ed25519 signature on the PROOF packet, against a full initiator/responder handshake captured from `rns`.
 - `node/tcp-gateway.js`'s HDLC framing matches `RNS.Interfaces.TCPInterface.HDLC` exactly, including escape-sequence handling.
+
+**Verified functionally, but not byte-exact or fully spec-compliant:**
+
+- `Link`'s operational lifecycle uses simple fixed intervals (15s establishment timeout, 30s keepalive) instead of `RNS.Link`'s RTT-adaptive keepalive/stale/timeout state machine (`KEEPALIVE_MIN`/`MAX` scaled by measured RTT, a separate STALE state before teardown, physical-layer stats). The wire format for each packet type is verified; the timing behavior around when they're sent is a simplification.
 
 **Not yet implemented, and not compliant:**
 
-- `Link` (`shared/rns/index.js`): the link-request/proof handshake is a rough approximation, not checked against `RNS.Link` (keepalives, RTT tracking, MTU/resource-strategy negotiation, and more — 1,458 lines in the reference implementation). Treat links as unverified.
 - `Transport`: no path-finding, transport tables, or multi-hop routing across independent Reticulum nodes (`RNS.Transport` is 3,613 lines implementing exactly this). Announce propagation here is still just "rebroadcast to this peer's other local interfaces" — see [Routing](#routing).
-- `Resource` / `Channel` / `Buffer`: not implemented (large-file transfer, request/response, buffered-channel protocols).
+- `Resource` / `Channel` / `Buffer` / `Request`/`Response`: not implemented (large-file transfer, buffered-channel, and request/response protocols that build on top of `Link`). Packet-level delivery proofs (`RNS.Packet.prove()`/`link.validate()`) are also not implemented.
 - LXMF: the `lxmf_build`/`lxmf_parse` functions in `shared/rns/protocol.js` mimic LXMF's basic envelope shape (source hash, signature, msgpacked `[timestamp, title, content, fields]`) only — no propagation-node protocol, no proof-of-work propagation stamps (required by LXMF v0.9.x+ before propagation nodes will route a message), no compression/node-sync negotiation. A message from this stack sent to an official LXMF client (Sideband, NomadNet) or propagation node would still be rejected as malformed.
 
-In short: a peer running this codebase now produces and validates announces and single-destination encrypted packets that a real Reticulum node would also consider valid, and the TCP gateway speaks real `TCPInterface` framing — but there's still no `Link`, `Transport`, `Resource`, or real LXMF compliance.
+In short: a peer running this codebase now produces and validates announces, single-destination encrypted packets, and full `Link` handshakes/data exchange that a real Reticulum node would also consider valid, and the TCP gateway speaks real `TCPInterface` framing — but there's still no `Transport`-level multi-hop routing, `Resource`/`Channel`/`Request`-`Response`, or real LXMF compliance. Note also that `Link`'s establishment doesn't currently drive the demo UI (`browser/main.js` messages over single-destination encryption directly) — it's available as a verified API, not yet wired into the chat demo.
 
 ## Known limitations
 

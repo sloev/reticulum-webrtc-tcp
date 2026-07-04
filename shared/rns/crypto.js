@@ -47,6 +47,17 @@ export function public_ratchet(ratchet_priv) {
   return x25519.getPublicKey(ratchet_priv);
 }
 
+// Generic single-key variants of public_identity()'s halves, for contexts
+// (like RNS.Link's per-link ephemeral keys) that use a bare X25519 or
+// Ed25519 key instead of the concatenated 64-byte identity key format.
+export function x25519_pubkey(private_key) {
+  return x25519.getPublicKey(private_key);
+}
+
+export function ed25519_pubkey(private_key) {
+  return ed25519.getPublicKey(private_key);
+}
+
 export function sha256(data) {
   return sha256Hash(data);
 }
