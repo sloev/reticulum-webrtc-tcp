@@ -441,6 +441,158 @@ test('a single-destination message is delivered across two hops via next-hop for
   assert.equal(await bGotPacket, 'hello across two hops');
 });
 
+test('a Link establishes, exchanges data both ways, round-trips a Request/Response, and tears down through an intermediate relay with no direct link between initiator and responder', async () => {
+  // Same A <-> Relay <-> B topology as the two tests above, but this time the
+  // relay owns neither endpoint of a real Link — exercising
+  // Reticulum._forwardLinkRequest()/_forwardLinkTraffic() (the "link table"),
+  // which lets the LINKREQUEST, the responder's PROOF, ongoing application
+  // data, a Request/Response round trip, and the eventual LINKCLOSE all pass
+  // through the relay in either direction, keyed by link_id rather than the
+  // path table (a link_id isn't a real, announced destination).
+  const rnsA = new Reticulum();
+  const rnsRelay = new Reticulum();
+  const rnsB = new Reticulum();
+
+  class Bridge extends Interface {
+    connect() {}
+    sendData(data) { setTimeout(() => this.other.rns.onPacketReceived(data, this.other), 0); }
+  }
+  const linkAR1 = new Bridge('A-side');
+  const linkAR2 = new Bridge('Relay-side-A');
+  linkAR1.other = linkAR2;
+  linkAR2.other = linkAR1;
+  rnsA.addInterface(linkAR1);
+  rnsRelay.addInterface(linkAR2);
+
+  const linkRB1 = new Bridge('Relay-side-B');
+  const linkRB2 = new Bridge('B-side');
+  linkRB1.other = linkRB2;
+  linkRB2.other = linkRB1;
+  rnsRelay.addInterface(linkRB1);
+  rnsB.addInterface(linkRB2);
+
+  const identityB = Identity.create();
+  const destB = new Destination(rnsB, identityB, Destination.IN, Destination.SINGLE, 'test', 'linkrelay');
+  destB.registerRequestHandler('greet', (data) => ({ reply: `hello ${data.name}` }));
+
+  const relayGotAnnounce = new Promise((resolve) => rnsRelay.once('announce', resolve));
+  destB.announce();
+  await relayGotAnnounce;
+
+  const aGotAnnounce = new Promise((resolve) => rnsA.once('announce', resolve));
+  rnsA.requestPath(destB.hash);
+  await aGotAnnounce;
+
+  const outDest = new Destination(rnsA, identityB, Destination.OUT, Destination.SINGLE, 'test', 'linkrelay');
+  outDest.hash = destB.hash;
+
+  const responderLinkPromise = new Promise((resolve) => destB.on('link', resolve));
+  const initiatorLink = new Link(rnsA, outDest);
+
+  await new Promise((resolve) => initiatorLink.once('established', resolve));
+  assert.equal(initiatorLink.status, Link.ACTIVE);
+
+  const responderLink = await responderLinkPromise;
+  await new Promise((resolve) => (responderLink.status === Link.ACTIVE ? resolve() : responderLink.once('established', resolve)));
+
+  assert.equal(crypto.bytesToHex(initiatorLink.linkId), crypto.bytesToHex(responderLink.linkId));
+  assert.equal(crypto.bytesToHex(initiatorLink.derivedKey), crypto.bytesToHex(responderLink.derivedKey));
+  assert.ok(rnsRelay.linkTable.has(crypto.bytesToHex(initiatorLink.linkId)), 'relay remembers this link_id in its link table');
+  assert.equal(rnsRelay.links.has(crypto.bytesToHex(initiatorLink.linkId)), false, 'relay does not own the link itself');
+
+  const responderGot = new Promise((resolve) => responderLink.once('packet', (d) => resolve(new TextDecoder().decode(d))));
+  initiatorLink.send(new TextEncoder().encode('hello responder, through a relay'));
+  assert.equal(await responderGot, 'hello responder, through a relay');
+
+  const initiatorGot = new Promise((resolve) => initiatorLink.once('packet', (d) => resolve(new TextDecoder().decode(d))));
+  responderLink.send(new TextEncoder().encode('hello initiator, through a relay'));
+  assert.equal(await initiatorGot, 'hello initiator, through a relay');
+
+  const response = await initiatorLink.request('greet', { name: 'relayed-world' });
+  assert.deepEqual(response, { reply: 'hello relayed-world' });
+
+  const responderClosed = new Promise((resolve) => responderLink.once('closed', resolve));
+  initiatorLink.close();
+  await responderClosed;
+
+  assert.equal(rnsRelay.linkTable.has(crypto.bytesToHex(initiatorLink.linkId)), false, 'relay cleans up its link table entry once LINKCLOSE passes through');
+});
+
+test('packet delivery proof (implicit form) matches RNS.Packet.prove()/PacketReceipt.validate_proof() byte-for-byte', () => {
+  const rawPacket = crypto.hexToBytes(
+    '00002faebc8928662560965b80058e75991a0032304d474ae3fcf3fbfbe69adbc08e463eed019c823856dbaca7a34af69f8772f34a75cfeeda151f1f2f9c3b87b74cd11014d7abca02bc5a1aacde57fd859a94f9b92d29662e987fb5e894934e373894f9debfda1ffe805a9fdbb2eb5d818c4ed3a10fcef0375fb5509a80f99dc693af'
+  );
+  const fullHash = protocol.packet_full_hash(rawPacket);
+  assert.equal(crypto.bytesToHex(fullHash), '4eb08be93adb3b6688d7f0097127da3e7a35cad5065526713c2e65d26422a5e2');
+
+  const proofPacket = protocol.build_packet_proof(fullHash, TEST_PRIVATE_KEY);
+  const parsed = protocol.packet_unpack(proofPacket);
+  assert.equal(
+    crypto.bytesToHex(parsed.data),
+    '877456df4296cc353ccf1744db619fe59c2fa97662b4dba595cab5a1f798dae3acb9f595911db76460e4576b811850de428f3fa0e3ae5ad8dfcae894e63e5809'
+  );
+
+  const destPub = crypto.public_identity(TEST_PRIVATE_KEY);
+  assert.equal(protocol.validate_packet_proof(parsed, fullHash, destPub), true);
+});
+
+test('Destination.send({ requestProof: true }) resolves once the receiver calls prove() on the received packet', async () => {
+  const rnsA = new Reticulum();
+  const rnsB = new Reticulum();
+
+  class Bridge extends Interface {
+    connect() {}
+    sendData(data) { setTimeout(() => this.other.rns.onPacketReceived(data, this.other), 0); }
+  }
+  const ifaceA = new Bridge('A');
+  const ifaceB = new Bridge('B');
+  ifaceA.other = ifaceB;
+  ifaceB.other = ifaceA;
+  rnsA.addInterface(ifaceA);
+  rnsB.addInterface(ifaceB);
+
+  const identityB = Identity.create();
+  const destB = new Destination(rnsB, identityB, Destination.IN, Destination.SINGLE, 'test', 'proof');
+
+  const aGotAnnounce = new Promise((resolve) => rnsA.once('announce', resolve));
+  destB.announce();
+  await aGotAnnounce;
+
+  const outDest = new Destination(rnsA, identityB, Destination.OUT, Destination.SINGLE, 'test', 'proof');
+
+  destB.on('packet', (e) => e.prove());
+  const receipt = await outDest.send(new TextEncoder().encode('please confirm delivery'), { requestProof: true });
+  assert.ok(receipt.packetFullHash);
+});
+
+test('Destination.send({ requestProof: true }) rejects on timeout if the receiver never proves the packet', async () => {
+  const rnsA = new Reticulum();
+  const rnsB = new Reticulum();
+
+  class Bridge extends Interface {
+    connect() {}
+    sendData(data) { setTimeout(() => this.other.rns.onPacketReceived(data, this.other), 0); }
+  }
+  const ifaceA = new Bridge('A');
+  const ifaceB = new Bridge('B');
+  ifaceA.other = ifaceB;
+  ifaceB.other = ifaceA;
+  rnsA.addInterface(ifaceA);
+  rnsB.addInterface(ifaceB);
+
+  const identityB = Identity.create();
+  const destB = new Destination(rnsB, identityB, Destination.IN, Destination.SINGLE, 'test', 'proof-timeout');
+
+  const aGotAnnounce = new Promise((resolve) => rnsA.once('announce', resolve));
+  destB.announce();
+  await aGotAnnounce;
+
+  const outDest = new Destination(rnsA, identityB, Destination.OUT, Destination.SINGLE, 'test', 'proof-timeout');
+
+  // destB deliberately never calls e.prove() here.
+  await assert.rejects(outDest.send(new TextEncoder().encode('nobody will confirm this'), { requestProof: true, timeout: 50 }));
+});
+
 test('an announce floods between two peers on the same multi-peer interface (e.g. a single WebRTCInterface relaying between two of its own data channels)', async () => {
   // Regression test for a bug where Reticulum.onPacketReceived's flood
   // rebroadcast only excluded the whole receiving Interface object, not the
