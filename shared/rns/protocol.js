@@ -13,6 +13,10 @@ export const DEST_PLAIN = 0x02;
 export const DEST_LINK = 0x03;
 
 export const CONTEXT_NONE = 0x00;
+export const CONTEXT_RESOURCE = 0x01;
+export const CONTEXT_RESOURCE_ADV = 0x02;
+export const CONTEXT_RESOURCE_REQ = 0x03;
+export const CONTEXT_RESOURCE_PRF = 0x05;
 export const CONTEXT_REQUEST = 0x09;
 export const CONTEXT_RESPONSE = 0x0a;
 export const CONTEXT_PATH_RESPONSE = 0x0b;
@@ -540,4 +544,142 @@ export function lxmf_parse(decrypted, destination_hash, sender_pub) {
     } catch {
         return false;
     }
+}
+
+// --- RNS.Resource (chunked large-transfer protocol over a Link) ---
+// A deliberately bounded implementation: single-segment only (no >
+// RESOURCE_MAX_PARTS-part transfers — real RNS splits those into multiple
+// advertised segments), no compression (real RNS bz2-compresses by default),
+// and no windowed rate-adaptation/retransmission (real RNS's Resource
+// requests parts in adaptive windows and retries on loss, tuned for lossy
+// shared-bandwidth radio links — this project's transports, WebRTC data
+// channels and TCP, are already reliable and ordered, so the receiver just
+// requests every part in one shot). The wire primitives that remain —
+// advertisement, request, part, and proof packets, and the hashing scheme
+// that ties them together — match RNS.Resource/ResourceAdvertisement's
+// format and context bytes exactly. See README's Compliance section.
+export const RESOURCE_MAPHASH_LEN = 4;
+export const RESOURCE_RANDOM_HASH_LEN = 4;
+// Plaintext (post link-encryption) bytes per part packet. Conservative
+// relative to a real RNS link's ~431-byte MDU, leaving headroom for this
+// project's 19-byte packet header without needing to compute an exact
+// per-platform MTU budget.
+export const RESOURCE_SDU = 400;
+// Caps a resource to what fits in a single advertisement's hashmap (real RNS
+// splits larger transfers into multiple advertised segments instead) — see
+// the module comment above.
+export const RESOURCE_MAX_PARTS = 128;
+
+export function resource_map_hash(part_data, random_hash) {
+    return crypto.sha256(crypto.concat(part_data, random_hash)).slice(0, RESOURCE_MAPHASH_LEN);
+}
+
+// Encrypts and slices `plaintext` into parts for a Link Resource transfer,
+// and computes the values both sides need to identify parts and verify the
+// transfer completed intact. `link_encrypt_fn` is usually
+// `(data) => link_encrypt(link.derivedKey, data)`. Throws if the data would
+// need more than RESOURCE_MAX_PARTS parts.
+export function resource_prepare(plaintext, link_encrypt_fn) {
+    const embeddedSalt = crypto.randomBytes(RESOURCE_RANDOM_HASH_LEN);
+    const cipherBlob = link_encrypt_fn(crypto.concat(embeddedSalt, plaintext));
+
+    const totalParts = Math.max(1, Math.ceil(cipherBlob.length / RESOURCE_SDU));
+    if (totalParts > RESOURCE_MAX_PARTS) {
+        throw new Error(`Resource of ${plaintext.length} bytes needs ${totalParts} parts, exceeding the ${RESOURCE_MAX_PARTS}-part single-segment limit (see README's Compliance section)`);
+    }
+
+    const randomHash = crypto.randomBytes(RESOURCE_RANDOM_HASH_LEN);
+    const resourceHash = crypto.sha256(crypto.concat(plaintext, randomHash));
+    const expectedProof = crypto.sha256(crypto.concat(plaintext, resourceHash));
+
+    const parts = [];
+    const hashmapEntries = [];
+    for (let i = 0; i < totalParts; i++) {
+        const partData = cipherBlob.slice(i * RESOURCE_SDU, (i + 1) * RESOURCE_SDU);
+        parts.push(partData);
+        hashmapEntries.push(resource_map_hash(partData, randomHash));
+    }
+
+    return {
+        randomHash, resourceHash, expectedProof, parts, hashmapEntries,
+        hashmap: crypto.concat(...hashmapEntries),
+        totalParts, transferSize: cipherBlob.length, dataSize: plaintext.length,
+    };
+}
+
+// Matches ResourceAdvertisement's msgpack field layout ({t,d,n,h,r,o,i,l,q,f,m}).
+// f (flags) only ever sets the "encrypted" bit here — compression, segment
+// splitting, has-metadata, and the request/response variants aren't
+// implemented, so those bits are always 0.
+export function build_resource_advertisement({ transferSize, dataSize, totalParts, resourceHash, randomHash, hashmap }) {
+    const dict = {
+        t: transferSize, d: dataSize, n: totalParts,
+        h: resourceHash, r: randomHash, o: resourceHash,
+        i: 0, l: 1, q: null, f: 0x01, m: hashmap,
+    };
+    return lxmfMsgpack.pack(dict);
+}
+
+export function parse_resource_advertisement(data) {
+    const dict = lxmfMsgpack.unpack(data);
+    const flags = dict.f;
+    return {
+        transferSize: dict.t, dataSize: dict.d, totalParts: dict.n,
+        resourceHash: dict.h, randomHash: dict.r, originalHash: dict.o,
+        segmentIndex: dict.i, totalSegments: dict.l, requestId: dict.q,
+        encrypted: (flags & 0x01) === 0x01,
+        compressed: ((flags >> 1) & 0x01) === 0x01,
+        split: ((flags >> 2) & 0x01) === 0x01,
+        hasMetadata: ((flags >> 5) & 0x01) === 0x01,
+        hashmap: dict.m,
+    };
+}
+
+// Matches Resource.request_next()'s request_data layout: a hashmap-exhausted
+// flag byte (always "not exhausted" here, since this implementation always
+// requests every part in one shot — see the module comment above) + the
+// resource hash + the requested map hashes concatenated.
+export function build_resource_request(resource_hash, requested_hashes) {
+    return crypto.concat(new Uint8Array([0x00]), resource_hash, requested_hashes);
+}
+
+export function parse_resource_request(data) {
+    const hashmapExhausted = data[0];
+    const resourceHash = data.slice(1, 33);
+    const requestedHashesRaw = data.slice(33);
+    const requestedHashes = [];
+    for (let i = 0; i < requestedHashesRaw.length; i += RESOURCE_MAPHASH_LEN) {
+        requestedHashes.push(requestedHashesRaw.slice(i, i + RESOURCE_MAPHASH_LEN));
+    }
+    return { hashmapExhausted, resourceHash, requestedHashes };
+}
+
+// Resource part packets carry a raw ciphertext slice, unencrypted at the
+// packet level — the whole blob was already encrypted once in
+// resource_prepare(), matching RNS.Packet.pack()'s "a resource takes care of
+// encryption by itself" special case (context == RESOURCE skips the usual
+// per-packet Link Token encryption that build_link_packet() applies).
+export function build_resource_part_packet(link_id, part_data) {
+    return packet_pack({
+        header_type: 0, context_flag: 0, transport_type: 0, destination_type: DEST_LINK,
+        packet_type: PACKET_DATA, hops: 0, destination_hash: link_id, context: CONTEXT_RESOURCE, data: part_data,
+    });
+}
+
+export function build_resource_proof(resource_hash, proof_value) {
+    return crypto.concat(resource_hash, proof_value);
+}
+
+export function parse_resource_proof(data) {
+    if (data.length !== 64) return null;
+    return { resourceHash: data.slice(0, 32), proofValue: data.slice(32, 64) };
+}
+
+// Resource proofs, like Link proofs, aren't encrypted at the packet level
+// (RNS.Packet.pack(): "Resource proofs are not encrypted").
+export function build_resource_proof_packet(link_id, resource_hash, proof_value) {
+    return packet_pack({
+        header_type: 0, context_flag: 0, transport_type: 0, destination_type: DEST_LINK,
+        packet_type: PACKET_PROOF, hops: 0, destination_hash: link_id, context: CONTEXT_RESOURCE_PRF, data: build_resource_proof(resource_hash, proof_value),
+    });
 }

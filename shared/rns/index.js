@@ -455,6 +455,8 @@ export class Link extends EventEmitter {
         this._keepaliveTimer = null;
         this._establishmentTimer = null;
         this.pendingRequests = new Map(); // request_id hex -> { resolve, reject, timer }
+        this._outgoingResources = new Map(); // resource_hash hex -> { parts, hashmapEntries, expectedProof, resolve, reject, timer }
+        this._incomingResources = new Map(); // resource_hash hex -> { randomHash, hashmapEntries, parts, receivedCount }
 
         this.initiator = true;
         this.xPrivate = crypto.private_ratchet();
@@ -491,6 +493,8 @@ export class Link extends EventEmitter {
         link._keepaliveTimer = null;
         link._establishmentTimer = null;
         link.pendingRequests = new Map();
+        link._outgoingResources = new Map();
+        link._incomingResources = new Map();
 
         link.peerXPublic = parsed.peer_x_pub;
         link.peerSigPublic = parsed.peer_sig_pub;
@@ -526,8 +530,16 @@ export class Link extends EventEmitter {
     }
 
     // Initiator-side: called when a PROOF (context=LRPROOF) packet addressed
-    // to this link arrives.
+    // to this link arrives. Also handles RESOURCE_PRF (a Resource transfer's
+    // completion proof — see sendResource()/_onResourceProof below), which
+    // can arrive on either side of the link, at any point after it's ACTIVE,
+    // unlike the handshake's LRPROOF.
     onProof(packet) {
+        if (packet.context === protocol.CONTEXT_RESOURCE_PRF) {
+            this._onResourceProof(packet.data);
+            return;
+        }
+
         if (this.status !== Link.PENDING || !this.initiator) return;
 
         const validated = protocol.validate_link_proof(packet, this.linkId, this.destination.identity.public.slice(32));
@@ -551,8 +563,9 @@ export class Link extends EventEmitter {
 
     // Dispatches an incoming DATA packet addressed to this link by context:
     // application data (NONE), the initiator's RTT report (LRRTT),
-    // KEEPALIVE ping/pong, LINKCLOSE teardown, or a REQUEST/RESPONSE.
-    // `rawBytes` is needed (only for REQUEST) to compute the request_id.
+    // KEEPALIVE ping/pong, LINKCLOSE teardown, a REQUEST/RESPONSE, or a
+    // Resource transfer's advertisement/part/request. `rawBytes` is needed
+    // (only for REQUEST) to compute the request_id.
     onPacket(packet, rawBytes) {
         if (this.status === Link.CLOSED) return;
 
@@ -563,11 +576,24 @@ export class Link extends EventEmitter {
             return;
         }
 
+        // Resource part packets carry a raw ciphertext slice, not further
+        // encrypted at the packet level (the whole blob was already
+        // encrypted once in resource_prepare()) — see protocol.js's
+        // "RNS.Resource" section.
+        if (packet.context === protocol.CONTEXT_RESOURCE) {
+            this._onResourcePart(packet.data);
+            return;
+        }
+
         if (!this.derivedKey) return;
         const plaintext = protocol.link_decrypt(this.derivedKey, packet.data);
         if (plaintext === null) return;
 
-        if (packet.context === protocol.CONTEXT_NONE) {
+        if (packet.context === protocol.CONTEXT_RESOURCE_ADV) {
+            this._onResourceAdvertisement(plaintext);
+        } else if (packet.context === protocol.CONTEXT_RESOURCE_REQ) {
+            this._onResourceRequest(plaintext);
+        } else if (packet.context === protocol.CONTEXT_NONE) {
             this.emit('packet', plaintext);
         } else if (packet.context === protocol.CONTEXT_LRRTT && !this.initiator) {
             const reportedRtt = unpack(plaintext);
@@ -592,11 +618,159 @@ export class Link extends EventEmitter {
         }
     }
 
+    // Transfers `data` to the peer on the other end of this link as a
+    // Resource (chunked across multiple packets), resolving once the peer's
+    // completion proof is received, or rejecting on timeout or a failed
+    // integrity check. Useful for payloads too large for a single Request/
+    // Response or LXMF packet. See protocol.js's "RNS.Resource" section for
+    // exactly what's implemented (single-segment, uncompressed, no windowed
+    // retry) versus real RNS's Resource.
+    sendResource(data, { timeout = 30000 } = {}) {
+        if (this.status !== Link.ACTIVE) return Promise.reject(new Error('Link is not active'));
+
+        let prepared;
+        try {
+            prepared = protocol.resource_prepare(data, (plaintext) => protocol.link_encrypt(this.derivedKey, plaintext));
+        } catch (e) {
+            return Promise.reject(e);
+        }
+
+        const resourceHashHex = crypto.bytesToHex(prepared.resourceHash);
+        const advPayload = protocol.build_resource_advertisement({
+            transferSize: prepared.transferSize, dataSize: prepared.dataSize, totalParts: prepared.totalParts,
+            resourceHash: prepared.resourceHash, randomHash: prepared.randomHash, hashmap: prepared.hashmap,
+        });
+        const advPacket = protocol.build_link_packet(this.linkId, this.derivedKey, advPayload, protocol.CONTEXT_RESOURCE_ADV);
+
+        return new Promise((resolve, reject) => {
+            const timer = setTimeout(() => {
+                this._outgoingResources.delete(resourceHashHex);
+                reject(new Error('Resource transfer timed out'));
+            }, timeout);
+
+            this._outgoingResources.set(resourceHashHex, {
+                parts: prepared.parts, hashmapEntries: prepared.hashmapEntries,
+                expectedProof: prepared.expectedProof, resolve, reject, timer,
+            });
+
+            this.rns.sendData(advPacket);
+        });
+    }
+
+    // Receiver side: a peer advertised a Resource transfer. Always accepts
+    // (no accept/reject callback, unlike real RNS) and immediately requests
+    // every part in one shot — no windowing, since this project's transports
+    // are already reliable and ordered (see protocol.js's "RNS.Resource"
+    // section).
+    _onResourceAdvertisement(plaintext) {
+        let adv;
+        try {
+            adv = protocol.parse_resource_advertisement(plaintext);
+        } catch {
+            return;
+        }
+        if (adv.compressed || adv.split || adv.hasMetadata) return; // not implemented — see protocol.js
+        if (!adv.totalParts || adv.totalParts > protocol.RESOURCE_MAX_PARTS) return;
+
+        const hashmapEntries = [];
+        for (let i = 0; i < adv.totalParts; i++) {
+            hashmapEntries.push(adv.hashmap.slice(i * protocol.RESOURCE_MAPHASH_LEN, (i + 1) * protocol.RESOURCE_MAPHASH_LEN));
+        }
+
+        this._incomingResources.set(crypto.bytesToHex(adv.resourceHash), {
+            randomHash: adv.randomHash, resourceHash: adv.resourceHash,
+            hashmapEntries, parts: new Array(adv.totalParts).fill(null), receivedCount: 0,
+        });
+
+        const requestPayload = protocol.build_resource_request(adv.resourceHash, adv.hashmap);
+        const requestPacket = protocol.build_link_packet(this.linkId, this.derivedKey, requestPayload, protocol.CONTEXT_RESOURCE_REQ);
+        this.rns.sendData(requestPacket);
+    }
+
+    // Sender side: the receiver requested some (in this implementation,
+    // always all) parts of a resource we advertised.
+    _onResourceRequest(plaintext) {
+        const { resourceHash, requestedHashes } = protocol.parse_resource_request(plaintext);
+        const pending = this._outgoingResources.get(crypto.bytesToHex(resourceHash));
+        if (!pending) return;
+
+        for (const wantedHash of requestedHashes) {
+            const wantedHex = crypto.bytesToHex(wantedHash);
+            const index = pending.hashmapEntries.findIndex((h) => crypto.bytesToHex(h) === wantedHex);
+            if (index === -1) continue;
+            this.rns.sendData(protocol.build_resource_part_packet(this.linkId, pending.parts[index]));
+        }
+    }
+
+    // Receiver side: one part of an in-progress resource transfer arrived.
+    // Parts carry no explicit index — like real RNS, the part is identified
+    // by matching its content hash against the advertised hashmap.
+    _onResourcePart(partData) {
+        for (const [resourceHashHex, incoming] of this._incomingResources.entries()) {
+            const mapHash = crypto.bytesToHex(protocol.resource_map_hash(partData, incoming.randomHash));
+            const index = incoming.hashmapEntries.findIndex((h) => crypto.bytesToHex(h) === mapHash);
+            if (index === -1 || incoming.parts[index] !== null) continue;
+
+            incoming.parts[index] = partData;
+            incoming.receivedCount++;
+
+            if (incoming.receivedCount === incoming.hashmapEntries.length) {
+                this._assembleResource(resourceHashHex, incoming);
+            }
+            return;
+        }
+    }
+
+    // All parts of a resource have arrived: decrypt the reassembled blob,
+    // verify it hashes to what was advertised, and — if it checks out —
+    // emit it and send the sender a completion proof.
+    _assembleResource(resourceHashHex, incoming) {
+        this._incomingResources.delete(resourceHashHex);
+
+        const cipherBlob = crypto.concat(...incoming.parts);
+        const preEncryptBlob = protocol.link_decrypt(this.derivedKey, cipherBlob);
+        if (preEncryptBlob === null) {
+            this.emit('resource-failed', { reason: 'decrypt-failed' });
+            return;
+        }
+
+        const plaintext = preEncryptBlob.slice(protocol.RESOURCE_RANDOM_HASH_LEN);
+        const calculatedHash = crypto.sha256(crypto.concat(plaintext, incoming.randomHash));
+        if (crypto.bytesToHex(calculatedHash) !== resourceHashHex) {
+            this.emit('resource-failed', { reason: 'hash-mismatch' });
+            return;
+        }
+
+        const proofValue = crypto.sha256(crypto.concat(plaintext, calculatedHash));
+        this.rns.sendData(protocol.build_resource_proof_packet(this.linkId, incoming.resourceHash, proofValue));
+
+        this.emit('resource', plaintext);
+    }
+
+    // Sender side: the receiver's completion proof for a resource we sent.
+    _onResourceProof(data) {
+        const parsed = protocol.parse_resource_proof(data);
+        if (!parsed) return;
+
+        const key = crypto.bytesToHex(parsed.resourceHash);
+        const pending = this._outgoingResources.get(key);
+        if (!pending) return;
+
+        clearTimeout(pending.timer);
+        this._outgoingResources.delete(key);
+
+        if (crypto.bytesToHex(parsed.proofValue) === crypto.bytesToHex(pending.expectedProof)) {
+            pending.resolve();
+        } else {
+            pending.reject(new Error('Resource proof did not match the expected value'));
+        }
+    }
+
     // Sends a request to whichever peer is on the other end of this link,
     // and resolves with the response data once it's received (or rejects
     // on timeout). Only the direct-packet form is implemented — a request or
-    // response that doesn't fit in a single packet has no fallback here
-    // (real RNS falls back to a Resource transfer; see README).
+    // response that doesn't fit in a single packet has no fallback here.
+    // For larger payloads, use sendResource() explicitly instead.
     request(path, data, { timeout = 10000 } = {}) {
         if (this.status !== Link.ACTIVE) return Promise.reject(new Error('Link is not active'));
 
@@ -656,6 +830,12 @@ export class Link extends EventEmitter {
         clearTimeout(this._establishmentTimer);
         clearInterval(this._keepaliveTimer);
         this.rns.links.delete(crypto.bytesToHex(this.linkId));
+        for (const pending of this._outgoingResources.values()) {
+            clearTimeout(pending.timer);
+            pending.reject(new Error('Link closed before resource transfer completed'));
+        }
+        this._outgoingResources.clear();
+        this._incomingResources.clear();
         this.emit('closed', this);
     }
 }
