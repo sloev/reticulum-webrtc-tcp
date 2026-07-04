@@ -216,15 +216,21 @@ export function validate_announce(packet) {
   return { public_key, name_hash: name_hash_bytes, random_hash, ratchet, signature, app_data };
 }
 
-export function build_data(plaintext, receiver_identity_pub, receiver_ratchet_pub, full_name) {
-  const destination_hash = get_identity_destination_hash(receiver_identity_pub, full_name);
+// Matches RNS.Identity.encrypt(): the same X25519 ECDH + HKDF + AES-256-CBC +
+// HMAC-SHA256 token used for single-destination DATA packets, but as a
+// standalone operation rather than a full packet — reused as-is for
+// encrypting an LXMF message to its recipient before handing it to a
+// propagation node for store-and-forward (see propagation.js), where the
+// prefixed destination_hash needs to stay outside the ciphertext so the
+// propagation node can index by it without being able to read the message.
+export function identity_encrypt(plaintext, receiver_identity_pub, receiver_ratchet_pub) {
   const salt = identity_hash(receiver_identity_pub);
 
   const ephemeral_priv = crypto.private_ratchet();
   const ephemeral_pub = crypto.public_ratchet(ephemeral_priv);
 
-  // Matches RNS.Identity.encrypt(): use the announced ratchet if the sender
-  // has one, otherwise fall back to the receiver's primary X25519 key.
+  // Use the announced ratchet if the sender has one, otherwise fall back to
+  // the receiver's primary X25519 key.
   const target_pub = (receiver_ratchet_pub && receiver_ratchet_pub.length > 0)
       ? receiver_ratchet_pub
       : receiver_identity_pub.slice(0, 32);
@@ -238,7 +244,12 @@ export function build_data(plaintext, receiver_identity_pub, receiver_ratchet_pu
   const signed_data = crypto.concat(iv, ciphertext);
   const message_hmac = crypto.hmac_sha256(derived_key.slice(0, 32), signed_data);
 
-  const data = crypto.concat(ephemeral_pub, signed_data, message_hmac);
+  return crypto.concat(ephemeral_pub, signed_data, message_hmac);
+}
+
+export function build_data(plaintext, receiver_identity_pub, receiver_ratchet_pub, full_name) {
+  const destination_hash = get_identity_destination_hash(receiver_identity_pub, full_name);
+  const data = identity_encrypt(plaintext, receiver_identity_pub, receiver_ratchet_pub);
 
   return packet_pack({
       header_type: 0, context_flag: 0, transport_type: 0, destination_type: DEST_SINGLE,

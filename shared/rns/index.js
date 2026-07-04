@@ -260,6 +260,23 @@ export class Identity {
     }
 }
 
+// Shared by Destination.onData() (opportunistic delivery) and
+// shared/rns/propagation.js's sync (propagated delivery): an LXMF payload
+// embeds its own sender's destination hash as its first 16 bytes; look up
+// that specific identity (learned from an earlier announce) rather than
+// brute-forcing every known identity, and require a *valid* signature
+// against it before treating the payload as LXMF. Returns the parsed
+// message, or null if it isn't a validly-signed LXMF payload from a known
+// sender.
+export function tryParseLxmf(rns, destination_hash, decrypted) {
+    if (decrypted.length < 16) return null;
+    const senderIdentity = rns.identities.get(crypto.bytesToHex(decrypted.slice(0, 16)));
+    if (!senderIdentity) return null;
+
+    const parsed = protocol.lxmf_parse(decrypted, destination_hash, senderIdentity.public_key);
+    return (parsed && parsed.valid) ? parsed : null;
+}
+
 export class Destination extends EventEmitter {
     static IN = 0;
     static OUT = 1;
@@ -356,19 +373,7 @@ export class Destination extends EventEmitter {
         // for senders who didn't have (or use) an announced ratchet.
         const decrypted = protocol.message_decrypt(packet, this.identity.public, [this.identity.ratchetPrivate, this.identity.private.slice(0, 32)]);
         if (decrypted) {
-            // An LXMF payload embeds its own sender's destination hash as its
-            // first 16 bytes; look up that specific identity (learned from an
-            // earlier announce) rather than brute-forcing every known
-            // identity, and require a *valid* signature against it before
-            // treating the payload as LXMF rather than plain Destination.send() data.
-            let parsedLxmf = null;
-            if (decrypted.length >= 16) {
-                const senderIdentity = this.rns.identities.get(crypto.bytesToHex(decrypted.slice(0, 16)));
-                if (senderIdentity) {
-                    const parsed = protocol.lxmf_parse(decrypted, this.hash, senderIdentity.public_key);
-                    if (parsed && parsed.valid) parsedLxmf = parsed;
-                }
-            }
+            const parsedLxmf = tryParseLxmf(this.rns, this.hash, decrypted);
 
             if (parsedLxmf) {
                 this.emit('lxmf', parsedLxmf);
