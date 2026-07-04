@@ -60,6 +60,18 @@ export class TCPServerInterface extends Interface {
       peerId.write(hdlcFrame(Buffer.from(data)));
     }
   }
+
+  // Broadcasts to every connected client except one — needed so flooding
+  // (announces, opaque relay) can relay between two TCP clients on this same
+  // gateway without echoing back to whoever just sent it.
+  sendDataExcluding(excludedPeerId, data) {
+    const framed = hdlcFrame(Buffer.from(data));
+    for (const socket of this.clients) {
+      if (socket !== excludedPeerId && socket.writable) {
+        socket.write(framed);
+      }
+    }
+  }
 }
 
 export function createTCPGateway(port, rns) {

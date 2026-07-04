@@ -441,6 +441,72 @@ test('a single-destination message is delivered across two hops via next-hop for
   assert.equal(await bGotPacket, 'hello across two hops');
 });
 
+test('an announce floods between two peers on the same multi-peer interface (e.g. a single WebRTCInterface relaying between two of its own data channels)', async () => {
+  // Regression test for a bug where Reticulum.onPacketReceived's flood
+  // rebroadcast only excluded the whole receiving Interface object, not the
+  // specific neighbor a packet arrived from. That's invisible with the
+  // Bridge helper above (one Interface object per link), but breaks any real
+  // interface that aggregates multiple neighbors on one object — like
+  // WebRTCInterface with several data channels, or TCPServerInterface with
+  // several client sockets. Here a single interface object plays both of the
+  // relay's neighbor connections, so a correct fix must call
+  // sendDataExcluding(fromPeerId, ...) to relay from one peer to the other
+  // while still not echoing the packet back to whichever peer sent it.
+  const rnsA = new Reticulum();
+  const rnsRelay = new Reticulum();
+  const rnsC = new Reticulum();
+
+  class MultiPeerBridge extends Interface {
+    connect() {}
+    // peers: Map of peerId -> the leaf's own Interface object, so the relay
+    // can inject data straight into that leaf's Reticulum instance.
+    sendData(data) {
+      for (const leafIface of this.peers.values()) {
+        setTimeout(() => leafIface.rns.onPacketReceived(data, leafIface), 0);
+      }
+    }
+    sendDataExcluding(excludedPeerId, data) {
+      for (const [peerId, leafIface] of this.peers.entries()) {
+        if (peerId !== excludedPeerId) {
+          setTimeout(() => leafIface.rns.onPacketReceived(data, leafIface), 0);
+        }
+      }
+    }
+  }
+
+  // The relay has ONE interface object with two "peers": A and C.
+  const relayIface = new MultiPeerBridge('relay-multi');
+  relayIface.peers = new Map();
+  rnsRelay.addInterface(relayIface);
+
+  class LeafBridge extends Interface {
+    connect() {}
+    // A leaf sending data injects it straight into the relay's Reticulum
+    // instance, tagged with which peer (this leaf) it arrived from.
+    sendData(data) { setTimeout(() => rnsRelay.onPacketReceived(data, relayIface, this.peerId), 0); }
+  }
+  const ifaceA = new LeafBridge('A-side');
+  const ifaceC = new LeafBridge('C-side');
+  ifaceA.peerId = 'A';
+  ifaceC.peerId = 'C';
+  rnsA.addInterface(ifaceA);
+  rnsC.addInterface(ifaceC);
+
+  relayIface.peers.set('A', ifaceA);
+  relayIface.peers.set('C', ifaceC);
+
+  const identityA = Identity.create();
+  const destA = new Destination(rnsA, identityA, Destination.IN, Destination.SINGLE, 'test', 'multipeer');
+
+  const relayGotAnnounce = new Promise((resolve) => rnsRelay.once('announce', resolve));
+  const cGotAnnounce = new Promise((resolve) => rnsC.once('announce', resolve));
+  destA.announce();
+
+  await relayGotAnnounce;
+  const announceOnC = await cGotAnnounce;
+  assert.equal(crypto.bytesToHex(announceOnC.destination_hash), crypto.bytesToHex(destA.hash));
+});
+
 test('HDLC framing matches RNS.Interfaces.TCPInterface.HDLC for a payload containing flag/escape bytes', () => {
   const payload = Buffer.from([0x01, 0x7e, 0x02, 0x7d, 0x03, 0x7e, 0x7d, 0x00, 0xff]);
   const framed = hdlcFrame(payload);

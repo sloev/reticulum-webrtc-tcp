@@ -41,11 +41,7 @@ export class Reticulum extends EventEmitter {
     onPacketReceived(data, receivingInterface, fromPeerId = null) {
         try {
             if ((data[0] & 0x80) === 0x80) {
-               for (const iface of this.interfaces) {
-                   if (iface !== receivingInterface) {
-                       iface.sendData(data);
-                   }
-               }
+               this._broadcastExcept(data, receivingInterface, fromPeerId);
                return;
             }
 
@@ -76,12 +72,10 @@ export class Reticulum extends EventEmitter {
                     }
 
                     this.emit('announce', { ...announce, destination_hash: packet.destination_hash });
-                    // Rebroadcast to other interfaces, with the incremented hop count.
-                    for (const iface of this.interfaces) {
-                        if (iface !== receivingInterface) {
-                            iface.sendData(forwarded);
-                        }
-                    }
+                    // Rebroadcast to every other neighbor (whether on this
+                    // same interface or a different one), with the
+                    // incremented hop count.
+                    this._broadcastExcept(forwarded, receivingInterface, fromPeerId);
                 }
             } else if (packet.packet_type === protocol.PACKET_LINKREQUEST) {
                 if (destination) destination.onLinkRequest(packet, data);
@@ -113,6 +107,20 @@ export class Reticulum extends EventEmitter {
             }
         } catch (e) {
             console.error("Error processing packet:", e);
+        }
+    }
+
+    // Floods data to every neighbor except the one it just arrived from —
+    // whether that neighbor is on a different Interface entirely, or is
+    // another peer on the same multi-peer interface (e.g. two WebRTC
+    // connections on one browser peer relaying between each other).
+    _broadcastExcept(data, receivingInterface, fromPeerId) {
+        for (const iface of this.interfaces) {
+            if (iface === receivingInterface) {
+                iface.sendDataExcluding(fromPeerId, data);
+            } else {
+                iface.sendData(data);
+            }
         }
     }
 
@@ -545,4 +553,16 @@ export class Interface {
     // one of many WebRTC peer connections) should override this for
     // point-to-point next-hop forwarding; the default just broadcasts.
     sendDataToPeer(peerId, data) { this.sendData(data); }
+    // Broadcasts to every neighbor on this interface except one — needed so
+    // that flooding (announces, opaque relay) can relay between two peers on
+    // the *same* multi-peer interface (e.g. two WebRTC connections on one
+    // browser peer acting as a relay) without echoing back to whoever just
+    // sent it. Interfaces that don't distinguish neighbors (the common case:
+    // one Interface object per link) can't tell "the sender" apart from
+    // "everyone on this interface" — since the sender IS the only neighbor,
+    // the safe default is to send to no one, matching the old behavior of
+    // simply never rebroadcasting back out the interface a packet arrived
+    // on. Broadcasting here would echo the packet straight back to whoever
+    // just sent it.
+    sendDataExcluding(excludedPeerId, data) {}
 }

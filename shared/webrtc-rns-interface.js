@@ -81,6 +81,14 @@ export class WebRTCInterface extends Interface {
         }
     }
 
+    sendDataExcluding(excludedPeerId, data) {
+        for (const [peerId, dc] of this.dataChannels.entries()) {
+            if (peerId !== excludedPeerId && dc.readyState === 'open') {
+                dc.send(data);
+            }
+        }
+    }
+
     onDataReceived(data, peerId) {
         try {
             if (this.rns) {
