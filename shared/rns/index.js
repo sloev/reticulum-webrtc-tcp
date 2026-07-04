@@ -221,9 +221,20 @@ export class Destination extends EventEmitter {
         this.rns.sendData(dataPacket);
     }
 
-    sendLXMF(title, content) {
+    // Sends an LXMF message to this (OUT) destination, signed by `source` —
+    // your own local (IN) destination, since `this.identity` on an OUT
+    // destination is the *recipient's* identity (used to encrypt to them),
+    // not yours. Matches LXMF's OPPORTUNISTIC delivery method: a single
+    // packet, opportunistically encrypted exactly like a normal DATA packet
+    // (see protocol.js's "LXMF" section for the wire format and README's
+    // Compliance section for what's not implemented, e.g. propagation nodes
+    // and Resource-based transfer for oversized messages).
+    sendLXMF(source, title, content, fields = {}) {
         if (this.direction !== Destination.OUT) {
-            throw new Error("Can only send to OUT destinations.");
+            throw new Error("Can only send LXMF to OUT destinations.");
+        }
+        if (!source || source.direction !== Destination.IN) {
+            throw new Error("LXMF source must be your own IN destination.");
         }
 
         const knownIdentity = this.rns.identities.get(crypto.bytesToHex(this.hash));
@@ -232,9 +243,7 @@ export class Destination extends EventEmitter {
             return;
         }
 
-        const sourcePriv = this.identity ? this.identity.private : crypto.private_identity();
-
-        const lxmfMsg = protocol.lxmf_build(content, sourcePriv, this.hash, null, null, title);
+        const lxmfMsg = protocol.lxmf_build(content, source.identity.private, this.hash, source.hash, null, title, fields);
         const dataPacket = protocol.build_data(lxmfMsg, knownIdentity.public_key, knownIdentity.ratchet, this.fullName);
         this.rns.sendData(dataPacket);
     }
@@ -247,16 +256,17 @@ export class Destination extends EventEmitter {
         // for senders who didn't have (or use) an announced ratchet.
         const decrypted = protocol.message_decrypt(packet, this.identity.public, [this.identity.ratchetPrivate, this.identity.private.slice(0, 32)]);
         if (decrypted) {
-            const knownIdentities = Array.from(this.rns.identities.values());
+            // An LXMF payload embeds its own sender's destination hash as its
+            // first 16 bytes; look up that specific identity (learned from an
+            // earlier announce) rather than brute-forcing every known
+            // identity, and require a *valid* signature against it before
+            // treating the payload as LXMF rather than plain Destination.send() data.
             let parsedLxmf = null;
-            let senderPub = null;
-
-            for (const id of knownIdentities) {
-                const parsed = protocol.lxmf_parse(decrypted, this.hash, id.public_key);
-                if (parsed && parsed.valid) {
-                    parsedLxmf = parsed;
-                    senderPub = id.public_key;
-                    break;
+            if (decrypted.length >= 16) {
+                const senderIdentity = this.rns.identities.get(crypto.bytesToHex(decrypted.slice(0, 16)));
+                if (senderIdentity) {
+                    const parsed = protocol.lxmf_parse(decrypted, this.hash, senderIdentity.public_key);
+                    if (parsed && parsed.valid) parsedLxmf = parsed;
                 }
             }
 

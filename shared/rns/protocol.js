@@ -1,5 +1,6 @@
 import * as crypto from './crypto.js';
 import { pack, unpack } from 'msgpackr';
+import * as lxmfMsgpack from './msgpack.js';
 
 export const PACKET_DATA = 0x00;
 export const PACKET_ANNOUNCE = 0x01;
@@ -452,24 +453,34 @@ export function parse_path_request(packet) {
     return { destination_hash, requesting_transport_id, tag };
 }
 
-// Mimics LXMF's basic envelope shape (source hash, signature, msgpacked
-// [timestamp, title, content, fields]) only. No propagation-node protocol, no
-// proof-of-work propagation stamp, no compression/node-sync negotiation — not
-// wire-compatible with real LXMF or accepted by official LXMF clients/nodes.
-export function lxmf_build(content, source_priv, destination_hash, source_hash, timestamp, title) {
+// Matches LXMF's core message envelope byte-for-byte (see LXMF.LXMessage.pack()/
+// unpack_from_bytes() in the reference implementation): msgpack([timestamp,
+// title, content, fields]) — using shared/rns/msgpack.js rather than msgpackr,
+// since msgpackr's int/float and map-size optimizations don't reproduce the
+// exact bytes LXMF's Python msgpack (umsgpack) would produce, and the message
+// hash/signature are computed over those exact bytes — hashed as
+// full_hash(destination_hash + source_hash + msgpack_payload), signed as
+// (that hash concatenated onto the hashed part). What's not implemented:
+// propagation-node stamps/tickets (LXMF's optional anti-spam proof-of-work),
+// the PROPAGATED/PAPER delivery methods, and Resource-based transfer for
+// messages too large for a single packet/link MDU — see README.
+export function lxmf_build(content, source_priv, destination_hash, source_hash, timestamp, title, fields = {}) {
     timestamp = timestamp || Date.now() / 1000;
     title = title || new Uint8Array(0);
     if (typeof title === 'string') title = new TextEncoder().encode(title);
     if (typeof content === 'string') content = new TextEncoder().encode(content);
     if (!source_hash) source_hash = crypto.sha256(crypto.public_identity(source_priv)).slice(0, 16);
 
-    let msgpack_raw = pack([timestamp, title, content, {}]);
-    if (!(msgpack_raw instanceof Uint8Array)) msgpack_raw = new Uint8Array(msgpack_raw);
+    const payload = [new lxmfMsgpack.Float64(timestamp), title, content, fields];
+    const msgpack_raw = lxmfMsgpack.pack(payload);
 
-    const message_id = crypto.sha256(crypto.concat(destination_hash, source_hash, msgpack_raw));
-    const signed_data = crypto.concat(destination_hash, source_hash, msgpack_raw, message_id);
+    const hashed_part = crypto.concat(destination_hash, source_hash, msgpack_raw);
+    const message_id = crypto.sha256(hashed_part);
+    const signed_data = crypto.concat(hashed_part, message_id);
     const signature = crypto.ed25519_sign(source_priv.slice(32), signed_data);
 
+    // This is the OPPORTUNISTIC wire form: destination_hash is omitted since
+    // it's implied by the packet's own (already-encrypted-to) destination.
     return crypto.concat(source_hash, signature, msgpack_raw);
 }
 
@@ -480,14 +491,15 @@ export function lxmf_parse(decrypted, destination_hash, sender_pub) {
     const msgpack_raw = decrypted.slice(80);
 
     try {
-        const data = unpack(msgpack_raw);
-        if (!data || data.length < 3) return false;
+        const data = lxmfMsgpack.unpack(msgpack_raw);
+        if (!data || data.length < 4) return false;
 
-        const message_id = crypto.sha256(crypto.concat(destination_hash, source_hash, msgpack_raw));
-        const signed_data = crypto.concat(destination_hash, source_hash, msgpack_raw, message_id);
+        const hashed_part = crypto.concat(destination_hash, source_hash, msgpack_raw);
+        const message_id = crypto.sha256(hashed_part);
+        const signed_data = crypto.concat(hashed_part, message_id);
         const valid = crypto.ed25519_validate(signature, signed_data, sender_pub.slice(32));
 
-        return { source_hash, signature, timestamp: data[0], title: data[1], content: data[2], fields: data[3], valid };
+        return { source_hash, signature, message_id, timestamp: data[0], title: data[1], content: data[2], fields: data[3], valid };
     } catch {
         return false;
     }

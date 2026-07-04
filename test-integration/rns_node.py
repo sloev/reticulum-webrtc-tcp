@@ -9,11 +9,16 @@ Commands (stdin, one JSON object per line):
   {"cmd": "announce"}
   {"cmd": "request_path", "dest_hash": "<hex>"}
   {"cmd": "send", "dest_hash": "<hex>", "text": "..."}
+  {"cmd": "send_lxmf", "dest_hash": "<hex>", "title": "...", "content": "..."}
 
 Events (stdout, one JSON object per line):
-  {"event": "ready", "dest_hash": "<hex>", "identity_hash": "<hex>", "public_key": "<hex>"}
+  {"event": "ready", "dest_hash": "<hex>", "identity_hash": "<hex>", "public_key": "<hex>", "lxmf_dest_hash": "<hex>"}
   {"event": "announce_received", "dest_hash": "<hex>", "hops": N}
   {"event": "packet_received", "dest_hash": "<hex>", "text": "..."}
+  {"event": "lxmf_received", "source_hash": "<hex>", "title": "...", "content": "...", "valid": bool}
+
+Requires the real `lxmf` package too (pip install lxmf) for the send_lxmf
+command and lxmf_received event.
 """
 import sys
 import json
@@ -22,6 +27,7 @@ import argparse
 import threading
 
 import RNS
+import LXMF
 
 
 def emit(event, **fields):
@@ -83,6 +89,29 @@ loglevel = 3
 
     destination.set_packet_callback(packet_callback)
 
+    # A separate LXMF delivery destination sharing the same identity, so this
+    # node can also participate as a real LXMF endpoint. Messages are sent
+    # and received directly as OPPORTUNISTIC single packets (bypassing
+    # LXMRouter/propagation nodes/stamps), matching this repo's JS LXMF
+    # implementation, for a fair, symmetric interop test.
+    lxmf_destination = RNS.Destination(identity, RNS.Destination.IN, RNS.Destination.SINGLE, LXMF.APP_NAME, "delivery")
+
+    def lxmf_callback(data, packet):
+        try:
+            full_bytes = lxmf_destination.hash + data
+            msg = LXMF.LXMessage.unpack_from_bytes(full_bytes)
+            emit(
+                "lxmf_received",
+                source_hash=msg.source_hash.hex(),
+                title=msg.title_as_string(),
+                content=msg.content_as_string(),
+                valid=msg.signature_validated,
+            )
+        except Exception as e:
+            emit("lxmf_error", error=str(e))
+
+    lxmf_destination.set_packet_callback(lxmf_callback)
+
     class Handler:
         aspect_filter = None
 
@@ -97,6 +126,7 @@ loglevel = 3
         dest_hash=destination.hash.hex(),
         identity_hash=identity.hash.hex(),
         public_key=identity.get_public_key().hex(),
+        lxmf_dest_hash=lxmf_destination.hash.hex(),
     )
 
     def handle_command(line):
@@ -107,6 +137,7 @@ loglevel = 3
 
         if cmd.get("cmd") == "announce":
             destination.announce()
+            lxmf_destination.announce()
         elif cmd.get("cmd") == "request_path":
             dest_hash = bytes.fromhex(cmd["dest_hash"])
             RNS.Transport.request_path(dest_hash)
@@ -118,6 +149,20 @@ loglevel = 3
                 return
             out_dest = RNS.Destination(peer_identity, RNS.Destination.OUT, RNS.Destination.SINGLE, args.app_name, args.aspect)
             RNS.Packet(out_dest, cmd["text"].encode("utf-8")).send()
+        elif cmd.get("cmd") == "send_lxmf":
+            dest_hash = bytes.fromhex(cmd["dest_hash"])
+            peer_identity = RNS.Identity.recall(dest_hash)
+            if peer_identity is None:
+                emit("send_failed", dest_hash=cmd["dest_hash"], reason="identity not known")
+                return
+            lxmf_out_dest = RNS.Destination(peer_identity, RNS.Destination.OUT, RNS.Destination.SINGLE, LXMF.APP_NAME, "delivery")
+            msg = LXMF.LXMessage(
+                lxmf_out_dest, lxmf_destination,
+                cmd.get("content", ""), cmd.get("title", ""),
+                desired_method=LXMF.LXMessage.OPPORTUNISTIC,
+            )
+            msg.pack()
+            RNS.Packet(lxmf_out_dest, msg.packed[LXMF.LXMessage.DESTINATION_LENGTH:]).send()
 
     for line in sys.stdin:
         line = line.strip()

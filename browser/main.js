@@ -119,7 +119,7 @@ const send = () => {
   const payload = new TextEncoder().encode(msg);
 
   if (knownPeers.has(toHex)) {
-    outDest.sendLXMF('Chat', payload);
+    outDest.sendLXMF(dest, 'Chat', payload);
     log('sent', `to ${toHex.slice(0, 12)}…: ${msg}`);
     msgInput.value = '';
   } else {

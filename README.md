@@ -3,7 +3,7 @@
 A JavaScript reimplementation of a subset of the [Reticulum Network Stack](https://reticulum.network/) (RNS) wire protocol, using WebRTC data channels as the peer-to-peer transport and public [Nostr](https://nostr.com/) 
 relays for connection signaling. Peers run in the browser or in Node.js and form a sparse mesh; a TCP gateway on the Node.js side bridges raw TCP connections into the mesh.
 
-This is a from-scratch implementation, not a port of or a wrapper around the reference [`rns`](https://github.com/markqvist/Reticulum) Python implementation. Packet framing, identity/destination hashing, announces, single-destination encryption, the core `Link` handshake, path request/response discovery, and small-payload `Link` Request/Response are now verified byte-for-byte against the real `rns` package. Single-destination messages can now be forwarded multiple hops through an intermediate peer; `Resource`/`Channel`, multi-hop `Link` relaying, and LXMF are not yet compliant. It still does not interoperate with the official Reticulum network, official LXMF clients (Sideband, NomadNet), or LXMF propagation nodes. See [Compliance](#compliance) and [Known limitations](#known-limitations) before relying on it for anything.
+This is a from-scratch implementation, not a port of or a wrapper around the reference [`rns`](https://github.com/markqvist/Reticulum) Python implementation. Packet framing, identity/destination hashing, announces, single-destination encryption, the core `Link` handshake, path request/response discovery, small-payload `Link` Request/Response, and single-packet LXMF messages are now verified byte-for-byte against the real `rns`/`lxmf` packages. Single-destination messages can now be forwarded multiple hops through an intermediate peer; `Resource`/`Channel`, multi-hop `Link` relaying, and LXMF's propagation-node/stamp economy are not yet compliant. It still does not interoperate with the official Reticulum network, official LXMF clients (Sideband, NomadNet), or LXMF propagation nodes. See [Compliance](#compliance) and [Known limitations](#known-limitations) before relying on it for anything.
 
 **Live demo:** https://sloev.github.io/reticulum-webrtc-tcp/ — the browser peer, built and deployed straight from `browser/` (see [Deploying the demo](#deploying-the-demo)). Open it in two tabs (or send someone the link) to form a mesh link over public Nostr relays and exchange messages.
 
@@ -12,7 +12,8 @@ This is a from-scratch implementation, not a port of or a wrapper around the ref
 ```
 shared/rns/                 Protocol implementation (transport-agnostic)
   crypto.js                   Ed25519 / X25519 / SHA-256 / HKDF / AES-CBC primitives (@noble/*)
-  protocol.js                  Packet framing, announces, Link, path requests, LXMF-style messages
+  msgpack.js                    Spec-compliant MessagePack encoder/decoder (byte-exact with LXMF's Python umsgpack)
+  protocol.js                  Packet framing, announces, Link, path requests, LXMF message envelopes
   index.js                     Reticulum router (path table), Identity, Destination, Link, Interface base class
 
 shared/webrtc-rns-interface.js  RNS Interface backed by RTCDataChannel peers (shared by browser + Node)
@@ -27,6 +28,7 @@ node/
 
 vite.config.js               Bundles browser/ for the browser (aliases Node builtins used by shared/rns)
 test/rns-compliance.test.js  Byte-exact vectors captured from the real `rns` package (node --test)
+test/lxmf-compliance.test.js Byte-exact vectors captured from the real `lxmf` package (node --test)
 ```
 
 ### Protocol layer (`shared/rns`)
@@ -106,6 +108,12 @@ There's also a heavier, separate integration check (not part of `npm test`, sinc
 PYLIBS=/path/to/site-packages npm run test:integration
 ```
 
+There's also `test-integration/lxmf-cross-language-check.mjs`, which has a real Python `lxmf`/`rns` process and this JS stack exchange genuine signed LXMF messages over real TCP in both directions. Requires `pip install rns lxmf`:
+
+```bash
+PYLIBS=/path/to/site-packages npm run test:integration:lxmf
+```
+
 ### Browser demo
 
 `browser/index.html` shows your peer's 16-byte destination hash (RID), a copy button, and live mesh status: the number of open WebRTC links and the RIDs of peers you've received an announce from (click one to fill in the destination field). Enter a destination RID and a message and send; the message goes out as an LXMF-style message once you've received an announce from that peer's identity (your own identity is announced automatically every 10 seconds).
@@ -129,6 +137,7 @@ This project is a from-scratch reimplementation, checked against the real [`rns`
 - `Link` Request/Response, small-payload form (`RNS.Link.request`/`handle_request`/`handle_response`): the `[timestamp, request_path_hash, data]` request envelope, the `[request_id, response_data]` response envelope, and that `request_id` (the packed REQUEST packet's own truncated hash) matches on both ends — all checked byte-for-byte, including decrypting real captured request/response ciphertext, against a captured exchange over a real link.
 - `Transport`'s path request/response wire format (`RNS.Transport`): the well-known `rnstransport.path.request` control destination hash, the path request packet layout (destination hash + tag, or + a requesting transport instance ID), and a path-response announce's `context=PATH_RESPONSE` byte — all checked byte-for-byte. Hop-count-aware path discovery through an intermediate peer is verified functionally (not byte-exact, since it depends on which of several correct announces propagates first) with a 3-peer test topology.
 - `node/tcp-gateway.js`'s HDLC framing matches `RNS.Interfaces.TCPInterface.HDLC` exactly, including escape-sequence handling.
+- LXMF's core message envelope (`shared/rns/protocol.js`'s `lxmf_build`/`lxmf_parse`, OPPORTUNISTIC delivery method only): `destination_hash + source_hash + signature + msgpack([timestamp, title, content, fields])`, with the message hash/signature computed exactly as `LXMF.LXMessage.pack()` does — checked byte-for-byte against the real [`lxmf`](https://pypi.org/project/lxmf/) package (v1.0.1) for a fixed source/destination/timestamp (see `test/lxmf-compliance.test.js`), including the msgpack encoding itself (`shared/rns/msgpack.js` — a small spec-compliant encoder written specifically because `msgpackr`, used elsewhere in this codebase, optimizes whole-number floats and small maps into different bytes than LXMF's Python `umsgpack` produces, which would have silently broken the hash/signature match). Cross-language interop is verified directly, not just byte comparison: `test-integration/lxmf-cross-language-check.mjs` has a real Python `lxmf`/`rns` process and this JS stack exchange genuine signed LXMF messages over real TCP, in both directions, each side validating the other's Ed25519 signature.
 
 **Verified functionally, but not byte-exact or fully spec-compliant:**
 
@@ -141,9 +150,9 @@ This project is a from-scratch reimplementation, checked against the real [`rns`
 - Multi-hop relaying of `Link` traffic: LINKREQUEST packets and an established link's ongoing packets (DATA/LRRTT/KEEPALIVE/etc., and Request/Response) are not forwarded through an intermediate peer, only delivered when local. Doing so needs a separate "link table" — remembering, per link ID, which neighbor a relayed LINKREQUEST came from and went to, so the eventual PROOF and all subsequent traffic can be routed back along the same path — which is more machinery than the path-table-based forwarding used for single-destination messages.
 - Requests/responses that don't fit in a single packet: real Reticulum falls back to a `Resource` transfer; there is no such fallback here.
 - `Resource` / `Channel` / `Buffer`: not implemented (large-file transfer and buffered-channel protocols that build on top of `Link`). Packet-level delivery proofs (`RNS.Packet.prove()`/`link.validate()`) are also not implemented.
-- LXMF: the `lxmf_build`/`lxmf_parse` functions in `shared/rns/protocol.js` mimic LXMF's basic envelope shape (source hash, signature, msgpacked `[timestamp, title, content, fields]`) only — no propagation-node protocol, no proof-of-work propagation stamps (required by LXMF v0.9.x+ before propagation nodes will route a message), no compression/node-sync negotiation. A message from this stack sent to an official LXMF client (Sideband, NomadNet) or propagation node would still be rejected as malformed.
+- LXMF beyond the OPPORTUNISTIC single-packet envelope: no propagation-node protocol or peer sync (`LXMRouter`/`LXMPeer`), no proof-of-work propagation stamps or tickets (`LXStamper`, required by real propagation nodes before they'll route a message), no DIRECT (link-based) or PROPAGATED delivery methods, no compression negotiation, and no `Resource`-based transfer for messages too large for a single packet — real LXMF falls back to a Reticulum `Link` + `Resource` for those, which isn't implemented here (see the `Resource`/`Channel` limitation above). A message from this stack still couldn't reach an official LXMF client (Sideband, NomadNet) through a propagation node, since that requires the stamp/ticket economy; direct peer-to-peer opportunistic delivery (the common case for two peers already in radio/link range of each other) is real and interoperable.
 
-In short: a peer running this codebase now produces and validates announces, single-destination encrypted packets (now forwardable across multiple hops through an intermediate peer), full `Link` handshakes/data exchange, small-payload Request/Response, and path requests/responses that a real Reticulum node would also consider valid, and the TCP gateway speaks real `TCPInterface` framing. What's still missing: multi-hop relaying of `Link` traffic specifically, `Resource`/`Channel` transfers, and real LXMF compliance. Note also that `Link`'s establishment doesn't currently drive the demo UI (`browser/main.js` messages over single-destination encryption directly) — it's available as a verified API, not yet wired into the chat demo.
+In short: a peer running this codebase now produces and validates announces, single-destination encrypted packets (now forwardable across multiple hops through an intermediate peer), full `Link` handshakes/data exchange, small-payload Request/Response, path requests/responses, and single-packet LXMF messages that a real Reticulum/LXMF node would also consider valid, and the TCP gateway speaks real `TCPInterface` framing. What's still missing: multi-hop relaying of `Link` traffic specifically, `Resource`/`Channel` transfers, and LXMF's propagation-node/stamp economy. Note also that `Link`'s establishment doesn't currently drive the demo UI (`browser/main.js` messages over single-destination encryption directly) — it's available as a verified API, not yet wired into the chat demo.
 
 ## Known limitations
 
