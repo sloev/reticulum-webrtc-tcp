@@ -302,6 +302,81 @@ test('Link.request()/registerRequestHandler() round-trip a request and response 
   initiatorLink.close();
 });
 
+test('Link.sendResource() transfers a multi-part payload and resolves once the receiver proves it, with content and hash verified on both ends', async () => {
+  const rnsA = new Reticulum();
+  const rnsB = new Reticulum();
+
+  class Bridge extends Interface {
+    connect() {}
+    sendData(data) { setTimeout(() => this.other.rns.onPacketReceived(data, this.other), 0); }
+  }
+  const ifaceA = new Bridge('A');
+  const ifaceB = new Bridge('B');
+  ifaceA.other = ifaceB;
+  ifaceB.other = ifaceA;
+  rnsA.addInterface(ifaceA);
+  rnsB.addInterface(ifaceB);
+
+  const identityB = Identity.create();
+  const destB = new Destination(rnsB, identityB, Destination.IN, Destination.SINGLE, 'test', 'resource');
+
+  const responderLinkPromise = new Promise((resolve) => destB.on('link', resolve));
+  const outDest = new Destination(rnsA, identityB, Destination.OUT, Destination.SINGLE, 'test', 'resource');
+  outDest.hash = destB.hash;
+  const initiatorLink = new Link(rnsA, outDest);
+
+  await new Promise((resolve) => initiatorLink.once('established', resolve));
+  const responderLink = await responderLinkPromise;
+  await new Promise((resolve) => (responderLink.status === Link.ACTIVE ? resolve() : responderLink.once('established', resolve)));
+
+  // Comfortably larger than a single packet/link MDU (~400-odd bytes), so
+  // this must actually split across multiple RESOURCE part packets.
+  const payload = new TextEncoder().encode('resource payload: '.repeat(200));
+  assert.ok(payload.length > 3000);
+
+  const responderGot = new Promise((resolve) => responderLink.once('resource', resolve));
+  const sendPromise = initiatorLink.sendResource(payload);
+
+  const received = await responderGot;
+  assert.equal(crypto.bytesToHex(received), crypto.bytesToHex(payload));
+
+  await sendPromise; // resolves once the receiver's completion proof arrives back
+
+  initiatorLink.close();
+});
+
+test('Link.sendResource() rejects when the payload would need more than the single-segment part limit', async () => {
+  const rnsA = new Reticulum();
+  const rnsB = new Reticulum();
+
+  class Bridge extends Interface {
+    connect() {}
+    sendData(data) { setTimeout(() => this.other.rns.onPacketReceived(data, this.other), 0); }
+  }
+  const ifaceA = new Bridge('A');
+  const ifaceB = new Bridge('B');
+  ifaceA.other = ifaceB;
+  ifaceB.other = ifaceA;
+  rnsA.addInterface(ifaceA);
+  rnsB.addInterface(ifaceB);
+
+  const identityB = Identity.create();
+  const destB = new Destination(rnsB, identityB, Destination.IN, Destination.SINGLE, 'test', 'resource-toobig');
+
+  const responderLinkPromise = new Promise((resolve) => destB.on('link', resolve));
+  const outDest = new Destination(rnsA, identityB, Destination.OUT, Destination.SINGLE, 'test', 'resource-toobig');
+  outDest.hash = destB.hash;
+  const initiatorLink = new Link(rnsA, outDest);
+
+  await new Promise((resolve) => initiatorLink.once('established', resolve));
+  await responderLinkPromise;
+
+  const tooBig = new Uint8Array(protocol.RESOURCE_MAX_PARTS * protocol.RESOURCE_SDU + 1000);
+  await assert.rejects(initiatorLink.sendResource(tooBig));
+
+  initiatorLink.close();
+});
+
 // --- RNS.Transport: path requests/responses ---
 
 test('path request destination hash and packet match RNS byte-for-byte', () => {
