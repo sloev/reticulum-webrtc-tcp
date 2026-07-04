@@ -10,12 +10,16 @@ Commands (stdin, one JSON object per line):
   {"cmd": "request_path", "dest_hash": "<hex>"}
   {"cmd": "send", "dest_hash": "<hex>", "text": "..."}
   {"cmd": "send_lxmf", "dest_hash": "<hex>", "title": "...", "content": "..."}
+  {"cmd": "send_resource", "text": "..."}
 
 Events (stdout, one JSON object per line):
   {"event": "ready", "dest_hash": "<hex>", "identity_hash": "<hex>", "public_key": "<hex>", "lxmf_dest_hash": "<hex>"}
   {"event": "announce_received", "dest_hash": "<hex>", "hops": N}
   {"event": "packet_received", "dest_hash": "<hex>", "text": "..."}
   {"event": "lxmf_received", "source_hash": "<hex>", "title": "...", "content": "...", "valid": bool}
+  {"event": "link_established"} — a peer established a real RNS.Link to this node's `destination`
+  {"event": "resource_received", "data_hex": "<hex>"} — a real RNS.Resource completed over that link
+  {"event": "resource_failed", "status": N}
 
 Requires the real `lxmf` package too (pip install lxmf) for the send_lxmf
 command and lxmf_received event.
@@ -88,6 +92,24 @@ loglevel = 3
         emit("packet_received", dest_hash=destination.hash.hex(), text=text, data_hex=data.hex())
 
     destination.set_packet_callback(packet_callback)
+
+    state = {"link": None}
+
+    def on_resource_concluded(resource):
+        if resource.status == RNS.Resource.COMPLETE:
+            data = resource.data.read()
+            emit("resource_received", data_hex=data.hex())
+        else:
+            emit("resource_failed", status=resource.status)
+
+    def on_link_established(link):
+        # Real RNS.Link defaults to ACCEPT_NONE for incoming resources.
+        link.set_resource_strategy(RNS.Link.ACCEPT_ALL)
+        link.set_resource_concluded_callback(on_resource_concluded)
+        state["link"] = link
+        emit("link_established")
+
+    destination.set_link_established_callback(on_link_established)
 
     # A separate LXMF delivery destination sharing the same identity, so this
     # node can also participate as a real LXMF endpoint. Messages are sent
@@ -163,6 +185,15 @@ loglevel = 3
             )
             msg.pack()
             RNS.Packet(lxmf_out_dest, msg.packed[LXMF.LXMessage.DESTINATION_LENGTH:]).send()
+        elif cmd.get("cmd") == "send_resource":
+            if state["link"] is None:
+                emit("send_failed", reason="no established link")
+                return
+            if "hex" in cmd:
+                payload = bytes.fromhex(cmd["hex"])
+            else:
+                payload = cmd["text"].encode("utf-8")
+            RNS.Resource(payload, state["link"])
 
     for line in sys.stdin:
         line = line.strip()

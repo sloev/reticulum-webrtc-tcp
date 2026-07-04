@@ -10,7 +10,9 @@
     "build": "vite build",
     "test": "node --test",
     "test:integration": "node test-integration/sparse-mesh-check.mjs",
-    "test:integration:lxmf": "node test-integration/lxmf-cross-language-check.mjs"
+    "test:integration:lxmf": "node test-integration/lxmf-cross-language-check.mjs",
+    "test:integration:resource": "node test-integration/resource-cross-language-check.mjs",
+    "test:integration:lxmf-propagation": "node test-integration/lxmf-propagation-cross-language-check.mjs"
   },
   "dependencies": {
     "@noble/ciphers": "^2.2.0",

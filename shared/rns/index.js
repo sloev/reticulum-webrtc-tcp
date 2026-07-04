@@ -628,8 +628,8 @@ export class Link extends EventEmitter {
     // completion proof is received, or rejecting on timeout or a failed
     // integrity check. Useful for payloads too large for a single Request/
     // Response or LXMF packet. See protocol.js's "RNS.Resource" section for
-    // exactly what's implemented (single-segment, uncompressed, no windowed
-    // retry) versus real RNS's Resource.
+    // exactly what's implemented (single-segment, uncompressed, fixed-size
+    // request window) versus real RNS's Resource.
     sendResource(data, { timeout = 30000 } = {}) {
         if (this.status !== Link.ACTIVE) return Promise.reject(new Error('Link is not active'));
 
@@ -663,10 +663,8 @@ export class Link extends EventEmitter {
     }
 
     // Receiver side: a peer advertised a Resource transfer. Always accepts
-    // (no accept/reject callback, unlike real RNS) and immediately requests
-    // every part in one shot — no windowing, since this project's transports
-    // are already reliable and ordered (see protocol.js's "RNS.Resource"
-    // section).
+    // (no accept/reject callback, unlike real RNS) and starts requesting
+    // parts in fixed-size windows (see _requestNextResourceParts below).
     _onResourceAdvertisement(plaintext) {
         let adv;
         try {
@@ -682,18 +680,45 @@ export class Link extends EventEmitter {
             hashmapEntries.push(adv.hashmap.slice(i * protocol.RESOURCE_MAPHASH_LEN, (i + 1) * protocol.RESOURCE_MAPHASH_LEN));
         }
 
-        this._incomingResources.set(crypto.bytesToHex(adv.resourceHash), {
+        const resourceHashHex = crypto.bytesToHex(adv.resourceHash);
+        this._incomingResources.set(resourceHashHex, {
             randomHash: adv.randomHash, resourceHash: adv.resourceHash,
-            hashmapEntries, parts: new Array(adv.totalParts).fill(null), receivedCount: 0,
+            hashmapEntries, parts: new Array(adv.totalParts).fill(null),
+            receivedCount: 0, consecutiveCompletedHeight: -1, outstandingParts: 0,
         });
 
-        const requestPayload = protocol.build_resource_request(adv.resourceHash, adv.hashmap);
+        this._requestNextResourceParts(resourceHashHex);
+    }
+
+    // Requests the next window's worth of not-yet-received parts, starting
+    // right after the longest known consecutive run of received parts —
+    // matches RNS.Resource.request_next(), but with a fixed window instead
+    // of one that adapts to measured throughput (see protocol.js's
+    // "RNS.Resource" section).
+    _requestNextResourceParts(resourceHashHex) {
+        const incoming = this._incomingResources.get(resourceHashHex);
+        if (!incoming) return;
+
+        const requested = [];
+        incoming.outstandingParts = 0;
+        for (let i = incoming.consecutiveCompletedHeight + 1; i < incoming.hashmapEntries.length && requested.length < protocol.RESOURCE_WINDOW; i++) {
+            if (incoming.parts[i] === null) {
+                requested.push(incoming.hashmapEntries[i]);
+                incoming.outstandingParts++;
+            }
+        }
+        if (requested.length === 0) return;
+
+        const requestPayload = protocol.build_resource_request(incoming.resourceHash, crypto.concat(...requested));
         const requestPacket = protocol.build_link_packet(this.linkId, this.derivedKey, requestPayload, protocol.CONTEXT_RESOURCE_REQ);
         this.rns.sendData(requestPacket);
     }
 
-    // Sender side: the receiver requested some (in this implementation,
-    // always all) parts of a resource we advertised.
+    // Sender side: the receiver requested some parts of a resource we
+    // advertised — send back whichever of our already-built parts match,
+    // trusting the receiver's own window/pacing entirely (matching real
+    // RNS.Resource.request(): the sender doesn't second-guess how many parts
+    // it's asked for at once).
     _onResourceRequest(plaintext) {
         const { resourceHash, requestedHashes } = protocol.parse_resource_request(plaintext);
         const pending = this._outgoingResources.get(crypto.bytesToHex(resourceHash));
@@ -708,19 +733,40 @@ export class Link extends EventEmitter {
     }
 
     // Receiver side: one part of an in-progress resource transfer arrived.
-    // Parts carry no explicit index — like real RNS, the part is identified
-    // by matching its content hash against the advertised hashmap.
+    // Parts carry no explicit index — like real RNS, a part is identified by
+    // matching its content hash against the advertised hashmap, bounded to
+    // the currently-outstanding request window (matching
+    // RNS.Resource.receive_part()'s bounded search).
     _onResourcePart(partData) {
         for (const [resourceHashHex, incoming] of this._incomingResources.entries()) {
+            const windowStart = incoming.consecutiveCompletedHeight >= 0 ? incoming.consecutiveCompletedHeight : 0;
+            const windowEnd = Math.min(windowStart + protocol.RESOURCE_WINDOW, incoming.hashmapEntries.length);
             const mapHash = crypto.bytesToHex(protocol.resource_map_hash(partData, incoming.randomHash));
-            const index = incoming.hashmapEntries.findIndex((h) => crypto.bytesToHex(h) === mapHash);
-            if (index === -1 || incoming.parts[index] !== null) continue;
 
-            incoming.parts[index] = partData;
+            let matchedIndex = -1;
+            for (let i = windowStart; i < windowEnd; i++) {
+                if (crypto.bytesToHex(incoming.hashmapEntries[i]) === mapHash) {
+                    matchedIndex = i;
+                    break;
+                }
+            }
+            if (matchedIndex === -1) continue;
+            if (incoming.parts[matchedIndex] !== null) return; // already have it
+
+            incoming.parts[matchedIndex] = partData;
             incoming.receivedCount++;
+            incoming.outstandingParts--;
+
+            let cp = incoming.consecutiveCompletedHeight + 1;
+            while (cp < incoming.parts.length && incoming.parts[cp] !== null) {
+                incoming.consecutiveCompletedHeight = cp;
+                cp++;
+            }
 
             if (incoming.receivedCount === incoming.hashmapEntries.length) {
                 this._assembleResource(resourceHashHex, incoming);
+            } else if (incoming.outstandingParts <= 0) {
+                this._requestNextResourceParts(resourceHashHex);
             }
             return;
         }
