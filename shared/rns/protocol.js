@@ -12,6 +12,8 @@ export const DEST_PLAIN = 0x02;
 export const DEST_LINK = 0x03;
 
 export const CONTEXT_NONE = 0x00;
+export const CONTEXT_REQUEST = 0x09;
+export const CONTEXT_RESPONSE = 0x0a;
 export const CONTEXT_PATH_RESPONSE = 0x0b;
 export const CONTEXT_KEEPALIVE = 0xfa;
 export const CONTEXT_LINKCLOSE = 0xfc;
@@ -35,6 +37,17 @@ export function identity_hash(identity_pub) {
 
 export function name_hash(full_name) {
     return crypto.sha256(new TextEncoder().encode(full_name)).slice(0, 10);
+}
+
+// Matches RNS.Packet.getTruncatedHash(): sha256(hashable_part)[:16], where
+// hashable_part is (flags & 0x0F) followed by everything after the hops
+// byte. Used as a Request/Response's request_id (the hash of the packed,
+// encrypted REQUEST packet's raw bytes, computed identically by sender and
+// receiver since the ciphertext is unchanged in transit).
+export function packet_truncated_hash(raw_packet) {
+    const flags = raw_packet[0];
+    const hashable_part = crypto.concat(new Uint8Array([flags & 0x0f]), raw_packet.slice(2));
+    return crypto.sha256(hashable_part).slice(0, 16);
 }
 
 // Matches RNS.Destination.hash(): sha256(name_hash + identity_hash)[:16].
@@ -347,6 +360,46 @@ export function build_link_packet(link_id, derived_key, data, context = CONTEXT_
         header_type: 0, context_flag: 0, transport_type: 0, destination_type: DEST_LINK,
         packet_type: PACKET_DATA, hops: 0, destination_hash: link_id, context, data: payload,
     });
+}
+
+// --- RNS.Link Request/Response (small-payload form only) ---
+// Verified byte-for-byte against the real `rns` package: the request/
+// response msgpack envelopes, and that request_id (packet_truncated_hash of
+// the packed REQUEST packet) matches on both the sending and receiving side.
+// Only the direct-packet form is implemented — RNS falls back to a Resource
+// transfer when a request or response doesn't fit in a single packet (over
+// the link MDU); that fallback is not implemented here (see README).
+
+export function request_path_hash(path) {
+    return crypto.sha256(new TextEncoder().encode(path)).slice(0, 16);
+}
+
+// Returns the msgpack-encoded [timestamp, request_path_hash, data] payload;
+// wrap it with build_link_packet(link_id, derived_key, payload,
+// CONTEXT_REQUEST) and then compute the request_id with
+// packet_truncated_hash() on the resulting packed bytes.
+export function build_request_payload(path, data, timestamp = Date.now() / 1000) {
+    let packed = pack([timestamp, request_path_hash(path), data]);
+    if (!(packed instanceof Uint8Array)) packed = new Uint8Array(packed);
+    return packed;
+}
+
+export function parse_request_payload(plaintext) {
+    const [timestamp, path_hash, data] = unpack(Buffer.from(plaintext));
+    return { timestamp, path_hash, data };
+}
+
+// Returns the msgpack-encoded [request_id, response_data] payload; wrap it
+// with build_link_packet(link_id, derived_key, payload, CONTEXT_RESPONSE).
+export function build_response_payload(request_id, response_data) {
+    let packed = pack([request_id, response_data]);
+    if (!(packed instanceof Uint8Array)) packed = new Uint8Array(packed);
+    return packed;
+}
+
+export function parse_response_payload(plaintext) {
+    const [request_id, response_data] = unpack(Buffer.from(plaintext));
+    return { request_id, response_data };
 }
 
 // --- RNS.Transport: path requests/responses ---

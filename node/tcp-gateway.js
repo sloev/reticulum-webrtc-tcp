@@ -22,7 +22,7 @@ export class TCPServerInterface extends Interface {
         if (!this.rns) return;
         for (const frame of decoder.push(data)) {
           if (frame.length > HEADER_MINSIZE) {
-            this.rns.onPacketReceived(new Uint8Array(frame), this);
+            this.rns.onPacketReceived(new Uint8Array(frame), this, socket);
           }
         }
       });
@@ -50,6 +50,14 @@ export class TCPServerInterface extends Interface {
       if (socket.writable) {
         socket.write(framed);
       }
+    }
+  }
+
+  // peerId is the specific client socket a packet should be forwarded to,
+  // for point-to-point next-hop forwarding (see Reticulum._forward()).
+  sendDataToPeer(peerId, data) {
+    if (peerId && peerId.writable) {
+      peerId.write(hdlcFrame(Buffer.from(data)));
     }
   }
 }

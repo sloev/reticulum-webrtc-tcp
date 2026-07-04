@@ -224,6 +224,84 @@ test('Link establishes, exchanges data both ways, and tears down between two ind
   assert.equal(rnsB.links.size, 0);
 });
 
+// --- RNS.Link Request/Response: ground truth captured from a real link
+// (same fixed ephemeral keys as above, destination app "test.reqresp") ---
+
+test('request_path_hash, request_id, and request/response payloads match RNS byte-for-byte', () => {
+  const identity = new Identity(TEST_PRIVATE_KEY);
+  const destHash = protocol.get_identity_destination_hash(identity.public, 'test.reqresp');
+
+  const linkXAPriv = new Uint8Array(32).fill(0x11);
+  const linkXAPub = crypto.x25519_pubkey(linkXAPriv);
+  const linkSigAPub = crypto.ed25519_pubkey(new Uint8Array(32).fill(0x22));
+  const linkXBPriv = new Uint8Array(32).fill(0x33);
+  const linkXBPub = crypto.x25519_pubkey(linkXBPriv);
+
+  const requestRaw = protocol.build_link_request(destHash, linkXAPub, linkSigAPub, 500);
+  const unpacked = protocol.packet_unpack(requestRaw);
+  const linkId = protocol.link_id_from_request(requestRaw, unpacked.data.length);
+  assert.equal(crypto.bytesToHex(linkId), 'd7228df8a9a21d3b087a880fd5a171a1');
+
+  const derivedKey = protocol.link_handshake(linkXAPriv, linkXBPub, linkId);
+  assert.equal(crypto.bytesToHex(derivedKey), crypto.bytesToHex(protocol.link_handshake(linkXBPriv, linkXAPub, linkId)));
+
+  assert.equal(crypto.bytesToHex(protocol.request_path_hash('test/path')), 'b04c3b75c4731c02f72d2ea9afcd7b66');
+
+  const capturedRequestRaw = crypto.hexToBytes(
+    '0c00d7228df8a9a21d3b087a880fd5a171a109ec15b94a5786c454871e5ab3961290a1d470e8ac21aeaada245bcfb879f0607ec33413b11a75cfbfbe49b6d801cc1421c921618c415026ab10fca9bb29be1f814c63228c9c73e924875bcc798c98fcb52b6338423ce0567a238d9b3a6ee30f12'
+  );
+  const requestId = protocol.packet_truncated_hash(capturedRequestRaw);
+  assert.equal(crypto.bytesToHex(requestId), 'e51d8c03381cf737f8de45f58f8340f1');
+
+  const capturedRequestUnpacked = protocol.packet_unpack(capturedRequestRaw);
+  const requestPlaintext = protocol.link_decrypt(derivedKey, capturedRequestUnpacked.data);
+  const { path_hash, data } = protocol.parse_request_payload(requestPlaintext);
+  assert.equal(crypto.bytesToHex(path_hash), 'b04c3b75c4731c02f72d2ea9afcd7b66');
+  assert.deepEqual(data, ['hello']);
+
+  const capturedResponseRaw = crypto.hexToBytes(
+    '0c00d7228df8a9a21d3b087a880fd5a171a10a82309b70c057e60740f49e137f8b09f9d3ab68d900880d0d966437e35caee763b1069bf1eac657e1f9df89e584aed5655acf70d1fc96a34262d552bc36fb153becd6a19769e1b907299bdef990369946'
+  );
+  const capturedResponseUnpacked = protocol.packet_unpack(capturedResponseRaw);
+  const responsePlaintext = protocol.link_decrypt(derivedKey, capturedResponseUnpacked.data);
+  const { request_id, response_data } = protocol.parse_response_payload(responsePlaintext);
+  assert.equal(crypto.bytesToHex(request_id), crypto.bytesToHex(requestId));
+  assert.deepEqual(response_data, ['world', 42]);
+});
+
+test('Link.request()/registerRequestHandler() round-trip a request and response over an established link', async () => {
+  const rnsA = new Reticulum();
+  const rnsB = new Reticulum();
+  class Bridge extends Interface {
+    connect() {}
+    sendData(data) { setTimeout(() => this.other.rns.onPacketReceived(data, this.other), 0); }
+  }
+  const ifaceA = new Bridge('A');
+  const ifaceB = new Bridge('B');
+  ifaceA.other = ifaceB;
+  ifaceB.other = ifaceA;
+  rnsA.addInterface(ifaceA);
+  rnsB.addInterface(ifaceB);
+
+  const responderIdentity = Identity.create();
+  const responderDest = new Destination(rnsB, responderIdentity, Destination.IN, Destination.SINGLE, 'test', 'reqresp');
+  responderDest.registerRequestHandler('greet', (data) => ({ reply: `hello ${data.name}` }));
+
+  const outDest = new Destination(rnsA, responderIdentity, Destination.OUT, Destination.SINGLE, 'test', 'reqresp');
+  outDest.hash = responderDest.hash;
+
+  const initiatorLink = new Link(rnsA, outDest);
+  await new Promise((resolve) => initiatorLink.once('established', resolve));
+
+  const response = await initiatorLink.request('greet', { name: 'world' });
+  assert.deepEqual(response, { reply: 'hello world' });
+
+  await assert.rejects(initiatorLink.request('unknown/path', {}, { timeout: 200 }));
+
+  // Otherwise the initiator's keepalive interval keeps running forever.
+  initiatorLink.close();
+});
+
 // --- RNS.Transport: path requests/responses ---
 
 test('path request destination hash and packet match RNS byte-for-byte', () => {
@@ -314,6 +392,53 @@ test('a peer with no direct path to a destination discovers it via path request 
   const aPathEntry = rnsA.pathTable.get(crypto.bytesToHex(destB.hash));
   assert.ok(aPathEntry);
   assert.equal(aPathEntry.hops, 2); // one more hop than the relay's view
+});
+
+test('a single-destination message is delivered across two hops via next-hop forwarding, with no direct link between sender and recipient', async () => {
+  // Same A <-> Relay <-> B topology, but this time actually sends an
+  // encrypted message from A to B and confirms the relay forwards it via
+  // Reticulum._forward() using the path table entry it learned from B's
+  // announce — not just that a path can be discovered.
+  const rnsA = new Reticulum();
+  const rnsRelay = new Reticulum();
+  const rnsB = new Reticulum();
+
+  class Bridge extends Interface {
+    connect() {}
+    sendData(data) { setTimeout(() => this.other.rns.onPacketReceived(data, this.other), 0); }
+  }
+  const linkAR1 = new Bridge('A-side');
+  const linkAR2 = new Bridge('Relay-side-A');
+  linkAR1.other = linkAR2;
+  linkAR2.other = linkAR1;
+  rnsA.addInterface(linkAR1);
+  rnsRelay.addInterface(linkAR2);
+
+  const linkRB1 = new Bridge('Relay-side-B');
+  const linkRB2 = new Bridge('B-side');
+  linkRB1.other = linkRB2;
+  linkRB2.other = linkRB1;
+  rnsRelay.addInterface(linkRB1);
+  rnsB.addInterface(linkRB2);
+
+  const identityB = Identity.create();
+  const destB = new Destination(rnsB, identityB, Destination.IN, Destination.SINGLE, 'test', 'multihop');
+
+  const relayGotAnnounce = new Promise((resolve) => rnsRelay.once('announce', resolve));
+  destB.announce();
+  await relayGotAnnounce;
+
+  const aGotAnnounce = new Promise((resolve) => rnsA.once('announce', resolve));
+  rnsA.requestPath(destB.hash);
+  await aGotAnnounce;
+
+  const outDest = new Destination(rnsA, identityB, Destination.OUT, Destination.SINGLE, 'test', 'multihop');
+  outDest.hash = destB.hash;
+
+  const bGotPacket = new Promise((resolve) => destB.on('packet', (e) => resolve(new TextDecoder().decode(e.data))));
+  outDest.send(new TextEncoder().encode('hello across two hops'));
+
+  assert.equal(await bGotPacket, 'hello across two hops');
 });
 
 test('HDLC framing matches RNS.Interfaces.TCPInterface.HDLC for a payload containing flag/escape bytes', () => {

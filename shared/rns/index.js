@@ -14,9 +14,12 @@ export class Reticulum extends EventEmitter {
         this.identities = new Map(); // hash hex -> { public_key, ratchet, app_data }
 
         // Lowest hop count seen to each destination, for answering path
-        // requests. Scoped to single-hop-aware flood propagation, not real
-        // next-hop routing — see protocol.js's Transport section.
-        this.pathTable = new Map(); // hash hex -> { hops, receivingInterface, packet, timestamp }
+        // requests and for single-destination forwarding (see _forward()).
+        // Scoped to single-hop-aware flood propagation for announces, plus
+        // simple next-hop forwarding for single-destination DATA/PROOF
+        // packets — not full RNS.Transport routing (see protocol.js's
+        // Transport section and README's Compliance section).
+        this.pathTable = new Map(); // hash hex -> { hops, receivingInterface, fromPeerId, packet, timestamp }
     }
 
     addInterface(iface) {
@@ -31,7 +34,11 @@ export class Reticulum extends EventEmitter {
         }
     }
 
-    onPacketReceived(data, receivingInterface) {
+    // fromPeerId identifies which neighbor on receivingInterface a packet
+    // arrived from (e.g. a specific WebRTC peer connection or TCP socket),
+    // when that interface has more than one; null for interfaces that don't
+    // distinguish neighbors.
+    onPacketReceived(data, receivingInterface, fromPeerId = null) {
         try {
             if ((data[0] & 0x80) === 0x80) {
                for (const iface of this.interfaces) {
@@ -65,7 +72,7 @@ export class Reticulum extends EventEmitter {
 
                     const existing = this.pathTable.get(destHex);
                     if (!existing || packet.hops <= existing.hops) {
-                        this.pathTable.set(destHex, { hops: packet.hops, receivingInterface, packet: forwarded, timestamp: Date.now() });
+                        this.pathTable.set(destHex, { hops: packet.hops, receivingInterface, fromPeerId, packet: forwarded, timestamp: Date.now() });
                     }
 
                     this.emit('announce', { ...announce, destination_hash: packet.destination_hash });
@@ -78,14 +85,21 @@ export class Reticulum extends EventEmitter {
                 }
             } else if (packet.packet_type === protocol.PACKET_LINKREQUEST) {
                 if (destination) destination.onLinkRequest(packet, data);
+                // Not forwarded: relaying a link handshake through an
+                // intermediate peer needs a separate "link table" to route
+                // the eventual PROOF and eventual link traffic back through
+                // the same relay, which isn't implemented (see README).
             } else if (packet.packet_type === protocol.PACKET_DATA) {
                 if (packet.destination_type === protocol.DEST_LINK) {
                     const link = this.links.get(destHex);
-                    if (link) link.onPacket(packet);
+                    if (link) link.onPacket(packet, data);
+                    // Not forwarded, for the same reason as LINKREQUEST above.
                 } else if (packet.destination_type === protocol.DEST_PLAIN && destHex === crypto.bytesToHex(protocol.PATH_REQUEST_DEST_HASH)) {
                     this._handlePathRequest(packet);
                 } else if (destination) {
                     destination.onData(packet);
+                } else {
+                    this._forward(destHex, receivingInterface, fromPeerId, forwarded);
                 }
             } else if (packet.packet_type === protocol.PACKET_PROOF) {
                 if (packet.destination_type === protocol.DEST_LINK) {
@@ -93,11 +107,26 @@ export class Reticulum extends EventEmitter {
                     if (link) link.onProof(packet);
                 } else if (destination) {
                     destination.onProof(packet);
+                } else {
+                    this._forward(destHex, receivingInterface, fromPeerId, forwarded);
                 }
             }
         } catch (e) {
             console.error("Error processing packet:", e);
         }
+    }
+
+    // Forwards a DATA/PROOF packet addressed to a single destination that
+    // isn't local, toward the next hop recorded in the path table (learned
+    // from that destination's announces) — a simplified, single-destination-
+    // only analog of RNS.Transport's hop-by-hop packet routing. Does nothing
+    // if the destination is unknown, or if forwarding would just echo the
+    // packet back to whoever just sent it to us.
+    _forward(destHex, receivingInterface, fromPeerId, forwardedData) {
+        const path = this.pathTable.get(destHex);
+        if (!path) return;
+        if (path.receivingInterface === receivingInterface && path.fromPeerId === fromPeerId) return;
+        path.receivingInterface.sendDataToPeer(path.fromPeerId, forwardedData);
     }
 
     // Answers a path request either with a fresh, locally-signed announce
@@ -236,6 +265,17 @@ export class Destination extends EventEmitter {
         if (link) this.emit('link', link);
     }
 
+    // Registers a handler for requests made over any Link to this
+    // destination, matching RNS.Destination.register_request_handler() in
+    // its simplest form: handler(data, requestId, link) is called
+    // synchronously and its return value (if not undefined) is sent back as
+    // the response. Unlike RNS, there's no allow-list/identity-based access
+    // control or async/file-response support.
+    registerRequestHandler(path, handler) {
+        if (!this.requestHandlers) this.requestHandlers = new Map();
+        this.requestHandlers.set(crypto.bytesToHex(protocol.request_path_hash(path)), { path, handler });
+    }
+
     onProof(packet) {
         this.emit('proof', packet);
     }
@@ -258,10 +298,13 @@ export class Destination extends EventEmitter {
 // byte-for-byte against the real `rns` package (see protocol.js's "RNS.Link
 // wire format" section and test/rns-compliance.test.js).
 //
-// Not implemented: RNS.Link's exact RTT-adaptive keepalive/stale/timeout
-// state machine (this uses simple fixed intervals instead), Resource
-// transfers, Request/Response, Channel, and packet-level delivery proofs
-// (RNS.Packet.prove()/link.validate()). See README's Compliance section.
+// Request/Response is implemented for the direct-packet (fits-in-one-packet)
+// form only. Not implemented: RNS.Link's exact RTT-adaptive keepalive/
+// stale/timeout state machine (this uses simple fixed intervals instead),
+// Resource transfers (including the Request/Response fallback to one when a
+// request or response doesn't fit in a single packet), Channel, and
+// packet-level delivery proofs (RNS.Packet.prove()/link.validate()). See
+// README's Compliance section.
 export class Link extends EventEmitter {
     static PENDING = 0;
     static HANDSHAKE = 1;
@@ -285,6 +328,7 @@ export class Link extends EventEmitter {
         this.derivedKey = null;
         this._keepaliveTimer = null;
         this._establishmentTimer = null;
+        this.pendingRequests = new Map(); // request_id hex -> { resolve, reject, timer }
 
         this.initiator = true;
         this.xPrivate = crypto.private_ratchet();
@@ -320,6 +364,7 @@ export class Link extends EventEmitter {
         link.mtu = parsed.mtu || Link.DEFAULT_MTU;
         link._keepaliveTimer = null;
         link._establishmentTimer = null;
+        link.pendingRequests = new Map();
 
         link.peerXPublic = parsed.peer_x_pub;
         link.peerSigPublic = parsed.peer_sig_pub;
@@ -380,8 +425,9 @@ export class Link extends EventEmitter {
 
     // Dispatches an incoming DATA packet addressed to this link by context:
     // application data (NONE), the initiator's RTT report (LRRTT),
-    // KEEPALIVE ping/pong, or LINKCLOSE teardown.
-    onPacket(packet) {
+    // KEEPALIVE ping/pong, LINKCLOSE teardown, or a REQUEST/RESPONSE.
+    // `rawBytes` is needed (only for REQUEST) to compute the request_id.
+    onPacket(packet, rawBytes) {
         if (this.status === Link.CLOSED) return;
 
         if (packet.context === protocol.CONTEXT_KEEPALIVE) {
@@ -406,7 +452,56 @@ export class Link extends EventEmitter {
             this.emit('established', this);
         } else if (packet.context === protocol.CONTEXT_LINKCLOSE) {
             if (crypto.bytesToHex(plaintext) === crypto.bytesToHex(this.linkId)) this._teardown();
+        } else if (packet.context === protocol.CONTEXT_REQUEST) {
+            this._handleRequest(protocol.packet_truncated_hash(rawBytes), plaintext);
+        } else if (packet.context === protocol.CONTEXT_RESPONSE) {
+            const { request_id, response_data } = protocol.parse_response_payload(plaintext);
+            const key = crypto.bytesToHex(request_id);
+            const pending = this.pendingRequests.get(key);
+            if (pending) {
+                clearTimeout(pending.timer);
+                this.pendingRequests.delete(key);
+                pending.resolve(response_data);
+            }
         }
+    }
+
+    // Sends a request to whichever peer is on the other end of this link,
+    // and resolves with the response data once it's received (or rejects
+    // on timeout). Only the direct-packet form is implemented — a request or
+    // response that doesn't fit in a single packet has no fallback here
+    // (real RNS falls back to a Resource transfer; see README).
+    request(path, data, { timeout = 10000 } = {}) {
+        if (this.status !== Link.ACTIVE) return Promise.reject(new Error('Link is not active'));
+
+        const payload = protocol.build_request_payload(path, data);
+        const requestPacket = protocol.build_link_packet(this.linkId, this.derivedKey, payload, protocol.CONTEXT_REQUEST);
+        const requestId = protocol.packet_truncated_hash(requestPacket);
+        const key = crypto.bytesToHex(requestId);
+
+        return new Promise((resolve, reject) => {
+            const timer = setTimeout(() => {
+                this.pendingRequests.delete(key);
+                reject(new Error(`Request to ${path} timed out`));
+            }, timeout);
+            this.pendingRequests.set(key, { resolve, reject, timer });
+            this.rns.sendData(requestPacket);
+        });
+    }
+
+    // Looks up a handler registered on this link's destination via
+    // Destination.registerRequestHandler() and, if it returns a value,
+    // sends it back as a RESPONSE packet.
+    _handleRequest(requestId, plaintext) {
+        const { path_hash, data } = protocol.parse_request_payload(plaintext);
+        const handlerEntry = this.destination?.requestHandlers?.get(crypto.bytesToHex(path_hash));
+        if (!handlerEntry) return;
+
+        const response = handlerEntry.handler(data, requestId, this);
+        if (response === undefined) return;
+
+        const payload = protocol.build_response_payload(requestId, response);
+        this.rns.sendData(protocol.build_link_packet(this.linkId, this.derivedKey, payload, protocol.CONTEXT_RESPONSE));
     }
 
     send(data) {
@@ -446,4 +541,8 @@ export class Interface {
     }
     connect() {}
     sendData(data) { throw new Error("Not implemented"); }
+    // Interfaces that can address one specific neighbor out of several (e.g.
+    // one of many WebRTC peer connections) should override this for
+    // point-to-point next-hop forwarding; the default just broadcasts.
+    sendDataToPeer(peerId, data) { this.sendData(data); }
 }

@@ -56,7 +56,7 @@ export class WebRTCInterface extends Interface {
                 // Try converting blob/text
                 data = new Uint8Array(event.data);
             }
-            this.onDataReceived(data);
+            this.onDataReceived(data, peerId);
         };
         dc.onclose = () => {
             this.peers.delete(peerId);
@@ -81,11 +81,11 @@ export class WebRTCInterface extends Interface {
         }
     }
 
-    onDataReceived(data) {
+    onDataReceived(data, peerId) {
         try {
             if (this.rns) {
                 // Pass everything to the RNS stack exactly as it arrived
-                this.rns.onPacketReceived(data, this);
+                this.rns.onPacketReceived(data, this, peerId);
             }
         } catch (e) {
             console.error("Failed to parse packet", e);
