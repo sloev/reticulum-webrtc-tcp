@@ -12,10 +12,13 @@ export const DEST_PLAIN = 0x02;
 export const DEST_LINK = 0x03;
 
 export const CONTEXT_NONE = 0x00;
+export const CONTEXT_PATH_RESPONSE = 0x0b;
 export const CONTEXT_KEEPALIVE = 0xfa;
 export const CONTEXT_LINKCLOSE = 0xfc;
 export const CONTEXT_LRRTT = 0xfe;
 export const CONTEXT_LRPROOF = 0xff;
+
+export const TRANSPORT_BROADCAST = 0x00;
 
 // RNS.Link constants (see shared/rns/index.js's Link class).
 export const LINK_ECPUBSIZE = 64; // 32-byte X25519 pub + 32-byte Ed25519 pub
@@ -40,6 +43,13 @@ export function name_hash(full_name) {
 // fixed test identity).
 export function get_identity_destination_hash(identity_pub, full_name) {
     return crypto.sha256(crypto.concat(name_hash(full_name), identity_hash(identity_pub))).slice(0, 16);
+}
+
+// Matches RNS.Destination.hash() for a PLAIN destination (no identity):
+// sha256(name_hash)[:16]. Used for Transport's well-known control
+// destinations, like the path request destination below.
+export function plain_destination_hash(full_name) {
+    return crypto.sha256(name_hash(full_name)).slice(0, 16);
 }
 
 // Matches Python's int(time.time()).to_bytes(5, "big"): a 40-bit big-endian
@@ -106,7 +116,7 @@ export function packet_unpack(bytes) {
   };
 }
 
-export function build_announce(identity_priv, identity_pub, destination_hash, ratchet_priv, ratchet_pub, full_name, app_data = new Uint8Array(0)) {
+export function build_announce(identity_priv, identity_pub, destination_hash, ratchet_priv, ratchet_pub, full_name, app_data = new Uint8Array(0), context = CONTEXT_NONE) {
   const name_hash_bytes = name_hash(full_name);
   // Matches RNS.Identity.get_random_hash()[0:5] + int(time.time()).to_bytes(5, "big").
   const random_hash = crypto.concat(crypto.randomBytes(5), timestamp5());
@@ -122,7 +132,7 @@ export function build_announce(identity_priv, identity_pub, destination_hash, ra
 
   return packet_pack({
       header_type: 0, context_flag, transport_type: 0, destination_type: DEST_SINGLE,
-      packet_type: PACKET_ANNOUNCE, hops: 0, destination_hash, context: CONTEXT_NONE, data
+      packet_type: PACKET_ANNOUNCE, hops: 0, destination_hash, context, data
   });
 }
 
@@ -337,6 +347,56 @@ export function build_link_packet(link_id, derived_key, data, context = CONTEXT_
         header_type: 0, context_flag: 0, transport_type: 0, destination_type: DEST_LINK,
         packet_type: PACKET_DATA, hops: 0, destination_hash: link_id, context, data: payload,
     });
+}
+
+// --- RNS.Transport: path requests/responses ---
+// Verified byte-for-byte against the real `rns` package: the well-known path
+// request destination hash, and a full path request packet. Scoped to what's
+// needed for single-hop path discovery (announce propagation with correct
+// hop counts, and answering/making path requests) — NOT implemented: real
+// multi-hop DATA/LINK packet forwarding via next-hop routing tables (would
+// require per-neighbor addressing, a further architectural change), transport
+// instance identities/HEADER_2 loop detection, or any of RNS.Transport's
+// interface-duty-cycle/roaming-mode rate limiting. See README's Compliance
+// section.
+
+// RNS.Transport's well-known "rnstransport.path.request" control destination
+// — the same fixed hash on every Reticulum network, used to broadcast and
+// answer path requests.
+export const PATH_REQUEST_DEST_HASH = plain_destination_hash('rnstransport.path.request');
+
+// Matches the non-transport-enabled form of RNS.Transport.request_path():
+// destination_hash + a random tag, with no transport instance ID (this
+// project has no persistent "transport identity" concept — see above).
+export function build_path_request(destination_hash, tag) {
+    const data = crypto.concat(destination_hash, tag);
+    return packet_pack({
+        header_type: 0, context_flag: 0, transport_type: TRANSPORT_BROADCAST, destination_type: DEST_PLAIN,
+        packet_type: PACKET_DATA, hops: 0, destination_hash: PATH_REQUEST_DEST_HASH, context: CONTEXT_NONE, data,
+    });
+}
+
+// Matches RNS.Transport.path_request_handler(): the first 16 bytes are
+// always the destination hash being looked up; if more bytes follow, RNS
+// treats the next 16 as a requesting transport instance ID and the rest as
+// the tag, otherwise everything after the destination hash is the tag.
+export function parse_path_request(packet) {
+    const HASHLEN = 16;
+    if (packet.data.length < HASHLEN) return null;
+    const destination_hash = packet.data.slice(0, HASHLEN);
+
+    let requesting_transport_id = null;
+    let tag = null;
+    if (packet.data.length > HASHLEN * 2) {
+        requesting_transport_id = packet.data.slice(HASHLEN, HASHLEN * 2);
+        tag = packet.data.slice(HASHLEN * 2);
+    } else if (packet.data.length > HASHLEN) {
+        tag = packet.data.slice(HASHLEN);
+    }
+    if (tag === null) return null;
+    if (tag.length > HASHLEN) tag = tag.slice(0, HASHLEN);
+
+    return { destination_hash, requesting_transport_id, tag };
 }
 
 // Mimics LXMF's basic envelope shape (source hash, signature, msgpacked

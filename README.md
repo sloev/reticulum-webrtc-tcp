@@ -3,7 +3,7 @@
 A JavaScript reimplementation of a subset of the [Reticulum Network Stack](https://reticulum.network/) (RNS) wire protocol, using WebRTC data channels as the peer-to-peer transport and public [Nostr](https://nostr.com/) 
 relays for connection signaling. Peers run in the browser or in Node.js and form a sparse mesh; a TCP gateway on the Node.js side bridges raw TCP connections into the mesh.
 
-This is a from-scratch implementation, not a port of or a wrapper around the reference [`rns`](https://github.com/markqvist/Reticulum) Python implementation. Packet framing, identity/destination hashing, announces, single-destination encryption, and the core `Link` handshake are now verified byte-for-byte against the real `rns` package; `Transport` (path-finding/multi-hop routing), `Resource`/`Channel`/`Request`-`Response`, and LXMF are not yet compliant. It still does not interoperate with the official Reticulum network, official LXMF clients (Sideband, NomadNet), or LXMF propagation nodes. See [Compliance](#compliance) and [Known limitations](#known-limitations) before relying on it for anything.
+This is a from-scratch implementation, not a port of or a wrapper around the reference [`rns`](https://github.com/markqvist/Reticulum) Python implementation. Packet framing, identity/destination hashing, announces, single-destination encryption, the core `Link` handshake, and path request/response discovery are now verified byte-for-byte against the real `rns` package; multi-hop packet forwarding, `Resource`/`Channel`/`Request`-`Response`, and LXMF are not yet compliant. It still does not interoperate with the official Reticulum network, official LXMF clients (Sideband, NomadNet), or LXMF propagation nodes. See [Compliance](#compliance) and [Known limitations](#known-limitations) before relying on it for anything.
 
 **Live demo:** https://sloev.github.io/reticulum-webrtc-tcp/ — the browser peer, built and deployed straight from `browser/` (see [Deploying the demo](#deploying-the-demo)). Open it in two tabs (or send someone the link) to form a mesh link over public Nostr relays and exchange messages.
 
@@ -12,8 +12,8 @@ This is a from-scratch implementation, not a port of or a wrapper around the ref
 ```
 shared/rns/                 Protocol implementation (transport-agnostic)
   crypto.js                   Ed25519 / X25519 / SHA-256 / HKDF / AES-CBC primitives (@noble/*)
-  protocol.js                  Packet framing, announces, destination hashing, LXMF-style messages
-  index.js                     Reticulum router, Identity, Destination, Link, Interface base class
+  protocol.js                  Packet framing, announces, Link, path requests, LXMF-style messages
+  index.js                     Reticulum router (path table), Identity, Destination, Link, Interface base class
 
 shared/webrtc-rns-interface.js  RNS Interface backed by RTCDataChannel peers (shared by browser + Node)
 shared/nostr-signaling.js       Peer discovery and WebRTC offer/answer/ICE exchange over Nostr relays
@@ -38,6 +38,7 @@ Implements enough of Reticulum's wire format to interoperate between the peers i
 - Announces: Ed25519-signed packets that broadcast an identity's public key and X25519 ratchet key; peers cache these to know who they can talk to.
 - Single-destination data: X25519 ECDH with the announced ratchet key (or the destination's primary key, if no ratchet is known), HKDF-derived AES-256-CBC key with PKCS7 padding, and HMAC-SHA256 authentication.
 - `Link` (`shared/rns/index.js`): the core handshake — LINKREQUEST (ephemeral X25519 + Ed25519 keys, MTU/mode signalling), the responder's Ed25519-signed PROOF, the ECDH+HKDF handshake keyed by the link ID, and per-link Token-encrypted DATA/LRRTT/KEEPALIVE/LINKCLOSE packets.
+- Path requests/responses (`shared/rns/index.js`'s `Reticulum.requestPath`/`_handlePathRequest`): the well-known `rnstransport.path.request` control destination, per-hop-incremented hop counts on every received packet, a path table of the lowest hop count seen to each destination, and answering a path request either with a fresh signed announce (if the destination is local) or a cached one (if only known via another peer).
 
 Not yet verified or compliant:
 
@@ -56,9 +57,9 @@ Not yet verified or compliant:
 
 ### Routing
 
-`Reticulum.onPacketReceived` (`shared/rns/index.js`) parses the packet header on every interface. ANNOUNCE packets are validated and rebroadcast to the peer's other local interfaces so presence propagates through the mesh; DATA and PROOF packets addressed to a known destination or link are delivered locally. Any incoming byte stream whose first byte has its high bit (`0x80`) set is treated as opaque and relayed unparsed to the other local interfaces — this is how the TCP gateway bridges arbitrary traffic without needing it to be framed as an RNS packet.
+`Reticulum.onPacketReceived` (`shared/rns/index.js`) parses the packet header on every interface and increments the packet's hop count on receipt, matching `RNS.Transport.inbound()`. ANNOUNCE packets are validated, used to update a path table (keyed by destination hash, keeping the lowest hop count seen), and rebroadcast to the peer's other local interfaces with the incremented hop count so presence propagates through the mesh; DATA and PROOF packets addressed to a known destination or link are delivered locally. A DATA packet addressed to the well-known path-request control destination is answered from the path table (see [Compliance](#compliance)). Any incoming byte stream whose first byte has its high bit (`0x80`) set is treated as opaque and relayed unparsed to the other local interfaces — this is how the TCP gateway bridges arbitrary traffic without needing it to be framed as an RNS packet.
 
-There is no multi-hop path finding: forwarding only happens between the interfaces attached to a single local peer, not across the mesh.
+Path *discovery* is hop-count-aware and can find a destination through an intermediate peer (verified in `test/rns-compliance.test.js` with an A↔Relay↔B topology where A and B never talk directly). Actual multi-hop *packet forwarding* is not implemented, though: a DATA or LINK packet not addressed to a local destination or link is simply dropped, rather than forwarded on toward a next hop from the path table.
 
 ### TCP gateway
 
@@ -116,23 +117,25 @@ This project is a from-scratch reimplementation, checked against the real [`rns`
 - Announces: field layout, signed data, and the Ed25519 signature itself all match byte-for-byte. Ed25519 signing is deterministic, so a matching signature over the same message is strong evidence the entire preceding computation is correct, not just superficially similar.
 - Single-destination encryption (`RNS.Identity.encrypt`/`decrypt`): X25519 ECDH, HKDF (salt = identity hash), AES-256-CBC with PKCS7 padding, HMAC-SHA256 authentication, and the token layout (`ephemeral_pubkey + iv + ciphertext + hmac`) — including the fallback path used when no ratchet is available, where encryption goes directly to the destination's primary X25519 key.
 - `Link`'s core handshake (`RNS.Link`): the LINKREQUEST packet (ephemeral X25519 + Ed25519 public keys plus 3-byte MTU/mode signalling), `link_id` derivation, the responder's PROOF packet (signed with the destination identity's real Ed25519 key, not an ephemeral one), the ECDH+HKDF handshake keyed by the link ID, and the Token-encrypted LRRTT/KEEPALIVE/LINKCLOSE/application-data packets that flow over an established link — all checked byte-for-byte, including the Ed25519 signature on the PROOF packet, against a full initiator/responder handshake captured from `rns`.
+- `Transport`'s path request/response wire format (`RNS.Transport`): the well-known `rnstransport.path.request` control destination hash, the path request packet layout (destination hash + tag, or + a requesting transport instance ID), and a path-response announce's `context=PATH_RESPONSE` byte — all checked byte-for-byte. Hop-count-aware path discovery through an intermediate peer is verified functionally (not byte-exact, since it depends on which of several correct announces propagates first) with a 3-peer test topology.
 - `node/tcp-gateway.js`'s HDLC framing matches `RNS.Interfaces.TCPInterface.HDLC` exactly, including escape-sequence handling.
 
 **Verified functionally, but not byte-exact or fully spec-compliant:**
 
 - `Link`'s operational lifecycle uses simple fixed intervals (15s establishment timeout, 30s keepalive) instead of `RNS.Link`'s RTT-adaptive keepalive/stale/timeout state machine (`KEEPALIVE_MIN`/`MAX` scaled by measured RTT, a separate STALE state before teardown, physical-layer stats). The wire format for each packet type is verified; the timing behavior around when they're sent is a simplification.
+- `Transport`'s path discovery skips `RNS.Transport`'s interface-duty-cycle/roaming-mode rate limiting and retransmission grace periods (tuned for slow, shared-bandwidth radio links, e.g. LoRa — not relevant to a WebRTC mesh), and has no persistent "transport instance identity" concept, so outgoing path requests always use the simpler 2-field form (destination hash + tag, no transport ID).
 
 **Not yet implemented, and not compliant:**
 
-- `Transport`: no path-finding, transport tables, or multi-hop routing across independent Reticulum nodes (`RNS.Transport` is 3,613 lines implementing exactly this). Announce propagation here is still just "rebroadcast to this peer's other local interfaces" — see [Routing](#routing).
+- Multi-hop **packet forwarding**: path *discovery* works — a peer can learn that a destination is reachable through another peer it's never talked to directly — but DATA/LINK packets addressed to a destination or link that isn't local are simply dropped, not forwarded on toward a next hop. Real `RNS.Transport` routes packets hop-by-hop using its path table; doing the same here would need per-neighbor addressing (this project's `WebRTCInterface.sendData()` currently broadcasts to every connected peer rather than targeting one), which is a further architectural change beyond wire-format compliance.
 - `Resource` / `Channel` / `Buffer` / `Request`/`Response`: not implemented (large-file transfer, buffered-channel, and request/response protocols that build on top of `Link`). Packet-level delivery proofs (`RNS.Packet.prove()`/`link.validate()`) are also not implemented.
 - LXMF: the `lxmf_build`/`lxmf_parse` functions in `shared/rns/protocol.js` mimic LXMF's basic envelope shape (source hash, signature, msgpacked `[timestamp, title, content, fields]`) only — no propagation-node protocol, no proof-of-work propagation stamps (required by LXMF v0.9.x+ before propagation nodes will route a message), no compression/node-sync negotiation. A message from this stack sent to an official LXMF client (Sideband, NomadNet) or propagation node would still be rejected as malformed.
 
-In short: a peer running this codebase now produces and validates announces, single-destination encrypted packets, and full `Link` handshakes/data exchange that a real Reticulum node would also consider valid, and the TCP gateway speaks real `TCPInterface` framing — but there's still no `Transport`-level multi-hop routing, `Resource`/`Channel`/`Request`-`Response`, or real LXMF compliance. Note also that `Link`'s establishment doesn't currently drive the demo UI (`browser/main.js` messages over single-destination encryption directly) — it's available as a verified API, not yet wired into the chat demo.
+In short: a peer running this codebase now produces and validates announces, single-destination encrypted packets, full `Link` handshakes/data exchange, and path requests/responses that a real Reticulum node would also consider valid, and the TCP gateway speaks real `TCPInterface` framing. A peer can discover that a destination is reachable through another peer — but can't yet actually forward traffic to it hop-by-hop, and there's still no `Resource`/`Channel`/`Request`-`Response` or real LXMF compliance. Note also that `Link`'s establishment doesn't currently drive the demo UI (`browser/main.js` messages over single-destination encryption directly) — it's available as a verified API, not yet wired into the chat demo.
 
 ## Known limitations
 
-- No multi-hop transport or path finding; reachability depends entirely on the local sparse-mesh topology (`k = 4`) actually connecting two peers, directly or via a bridging interface like the TCP gateway.
+- Path *discovery* can span multiple hops, but packet *delivery* can't: reachability for actually sending/receiving data still depends entirely on the local sparse-mesh topology (`k = 4`) directly connecting two peers, or bridging through the TCP gateway — see [Compliance](#compliance).
 - Identities, the announce/identity cache, and links are in-memory only and are lost on restart.
 - Signaling depends on public Nostr relays; relay operators can observe connection metadata (who is signaling whom, and when) even though offer/answer payloads are NIP-04 encrypted, and any of them may still rate-limit a busy key.
 - `node-datachannel` (used for `RTCPeerConnection` in Node) ships prebuilt native binaries per platform; if none is available for your platform/Node version, `npm install` needs to build it from source.

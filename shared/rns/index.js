@@ -12,6 +12,11 @@ export class Reticulum extends EventEmitter {
 
         // Cache to store known public keys and ratchets from announcements
         this.identities = new Map(); // hash hex -> { public_key, ratchet, app_data }
+
+        // Lowest hop count seen to each destination, for answering path
+        // requests. Scoped to single-hop-aware flood propagation, not real
+        // next-hop routing — see protocol.js's Transport section.
+        this.pathTable = new Map(); // hash hex -> { hops, receivingInterface, packet, timestamp }
     }
 
     addInterface(iface) {
@@ -40,23 +45,34 @@ export class Reticulum extends EventEmitter {
             const packet = protocol.packet_unpack(data);
             if (!packet) return;
 
+            // Matches RNS.Transport.inbound(): every packet gains one hop
+            // upon receipt, whether or not we do anything with that count.
+            packet.hops = (packet.hops + 1) & 0xff;
+            const forwarded = new Uint8Array(data);
+            forwarded[1] = packet.hops;
+
             const destHex = crypto.bytesToHex(packet.destination_hash);
             const destination = this.destinations.get(destHex);
 
             if (packet.packet_type === protocol.PACKET_ANNOUNCE) {
                 const announce = protocol.validate_announce(packet);
                 if (announce) {
-                    const idHash = crypto.bytesToHex(packet.destination_hash);
-                    this.identities.set(idHash, {
+                    this.identities.set(destHex, {
                         public_key: announce.public_key,
                         ratchet: announce.ratchet,
                         app_data: announce.app_data
                     });
+
+                    const existing = this.pathTable.get(destHex);
+                    if (!existing || packet.hops <= existing.hops) {
+                        this.pathTable.set(destHex, { hops: packet.hops, receivingInterface, packet: forwarded, timestamp: Date.now() });
+                    }
+
                     this.emit('announce', { ...announce, destination_hash: packet.destination_hash });
-                    // Rebroadcast to other interfaces
+                    // Rebroadcast to other interfaces, with the incremented hop count.
                     for (const iface of this.interfaces) {
                         if (iface !== receivingInterface) {
-                            iface.sendData(data);
+                            iface.sendData(forwarded);
                         }
                     }
                 }
@@ -66,6 +82,8 @@ export class Reticulum extends EventEmitter {
                 if (packet.destination_type === protocol.DEST_LINK) {
                     const link = this.links.get(destHex);
                     if (link) link.onPacket(packet);
+                } else if (packet.destination_type === protocol.DEST_PLAIN && destHex === crypto.bytesToHex(protocol.PATH_REQUEST_DEST_HASH)) {
+                    this._handlePathRequest(packet);
                 } else if (destination) {
                     destination.onData(packet);
                 }
@@ -80,6 +98,33 @@ export class Reticulum extends EventEmitter {
         } catch (e) {
             console.error("Error processing packet:", e);
         }
+    }
+
+    // Answers a path request either with a fresh, locally-signed announce
+    // (if we own the requested destination) or by re-broadcasting the best
+    // cached announce we know of (if we've merely heard of it) — matching
+    // RNS.Transport.path_request(), minus its interface-timing/roaming-mode
+    // rebroadcast delays, which don't apply to this project's WebRTC mesh.
+    _handlePathRequest(packet) {
+        const parsed = protocol.parse_path_request(packet);
+        if (!parsed) return;
+        const destHex = crypto.bytesToHex(parsed.destination_hash);
+
+        const localDestination = this.destinations.get(destHex);
+        if (localDestination) {
+            localDestination.announce({ pathResponse: true });
+            return;
+        }
+
+        const known = this.pathTable.get(destHex);
+        if (known) this.sendData(known.packet);
+    }
+
+    // Broadcasts a path request for a destination hash, matching the
+    // non-transport-enabled form of RNS.Transport.request_path() (this
+    // project has no persistent "transport identity" concept).
+    requestPath(destination_hash, tag = crypto.randomBytes(16)) {
+        this.sendData(protocol.build_path_request(destination_hash, tag));
     }
 }
 
@@ -195,9 +240,14 @@ export class Destination extends EventEmitter {
         this.emit('proof', packet);
     }
 
-    announce() {
+    announce({ pathResponse = false } = {}) {
         if (this.identity) {
-            const packet = protocol.build_announce(this.identity.private, this.identity.public, this.hash, this.identity.ratchetPrivate, this.identity.ratchetPublic, this.fullName);
+            const context = pathResponse ? protocol.CONTEXT_PATH_RESPONSE : protocol.CONTEXT_NONE;
+            const packet = protocol.build_announce(
+                this.identity.private, this.identity.public, this.hash,
+                this.identity.ratchetPrivate, this.identity.ratchetPublic, this.fullName,
+                new Uint8Array(0), context
+            );
             this.rns.sendData(packet);
         }
     }

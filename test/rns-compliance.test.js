@@ -224,6 +224,98 @@ test('Link establishes, exchanges data both ways, and tears down between two ind
   assert.equal(rnsB.links.size, 0);
 });
 
+// --- RNS.Transport: path requests/responses ---
+
+test('path request destination hash and packet match RNS byte-for-byte', () => {
+  assert.equal(crypto.bytesToHex(protocol.PATH_REQUEST_DEST_HASH), '6b9f66014d9853faab220fba47d02761');
+
+  const destHash = new Uint8Array(16).fill(0xab);
+  const transportId = new Uint8Array(16).fill(0xcd);
+  const tag = new Uint8Array(16).fill(0xef);
+
+  // The 3-field form (destination_hash + transport_id + tag) that a
+  // transport-enabled real Reticulum node would send.
+  const packet = protocol.packet_pack({
+    header_type: 0, context_flag: 0, transport_type: protocol.TRANSPORT_BROADCAST, destination_type: protocol.DEST_PLAIN,
+    packet_type: protocol.PACKET_DATA, hops: 0, destination_hash: protocol.PATH_REQUEST_DEST_HASH, context: protocol.CONTEXT_NONE,
+    data: crypto.concat(destHash, transportId, tag),
+  });
+  assert.equal(
+    crypto.bytesToHex(packet),
+    '08006b9f66014d9853faab220fba47d0276100ababababababababababababababababcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdefefefefefefefefefefefefefefefef'
+  );
+
+  const parsed = protocol.parse_path_request(protocol.packet_unpack(packet));
+  assert.equal(crypto.bytesToHex(parsed.destination_hash), crypto.bytesToHex(destHash));
+  assert.equal(crypto.bytesToHex(parsed.requesting_transport_id), crypto.bytesToHex(transportId));
+  assert.equal(crypto.bytesToHex(parsed.tag), crypto.bytesToHex(tag));
+
+  // build_path_request() uses the simpler 2-field form (no transport ID).
+  const simplePacket = protocol.build_path_request(destHash, tag);
+  const simpleParsed = protocol.parse_path_request(protocol.packet_unpack(simplePacket));
+  assert.equal(crypto.bytesToHex(simpleParsed.destination_hash), crypto.bytesToHex(destHash));
+  assert.equal(simpleParsed.requesting_transport_id, null);
+  assert.equal(crypto.bytesToHex(simpleParsed.tag), crypto.bytesToHex(tag));
+});
+
+test('path-response announce uses context=PATH_RESPONSE and matches RNS byte-for-byte', () => {
+  const identity = new Identity(TEST_PRIVATE_KEY);
+  const destHash = protocol.get_identity_destination_hash(identity.public, 'webrtc_demo.chat');
+  const packet = protocol.build_announce(
+    identity.private, identity.public, destHash, null, new Uint8Array(0), 'webrtc_demo.chat',
+    new Uint8Array(0), protocol.CONTEXT_PATH_RESPONSE
+  );
+  assert.equal(packet[0], 0x01); // flags unchanged from a normal announce
+  assert.equal(packet[18], 0x0b); // context byte = PATH_RESPONSE
+});
+
+test('a peer with no direct path to a destination discovers it via path request through a relay', async () => {
+  // Topology: A <-> Relay <-> B. A and B never talk directly — this exercises
+  // hop-count-correct announce propagation, the relay's path table, and
+  // answering a path request with a cached (not locally-owned) announce.
+  const rnsA = new Reticulum();
+  const rnsRelay = new Reticulum();
+  const rnsB = new Reticulum();
+
+  class Bridge extends Interface {
+    connect() {}
+    sendData(data) { setTimeout(() => this.other.rns.onPacketReceived(data, this.other), 0); }
+  }
+  const linkAR1 = new Bridge('A-side');
+  const linkAR2 = new Bridge('Relay-side-A');
+  linkAR1.other = linkAR2;
+  linkAR2.other = linkAR1;
+  rnsA.addInterface(linkAR1);
+  rnsRelay.addInterface(linkAR2);
+
+  const linkRB1 = new Bridge('Relay-side-B');
+  const linkRB2 = new Bridge('B-side');
+  linkRB1.other = linkRB2;
+  linkRB2.other = linkRB1;
+  rnsRelay.addInterface(linkRB1);
+  rnsB.addInterface(linkRB2);
+
+  const identityB = Identity.create();
+  const destB = new Destination(rnsB, identityB, Destination.IN, Destination.SINGLE, 'test', 'relay');
+
+  // B announces; only the relay hears it directly (hops=1).
+  const relayGotAnnounce = new Promise((resolve) => rnsRelay.once('announce', resolve));
+  destB.announce();
+  await relayGotAnnounce;
+  assert.equal(rnsRelay.pathTable.get(crypto.bytesToHex(destB.hash)).hops, 1);
+  assert.equal(rnsA.pathTable.has(crypto.bytesToHex(destB.hash)), false);
+
+  // A requests a path to B's destination; the relay answers from its cache.
+  const aGotAnnounce = new Promise((resolve) => rnsA.once('announce', resolve));
+  rnsA.requestPath(destB.hash);
+  await aGotAnnounce;
+
+  assert.ok(rnsA.identities.has(crypto.bytesToHex(destB.hash)));
+  const aPathEntry = rnsA.pathTable.get(crypto.bytesToHex(destB.hash));
+  assert.ok(aPathEntry);
+  assert.equal(aPathEntry.hops, 2); // one more hop than the relay's view
+});
+
 test('HDLC framing matches RNS.Interfaces.TCPInterface.HDLC for a payload containing flag/escape bytes', () => {
   const payload = Buffer.from([0x01, 0x7e, 0x02, 0x7d, 0x03, 0x7e, 0x7d, 0x00, 0xff]);
   const framed = hdlcFrame(payload);
