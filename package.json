@@ -8,7 +8,8 @@
     "gateway": "node node/index.js",
     "dev": "vite serve browser",
     "build": "vite build",
-    "test": "node --test"
+    "test": "node --test",
+    "test:integration": "node test-integration/sparse-mesh-check.mjs"
   },
   "dependencies": {
     "@noble/ciphers": "^2.2.0",

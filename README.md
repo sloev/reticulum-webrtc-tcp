@@ -100,6 +100,12 @@ Run the compliance test suite with:
 npm test
 ```
 
+There's also a heavier, separate integration check (not part of `npm test`, since it spawns real subprocesses/browsers and takes much longer) in `test-integration/sparse-mesh-check.mjs`. It spins up a sparse, mixed-transport mesh — two real Python `rns` processes, two Node.js TCP/WebRTC bridge processes, and two WebRTC-only browser peers (via headless Chromium/Playwright), wired sparsely so no node has a direct link to a node more than one hop away — and confirms an announce from one Python node reaches the other across every hop and transport. Requires `pip install rns` and a running `npm run dev` (vite) server:
+
+```bash
+PYLIBS=/path/to/site-packages npm run test:integration
+```
+
 ### Browser demo
 
 `browser/index.html` shows your peer's 16-byte destination hash (RID), a copy button, and live mesh status: the number of open WebRTC links and the RIDs of peers you've received an announce from (click one to fill in the destination field). Enter a destination RID and a message and send; the message goes out as an LXMF-style message once you've received an announce from that peer's identity (your own identity is announced automatically every 10 seconds).
