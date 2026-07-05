@@ -72,8 +72,8 @@ reason).
 | Handshake (LINKREQUEST/PROOF/LRRTT), Token encryption, LINKCLOSE | `RNS/Link.py` | `shared/rns/index.js` `Link`, `shared/rns/protocol.js` | DONE | byte-exact + live |
 | `identify()` / `get_remote_identity()` | `RNS/Link.py` `identify()` | `shared/rns/index.js` `Link.identify/getRemoteIdentity` | DONE | live vs real `LXMRouter` |
 | Request/Response (single-packet) | `RNS/Link.py` `request()`, `RNS/Destination.py` `register_request_handler()` | `shared/rns/index.js` `Link.request`, `Destination.registerRequestHandler` | DONE | byte-exact + live |
-| RTT-adaptive keepalive/stale/timeout state machine | `RNS/Link.py:75–108` (constants), `__watchdog_job` (:710–775), `__update_keepalive` (:794) | `shared/rns/index.js` `Link` | MISSING — fixed intervals instead | **Phase 1** |
-| Hop-scaled establishment timeout | `RNS/Link.py:75,206,284` (`ESTABLISHMENT_TIMEOUT_PER_HOP=6`) | `shared/rns/index.js` `Link` | MISSING — fixed 15 s | **Phase 1** |
+| RTT-adaptive keepalive/stale/timeout state machine | `RNS/Link.py:75–108` (constants), `__watchdog_job` (:710–775), `__update_keepalive` (:794) | `shared/rns/index.js` `Link._watchdogTick/_updateKeepalive/_noteInbound` | DONE | unit tests (formula + STALE transition/recovery/teardown) + live (`test:integration:resource/:channel/:lxmf-propagation/:lxmf-peer-sync` re-verified) |
+| Hop-scaled establishment timeout | `RNS/Link.py:75,206,284` (`ESTABLISHMENT_TIMEOUT_PER_HOP=6`) | `shared/rns/index.js` `Link` constructor/`fromRequest` | DONE | live (established links across the existing integration suite) |
 | Request/Response Resource fallback (oversized payloads) | `RNS/Link.py:506` (request), `:844–850` (response) | `shared/rns/index.js` `Link.request/_handleRequest` | MISSING | **Phase 3** |
 
 ### Resource / Channel / Buffer
@@ -137,34 +137,60 @@ checklist updated, README updated, and a commit.
 Commit the verified sessionStorage identity persistence (`browser/main.js`,
 `browser/index.html`). Done: commit `b3f95fe`.
 
-### Phase 1 — Link timing parity
+### Phase 1 — Link timing parity ✅
 
 Goal: replace the fixed 15 s establishment / 30 s keepalive timers with real RNS's
-state machine.
+state machine. **Done.**
 
-1. Read `RNS/Link.py` in full — especially constants (:75–108), `__watchdog_job`
-   (:710–775), `__update_keepalive` (:794–795), the `last_inbound/last_proof/last_data`
-   bookkeeping in `__update_timestamps`/inbound handling (:922–930), and hop scaling
-   (:206, :284).
-2. In `shared/rns/index.js` `Link`: add `STALE = 3` (RNS values 0/1/2/4 already match);
-   port constants `KEEPALIVE_MAX=360, KEEPALIVE_MIN=5, KEEPALIVE_MAX_RTT=1.75,
-   STALE_FACTOR=2, STALE_GRACE=5, KEEPALIVE_TIMEOUT_FACTOR=4, TRAFFIC_TIMEOUT_FACTOR=6,
-   WATCHDOG_MAX_SLEEP=5, ESTABLISHMENT_TIMEOUT_PER_HOP=6` (seconds — JS timers take ms).
-3. Replace `_startKeepalive`/`_armEstablishmentTimeout` with a single rescheduling
-   watchdog (chained `setTimeout`, not `setInterval`): PENDING/HANDSHAKE → establishment
-   timeout (`PER_HOP × max(1, hops) + keepalive`, using the path table's hop count);
-   ACTIVE → initiator sends keepalive when idle ≥ `keepalive`, transition to STALE when
-   idle ≥ `stale_time`, then after `rtt × KEEPALIVE_TIMEOUT_FACTOR + STALE_GRACE`
-   teardown with reason TIMEOUT; any inbound while STALE → back to ACTIVE.
-4. On RTT measurement (both sides): `keepalive = clamp(rtt × KEEPALIVE_MAX /
-   KEEPALIVE_MAX_RTT, KEEPALIVE_MIN, KEEPALIVE_MAX)`, `stale_time = keepalive ×
-   STALE_FACTOR`. Track `lastInbound` on every packet for this link, `lastProof`
-   on proofs; keepalive responses (0xFE) count as inbound but not data.
-5. Tests: unit — keepalive formula vectors (e.g. rtt=0.01 → keepalive≈5 (MIN),
-   rtt=1.75 → 360 (MAX)); STALE→ACTIVE recovery; teardown fires with reason TIMEOUT.
-   Live — re-run `test:integration:channel` and `test:integration:resource`; add an
-   idle-hold check (JS link to real `rns` stays ACTIVE through ≥ 2 keepalive cycles at a
-   short RTT-scaled interval; keep wall time bounded).
+What was implemented, in `shared/rns/index.js`'s `Link`:
+
+- Added `STALE = 3` (RNS values 0/1/2/4 already matched); ported constants
+  `KEEPALIVE_MAX=360, KEEPALIVE_MIN=5, KEEPALIVE_MAX_RTT=1.75, STALE_FACTOR=2,
+  STALE_GRACE=5, KEEPALIVE_TIMEOUT_FACTOR=4, DEFAULT_PER_HOP_TIMEOUT=6,
+  ESTABLISHMENT_TIMEOUT_PER_HOP=6` (seconds, matching `RNS/Link.py:75–108`;
+  converted to ms at point of use).
+- Replaced `_startKeepalive`/`_armEstablishmentTimeout` (fixed `setInterval`/
+  `setTimeout`) with a single rescheduling watchdog (`_watchdogTick`, chained
+  `setTimeout`, since JS has no per-link thread to poll on a fixed cadence the way
+  `__watchdog_job` does — the next check is instead recomputed and rescheduled
+  whenever something that affects it changes): PENDING/HANDSHAKE → establishment
+  timeout (initiator: `DEFAULT_PER_HOP_TIMEOUT + ESTABLISHMENT_TIMEOUT_PER_HOP ×
+  max(1, hops)`, hops from the path table, matching `Link.py:283–284`; responder:
+  `ESTABLISHMENT_TIMEOUT_PER_HOP × max(1, request.hops) + KEEPALIVE_MAX`, matching
+  `Link.py:206`, which is deliberately generous since the responder must tolerate
+  however long the initiator takes to receive the PROOF and reply). ACTIVE →
+  initiator sends a keepalive when idle ≥ `keepalive`, transitions to STALE when
+  idle ≥ `stale_time`, then tears down with reason `TIMEOUT` after `rtt ×
+  KEEPALIVE_TIMEOUT_FACTOR + STALE_GRACE`; any inbound while STALE recovers to
+  ACTIVE (`_noteInbound()`, called from `onPacket`/`onProof`).
+- `_updateKeepalive()`: `keepalive = clamp(rtt × KEEPALIVE_MAX/KEEPALIVE_MAX_RTT,
+  KEEPALIVE_MIN, KEEPALIVE_MAX)`, `stale_time = keepalive × STALE_FACTOR` — run once
+  RTT is known on both sides (`_activateWatchdog()`, called from the initiator's
+  PROOF handler and the responder's LRRTT handler).
+- `_teardown()` now also rejects any pending `Link.request()` calls (a pre-existing
+  gap — it only cleaned up outgoing resources before), so a torn-down link fails
+  fast instead of hanging until a request's own timeout fires.
+- **Real bug found and fixed along the way**: `stamp.generate_stamp()`
+  (`shared/rns/stamp.js`) was a tight synchronous proof-of-work loop with no
+  yielding. That was harmless under the old fixed-interval keepalive, but once
+  Link's keepalive is *correctly* short for a fast connection (5–10s), a long
+  synchronous stamp computation (this project's LXMF admission/peering-key stamps)
+  starves the event loop long enough that a real peer's own — already-compliant,
+  unmodified — stale/timeout logic can legitimately close the link out from under
+  it. Real `LXStamper` doesn't have this problem because it searches in separate OS
+  processes. Fixed by making `generate_stamp()`/`generate_peering_key()` `async`
+  and yielding every ~15ms of wall time (`propagateLXMF()`/`syncToPeer()` in
+  `propagation.js` updated to `await` them) — confirmed with a peer-sync run that
+  took 24 s to compute a peering key and still completed successfully.
+
+Tests: unit (`test/rns-compliance.test.js`) — keepalive-formula vectors at the
+MIN/MAX/interpolated RTT points; STALE transition, STALE→ACTIVE recovery on
+inbound, and teardown-with-reason-TIMEOUT, all driven directly via `_watchdogTick()`/
+`_noteInbound()` with back-dated timestamps rather than real waiting (keeps the
+tests fast — real keepalive/stale timing has a 15s floor). Live — `test:integration:
+resource`, `:channel`, `:lxmf-propagation`, and `:lxmf-peer-sync` all re-verified
+against real `rns`/`lxmf` (the peer-sync check in particular now reliably survives
+a multi-second synchronous PoW computation without the real node closing the link).
 
 Done when: fixed-interval constants are gone, all tests green, checklist + README rows
 updated.
@@ -303,3 +329,4 @@ its "verified by" filled in; remove stale caveats elsewhere (module comments cit
 | Date | Phase | Result |
 |---|---|---|
 | 2026-07-05 | Phase 0 | Identity persistence committed (`b3f95fe`); this document created. |
+| 2026-07-05 | Phase 1 | Link's RTT-adaptive keepalive/stale/timeout state machine implemented, plus a real bug fix (made `stamp.generate_stamp()`/`generate_peering_key()` non-blocking — see Phase 1 writeup). 51/51 unit tests pass; live `resource`/`channel`/`lxmf-propagation`/`lxmf-peer-sync` checks re-verified. |

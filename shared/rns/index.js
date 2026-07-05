@@ -429,25 +429,41 @@ export class Destination extends EventEmitter {
 // Wire-compatible with RNS.Link's core handshake (LINKREQUEST -> PROOF ->
 // LRRTT), per-link Token encryption, KEEPALIVE, and LINKCLOSE — verified
 // byte-for-byte against the real `rns` package (see protocol.js's "RNS.Link
-// wire format" section and test/rns-compliance.test.js).
+// wire format" section and test/rns-compliance.test.js). Also implements
+// RNS.Link's real RTT-adaptive keepalive/stale/timeout state machine (see
+// _watchdogTick()/_updateKeepalive() below), Resource transfers (including
+// multi-segment, but not yet the rate-adaptive window or outgoing
+// compression — see compliance.md), and Channel/Buffer.
 //
 // Request/Response is implemented for the direct-packet (fits-in-one-packet)
-// form only. Not implemented: RNS.Link's exact RTT-adaptive keepalive/
-// stale/timeout state machine (this uses simple fixed intervals instead),
-// Resource transfers (including the Request/Response fallback to one when a
-// request or response doesn't fit in a single packet), Channel, and
-// packet-level delivery proofs (RNS.Packet.prove()/link.validate()). See
-// README's Compliance section.
+// form only — no Resource fallback yet for an oversized request/response
+// (see compliance.md Phase 3). See README's Compliance section and
+// compliance.md for the full parity checklist.
 export class Link extends EventEmitter {
     static PENDING = 0;
     static HANDSHAKE = 1;
     static ACTIVE = 2;
+    static STALE = 3;
     static CLOSED = 4;
 
+    static TIMEOUT = 1; // teardown reason, matches RNS.Link.TIMEOUT
+    static INITIATOR_CLOSED = 2;
+    static DESTINATION_CLOSED = 3;
+
     static DEFAULT_MTU = 500;
-    static ESTABLISHMENT_TIMEOUT_MS = 15000;
-    static KEEPALIVE_INTERVAL_MS = 30000;
-    static STALE_AFTER_MS = Link.KEEPALIVE_INTERVAL_MS * 2.5;
+
+    // RNS.Link's real RTT-adaptive keepalive/stale/timeout state machine
+    // (RNS/Link.py), replacing the fixed intervals this used to use — see
+    // _updateKeepalive()/_watchdogTick() below. Values match the Python
+    // constants (seconds); converted to ms at the point of use.
+    static DEFAULT_PER_HOP_TIMEOUT = 6;
+    static ESTABLISHMENT_TIMEOUT_PER_HOP = 6;
+    static KEEPALIVE_MAX = 360;
+    static KEEPALIVE_MIN = 5;
+    static KEEPALIVE_MAX_RTT = 1.75;
+    static STALE_FACTOR = 2;
+    static STALE_GRACE = 5;
+    static KEEPALIVE_TIMEOUT_FACTOR = 4;
 
     // Use Link.fromRequest() to construct a responder-side link from an
     // incoming LINKREQUEST packet; use `new Link(rns, destination)` directly
@@ -459,8 +475,12 @@ export class Link extends EventEmitter {
         this.status = Link.PENDING;
         this.mtu = Link.DEFAULT_MTU;
         this.derivedKey = null;
-        this._keepaliveTimer = null;
-        this._establishmentTimer = null;
+        this._watchdogTimer = null;
+        this.lastInbound = 0;
+        this.lastKeepaliveSent = 0;
+        this.activatedAt = null;
+        this.keepaliveMs = Link.KEEPALIVE_MAX * 1000;
+        this.staleTimeMs = this.keepaliveMs * Link.STALE_FACTOR;
         this.pendingRequests = new Map(); // request_id hex -> { resolve, reject, timer }
         this._outgoingResources = new Map(); // resource_hash hex -> { parts, hashmapEntries, expectedProof, resolve, reject, timer }
         this._incomingResources = new Map(); // resource_hash hex -> { randomHash, hashmapEntries, parts, receivedCount }
@@ -483,10 +503,24 @@ export class Link extends EventEmitter {
         this.linkId = protocol.link_id_from_request(requestRaw, unpacked.data.length);
         this.hash = this.linkId;
 
+        // Matches RNS.Link's initiator-side establishment timeout (a base
+        // per-hop timeout plus ESTABLISHMENT_TIMEOUT_PER_HOP per hop to the
+        // destination). Real RNS asks the transport layer for a
+        // link-specific first-hop timeout derived from the first
+        // interface's bitrate; this project's transports (WebRTC/TCP) are
+        // fast and don't vary that way, so DEFAULT_PER_HOP_TIMEOUT is used
+        // as that base instead. Hops default to 1 if not yet known from the
+        // path table (real RNS falls back to PATHFINDER_M/128 there, but a
+        // Link is only ever constructed here once a path is already known).
+        const destHex = crypto.bytesToHex(destination.hash);
+        const knownHops = this.rns.pathTable.get(destHex)?.hops;
+        const hops = Math.max(1, knownHops ?? 1);
+        this.establishmentTimeoutMs = (Link.DEFAULT_PER_HOP_TIMEOUT + Link.ESTABLISHMENT_TIMEOUT_PER_HOP * hops) * 1000;
+
         this.rns.links.set(crypto.bytesToHex(this.linkId), this);
         this.requestTime = Date.now();
         this.rns.sendData(requestRaw);
-        this._armEstablishmentTimeout();
+        this._scheduleWatchdog(this.establishmentTimeoutMs);
     }
 
     static fromRequest(rns, destination, packet, rawBytes) {
@@ -500,8 +534,12 @@ export class Link extends EventEmitter {
         link.status = Link.HANDSHAKE;
         link.initiator = false;
         link.mtu = parsed.mtu || Link.DEFAULT_MTU;
-        link._keepaliveTimer = null;
-        link._establishmentTimer = null;
+        link._watchdogTimer = null;
+        link.lastInbound = 0;
+        link.lastKeepaliveSent = 0;
+        link.activatedAt = null;
+        link.keepaliveMs = Link.KEEPALIVE_MAX * 1000;
+        link.staleTimeMs = link.keepaliveMs * Link.STALE_FACTOR;
         link.pendingRequests = new Map();
         link._outgoingResources = new Map();
         link._incomingResources = new Map();
@@ -527,19 +565,18 @@ export class Link extends EventEmitter {
 
         link.rns.links.set(crypto.bytesToHex(link.linkId), link);
         link.requestTime = Date.now();
+        // Matches RNS.Link's responder-side establishment timeout
+        // (Link.validate_request): generous, since the responder must
+        // tolerate however long it takes the initiator to receive our
+        // PROOF and reply with LRRTT, over however many hops the request
+        // itself travelled to get here.
+        link.establishmentTimeoutMs = (Link.ESTABLISHMENT_TIMEOUT_PER_HOP * Math.max(1, packet.hops || 0) + Link.KEEPALIVE_MAX) * 1000;
 
         const proofRaw = protocol.build_link_proof(link.linkId, destination.identity.private, link.xPublic, link.mtu);
         link.rns.sendData(proofRaw);
-        link._armEstablishmentTimeout();
+        link._scheduleWatchdog(link.establishmentTimeoutMs);
 
         return link;
-    }
-
-    _armEstablishmentTimeout() {
-        clearTimeout(this._establishmentTimer);
-        this._establishmentTimer = setTimeout(() => {
-            if (this.status !== Link.ACTIVE) this.close();
-        }, Link.ESTABLISHMENT_TIMEOUT_MS);
     }
 
     // Initiator-side: called when a PROOF (context=LRPROOF) packet addressed
@@ -548,6 +585,8 @@ export class Link extends EventEmitter {
     // can arrive on either side of the link, at any point after it's ACTIVE,
     // unlike the handshake's LRPROOF.
     onProof(packet) {
+        this._noteInbound();
+
         if (packet.context === protocol.CONTEXT_RESOURCE_PRF) {
             this._onResourceProof(packet.data);
             return;
@@ -571,14 +610,13 @@ export class Link extends EventEmitter {
         this.derivedKey = protocol.link_handshake(this.xPrivate, this.peerXPublic, this.linkId);
         this.rtt = (Date.now() - this.requestTime) / 1000;
         this.status = Link.ACTIVE;
-        clearTimeout(this._establishmentTimer);
 
         let rttData = pack(this.rtt);
         if (!(rttData instanceof Uint8Array)) rttData = new Uint8Array(rttData);
         const rttPacket = protocol.build_link_packet(this.linkId, this.derivedKey, rttData, protocol.CONTEXT_LRRTT);
         this.rns.sendData(rttPacket);
 
-        this._startKeepalive();
+        this._activateWatchdog();
         this.emit('established', this);
     }
 
@@ -589,6 +627,7 @@ export class Link extends EventEmitter {
     // (only for REQUEST) to compute the request_id.
     onPacket(packet, rawBytes) {
         if (this.status === Link.CLOSED) return;
+        this._noteInbound();
 
         if (packet.context === protocol.CONTEXT_KEEPALIVE) {
             if (!this.initiator && packet.data.length === 1 && packet.data[0] === 0xff) {
@@ -625,8 +664,7 @@ export class Link extends EventEmitter {
             const reportedRtt = unpack(plaintext);
             this.rtt = Math.max((Date.now() - this.requestTime) / 1000, reportedRtt);
             this.status = Link.ACTIVE;
-            clearTimeout(this._establishmentTimer);
-            this._startKeepalive();
+            this._activateWatchdog();
             this.emit('established', this);
         } else if (packet.context === protocol.CONTEXT_LINKCLOSE) {
             if (crypto.bytesToHex(plaintext) === crypto.bytesToHex(this.linkId)) this._teardown();
@@ -982,26 +1020,112 @@ export class Link extends EventEmitter {
         this.rns.sendData(proofPacket);
     }
 
-    _startKeepalive() {
-        clearInterval(this._keepaliveTimer);
-        if (!this.initiator) return;
-        this._keepaliveTimer = setInterval(() => {
-            this.rns.sendData(protocol.build_link_packet(this.linkId, this.derivedKey, new Uint8Array([0xff]), protocol.CONTEXT_KEEPALIVE));
-        }, Link.KEEPALIVE_INTERVAL_MS);
+    // Matches RNS.Link's real RTT-adaptive keepalive/stale/timeout state
+    // machine (RNS/Link.py __watchdog_job/__update_keepalive), adapted from
+    // Python's polling sleep-loop (a dedicated thread per link, woken on a
+    // fixed cadence to re-check elapsed time) to a single rescheduled
+    // setTimeout: since JS has no threads, the next check is instead
+    // recomputed and rescheduled from scratch whenever something that
+    // affects it changes (RTT becomes known, a packet arrives, a status
+    // transition happens) rather than by polling.
+    _updateKeepalive() {
+        const keepaliveS = Math.max(
+            Math.min(this.rtt * (Link.KEEPALIVE_MAX / Link.KEEPALIVE_MAX_RTT), Link.KEEPALIVE_MAX),
+            Link.KEEPALIVE_MIN,
+        );
+        this.keepaliveMs = keepaliveS * 1000;
+        this.staleTimeMs = this.keepaliveMs * Link.STALE_FACTOR;
+    }
+
+    _activateWatchdog() {
+        this.activatedAt = Date.now();
+        this.lastInbound = this.activatedAt;
+        this._updateKeepalive();
+        this._watchdogTick();
+    }
+
+    // Called whenever traffic arrives for this link (see onPacket/onProof)
+    // — resets the staleness clock and recovers a STALE link back to
+    // ACTIVE, matching RNS.Link's "if self.status == Link.STALE: self.
+    // status = Link.ACTIVE" on any inbound packet.
+    _noteInbound() {
+        if (this.status !== Link.ACTIVE && this.status !== Link.STALE) return;
+        this.lastInbound = Date.now();
+        if (this.status === Link.STALE) this.status = Link.ACTIVE;
+        this._watchdogTick();
+    }
+
+    _sendKeepalive() {
+        this.lastKeepaliveSent = Date.now();
+        this.rns.sendData(protocol.build_link_packet(this.linkId, this.derivedKey, new Uint8Array([0xff]), protocol.CONTEXT_KEEPALIVE));
+    }
+
+    _scheduleWatchdog(delayMs) {
+        clearTimeout(this._watchdogTimer);
+        this._watchdogTimer = setTimeout(() => this._watchdogTick(), Math.max(delayMs, 0));
+    }
+
+    // Re-evaluates this link's timing state from scratch and schedules the
+    // next check — the JS equivalent of one iteration of RNS.Link's
+    // __watchdog_job loop.
+    _watchdogTick() {
+        if (this.status === Link.CLOSED) return;
+
+        if (this.status === Link.PENDING || this.status === Link.HANDSHAKE) {
+            const now = Date.now();
+            const deadline = this.requestTime + this.establishmentTimeoutMs;
+            if (now >= deadline) {
+                this.teardownReason = Link.TIMEOUT;
+                this._teardown();
+                return;
+            }
+            this._scheduleWatchdog(deadline - now);
+            return;
+        }
+
+        if (this.status === Link.ACTIVE) {
+            const now = Date.now();
+            const lastInbound = Math.max(this.lastInbound, this.activatedAt || 0);
+
+            if (now >= lastInbound + this.keepaliveMs) {
+                if (this.initiator && now >= this.lastKeepaliveSent + this.keepaliveMs) {
+                    this._sendKeepalive();
+                }
+                if (now >= lastInbound + this.staleTimeMs) {
+                    this.status = Link.STALE;
+                    this._scheduleWatchdog(this.rtt * Link.KEEPALIVE_TIMEOUT_FACTOR * 1000 + Link.STALE_GRACE * 1000);
+                    return;
+                }
+                this._scheduleWatchdog(this.keepaliveMs);
+                return;
+            }
+            this._scheduleWatchdog((lastInbound + this.keepaliveMs) - now);
+            return;
+        }
+
+        if (this.status === Link.STALE) {
+            this.teardownReason = Link.TIMEOUT;
+            this._sendTeardownPacket();
+            this._teardown();
+        }
+    }
+
+    _sendTeardownPacket() {
+        if (this.derivedKey) {
+            this.rns.sendData(protocol.build_link_packet(this.linkId, this.derivedKey, this.linkId, protocol.CONTEXT_LINKCLOSE));
+        }
     }
 
     close() {
         if (this.status === Link.CLOSED) return;
-        if (this.status !== Link.PENDING && this.derivedKey) {
-            this.rns.sendData(protocol.build_link_packet(this.linkId, this.derivedKey, this.linkId, protocol.CONTEXT_LINKCLOSE));
-        }
+        if (this.status !== Link.PENDING) this._sendTeardownPacket();
+        this.teardownReason = Link.INITIATOR_CLOSED;
         this._teardown();
     }
 
     _teardown() {
         this.status = Link.CLOSED;
-        clearTimeout(this._establishmentTimer);
-        clearInterval(this._keepaliveTimer);
+        clearTimeout(this._watchdogTimer);
         this.rns.links.delete(crypto.bytesToHex(this.linkId));
         for (const pending of this._outgoingResources.values()) {
             clearTimeout(pending.timer);
@@ -1010,6 +1134,11 @@ export class Link extends EventEmitter {
         this._outgoingResources.clear();
         this._incomingResources.clear();
         this._resourceSegments.clear();
+        for (const pending of this.pendingRequests.values()) {
+            clearTimeout(pending.timer);
+            pending.reject(new Error('Link closed before a response was received'));
+        }
+        this.pendingRequests.clear();
         if (this._channel) this._channel._shutdown();
         this.emit('closed', this);
     }

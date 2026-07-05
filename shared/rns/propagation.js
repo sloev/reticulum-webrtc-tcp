@@ -215,7 +215,7 @@ export class PropagationNode {
 // doesn't parse a node's announced cost automatically), and uploads it over
 // an already-established Link. Returns the Link.sendResource() promise
 // (resolves once the node acknowledges receipt of the transfer).
-export function propagateLXMF(propagationLink, destination, source, title, content, fields = {}, stampCost = 0) {
+export async function propagateLXMF(propagationLink, destination, source, title, content, fields = {}, stampCost = 0) {
     if (destination.direction !== Destination.OUT) {
         throw new Error("Can only propagate LXMF to OUT destinations.");
     }
@@ -231,7 +231,7 @@ export function propagateLXMF(propagationLink, destination, source, title, conte
     const wirePayload = protocol.lxmf_build(content, source.identity.private, destination.hash, source.hash, null, title, fields);
     const envelope = build_propagated_envelope(destination.hash, wirePayload, knownIdentity.public_key, knownIdentity.ratchet);
     const transientId = propagated_transient_id(envelope);
-    const { stamp: stampBytes } = stamp.generate_stamp(transientId, stampCost);
+    const { stamp: stampBytes } = await stamp.generate_stamp(transientId, stampCost);
     const container = msgpack.pack([new msgpack.Float64(Date.now() / 1000), [crypto.concat(envelope, stampBytes)]]);
 
     return propagationLink.sendResource(container);
@@ -362,7 +362,7 @@ export async function syncToPeer(node, peerLink, peerIdentity, { peeringCost = 1
         node.peers.set(peerHashHex, peerState);
     }
     if (!peerState.peeringKey) {
-        const { stamp: peeringKey } = stamp.generate_peering_key(peerIdentity.hash, node.identity.hash, peeringCost);
+        const { stamp: peeringKey } = await stamp.generate_peering_key(peerIdentity.hash, node.identity.hash, peeringCost);
         peerState.peeringKey = peeringKey;
     }
 

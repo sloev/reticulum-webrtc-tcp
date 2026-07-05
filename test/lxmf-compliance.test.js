@@ -263,9 +263,9 @@ test('stamp_workblock matches LXStamper.stamp_workblock byte-for-byte', () => {
   assert.equal(workblock.length, 256);
 });
 
-test('generate_stamp produces a stamp that stamp_valid (and real LXStamper) both accept', () => {
+test('generate_stamp produces a stamp that stamp_valid (and real LXStamper) both accept', async () => {
   const material = crypto.randomBytes(32);
-  const { stamp: stampBytes, value } = stamp.generate_stamp(material, 8, 50);
+  const { stamp: stampBytes, value } = await stamp.generate_stamp(material, 8, 50);
 
   assert.ok(value >= 8);
   const workblock = stamp.stamp_workblock(material, 50);
@@ -418,7 +418,7 @@ test('a propagation node rejects an /offer whose peering key does not meet its r
   await new Promise((resolve) => peerLink.once('established', resolve));
 
   peerLink.identify(nodeA.identity);
-  const { stamp: lowCostKey } = stamp.generate_peering_key(nodeBIdentity.hash, nodeAIdentity.hash, 8);
+  const { stamp: lowCostKey } = await stamp.generate_peering_key(nodeBIdentity.hash, nodeAIdentity.hash, 8);
   const response = await peerLink.request('/offer', [lowCostKey, []]);
   assert.equal(response, 0xf3);
 

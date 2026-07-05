@@ -224,6 +224,98 @@ test('Link establishes, exchanges data both ways, and tears down between two ind
   assert.equal(rnsB.links.size, 0);
 });
 
+test('Link keepalive/stale timing scales with RTT matching RNS.Link\'s KEEPALIVE_MAX/MIN/MAX_RTT/STALE_FACTOR formula', async () => {
+  const rnsA = new Reticulum();
+  const rnsB = new Reticulum();
+  class Bridge extends Interface {
+    connect() {}
+    sendData(data) { setTimeout(() => this.other.rns.onPacketReceived(data, this.other), 0); }
+  }
+  const ifaceA = new Bridge('A');
+  const ifaceB = new Bridge('B');
+  ifaceA.other = ifaceB;
+  ifaceB.other = ifaceA;
+  rnsA.addInterface(ifaceA);
+  rnsB.addInterface(ifaceB);
+
+  const responderIdentity = Identity.create();
+  const responderDest = new Destination(rnsB, responderIdentity, Destination.IN, Destination.SINGLE, 'test', 'keepalive');
+  const outDest = new Destination(rnsA, responderIdentity, Destination.OUT, Destination.SINGLE, 'test', 'keepalive');
+  outDest.hash = responderDest.hash;
+
+  const link = new Link(rnsA, outDest);
+  await new Promise((resolve) => link.once('established', resolve));
+
+  // Below KEEPALIVE_MIN_RTT-equivalent: clamps to KEEPALIVE_MIN (5s).
+  link.rtt = 0.001;
+  link._updateKeepalive();
+  assert.equal(link.keepaliveMs, Link.KEEPALIVE_MIN * 1000);
+  assert.equal(link.staleTimeMs, Link.KEEPALIVE_MIN * Link.STALE_FACTOR * 1000);
+
+  // At KEEPALIVE_MAX_RTT exactly: keepalive saturates to KEEPALIVE_MAX (360s).
+  link.rtt = Link.KEEPALIVE_MAX_RTT;
+  link._updateKeepalive();
+  assert.equal(link.keepaliveMs, Link.KEEPALIVE_MAX * 1000);
+
+  // Somewhere in between: keepalive = rtt * (KEEPALIVE_MAX/KEEPALIVE_MAX_RTT), clamped.
+  link.rtt = 1.0;
+  link._updateKeepalive();
+  const expectedS = Math.max(Math.min(1.0 * (Link.KEEPALIVE_MAX / Link.KEEPALIVE_MAX_RTT), Link.KEEPALIVE_MAX), Link.KEEPALIVE_MIN);
+  assert.equal(link.keepaliveMs, expectedS * 1000);
+  assert.equal(link.staleTimeMs, link.keepaliveMs * Link.STALE_FACTOR);
+
+  link.close();
+});
+
+test('a Link transitions ACTIVE -> STALE after the stale timeout, recovers to ACTIVE on inbound traffic, and tears down with reason TIMEOUT if nothing arrives during the STALE grace period', async () => {
+  const rnsA = new Reticulum();
+  const rnsB = new Reticulum();
+  class Bridge extends Interface {
+    connect() {}
+    sendData(data) { setTimeout(() => this.other.rns.onPacketReceived(data, this.other), 0); }
+  }
+  const ifaceA = new Bridge('A');
+  const ifaceB = new Bridge('B');
+  ifaceA.other = ifaceB;
+  ifaceB.other = ifaceA;
+  rnsA.addInterface(ifaceA);
+  rnsB.addInterface(ifaceB);
+
+  const responderIdentity = Identity.create();
+  const responderDest = new Destination(rnsB, responderIdentity, Destination.IN, Destination.SINGLE, 'test', 'stale');
+  const outDest = new Destination(rnsA, responderIdentity, Destination.OUT, Destination.SINGLE, 'test', 'stale');
+  outDest.hash = responderDest.hash;
+
+  const link = new Link(rnsA, outDest);
+  await new Promise((resolve) => link.once('established', resolve));
+  assert.equal(link.status, Link.ACTIVE);
+
+  // Simulate time passing well beyond stale_time without needing to
+  // actually wait for it in real time: back-date lastInbound/activatedAt,
+  // then drive the same tick function the real watchdog timer calls.
+  link.lastInbound -= link.staleTimeMs + 1000;
+  link.activatedAt -= link.staleTimeMs + 1000;
+  link._watchdogTick();
+  assert.equal(link.status, Link.STALE, 'link goes STALE once idle past stale_time');
+
+  // Any inbound traffic recovers a STALE link back to ACTIVE.
+  link._noteInbound();
+  assert.equal(link.status, Link.ACTIVE, 'inbound traffic recovers a STALE link to ACTIVE');
+
+  // Now let it go STALE again and simulate the grace period elapsing with
+  // nothing arriving — should tear down with reason TIMEOUT.
+  link.lastInbound -= link.staleTimeMs + 1000;
+  link.activatedAt -= link.staleTimeMs + 1000;
+  link._watchdogTick();
+  assert.equal(link.status, Link.STALE);
+  const closed = new Promise((resolve) => link.once('closed', resolve));
+  link._watchdogTick(); // STALE tick tears down immediately (grace period already modeled by the scheduled delay, not by this call)
+  await closed;
+  assert.equal(link.status, Link.CLOSED);
+  assert.equal(link.teardownReason, Link.TIMEOUT);
+  assert.equal(rnsA.links.size, 0);
+});
+
 test('Link.identify() reveals the initiator\'s real identity to the responder, matching RNS.Link.identify()/get_remote_identity()', async () => {
   const rnsA = new Reticulum();
   const rnsB = new Reticulum();
