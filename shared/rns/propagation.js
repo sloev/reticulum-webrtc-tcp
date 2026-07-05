@@ -8,12 +8,15 @@
 // This is a from-scratch design *inspired by* real LXMF's LXMRouter/LXMPeer
 // (same core ideas: a dedicated "lxmf.propagation" destination, messages
 // identified by a transient_id hash rather than a sequence number, a
-// list-then-fetch client sync protocol under a "/get" request path, and
-// LXStamper's proof-of-work admission stamps) but not wire-compatible with
-// it: no node-to-node peer sync (LXMPeer's "/offer" protocol between
-// propagation nodes, including its own peering-key stamps), and messages
-// travel over this project's Resource implementation, which is itself
-// JS-only-interoperable (see protocol.js's "RNS.Resource" section). Real
+// list-then-fetch client sync protocol under a "/get" request path,
+// LXStamper's proof-of-work admission stamps, and — see syncToPeer() below —
+// node-to-node peer sync under an "/offer" request path with its own
+// peering-key stamps). What isn't wire-compatible: messages travel over this
+// project's Resource implementation, which is itself JS-only-interoperable
+// for anything past a single segment (see protocol.js's "RNS.Resource"
+// section), and this project's own client-facing "/get" sync protocol
+// (`syncLXMF()`) is a different, JS-only mechanism from real LXMF's — see
+// `syncFromRealPropagationNode()` for the one that's wire-compatible. Real
 // LXMF's message *envelope* (destination_hash + source_hash + signature +
 // msgpack payload) is reused unchanged, wrapped in an extra layer that keeps
 // the destination_hash in the clear (so a node can index by it) while
@@ -58,15 +61,23 @@ export function propagated_transient_id(envelope) {
 // required cost so senders know what to compute; that announce-parsing
 // isn't implemented here, so a sender must be told the required cost out of
 // band (see propagateLXMF's stampCost parameter).
+//
+// peeringCost sets the proof-of-work required of another propagation node
+// before it's allowed to sync messages to this one (see syncToPeer() below
+// and stamp.js's peering-key functions) — matches real LXMF's
+// LXMRouter.peering_cost (default 18).
 export class PropagationNode {
-    constructor(rns, identity, { stampCost = 0 } = {}) {
+    constructor(rns, identity, { stampCost = 0, peeringCost = 18 } = {}) {
         this.rns = rns;
         this.identity = identity;
         this.stampCost = stampCost;
+        this.peeringCost = peeringCost;
         this.destination = new Destination(rns, identity, Destination.IN, Destination.SINGLE, 'lxmf', 'propagation');
-        this.messages = new Map(); // transient_id hex -> { destinationHash, envelope }
+        this.messages = new Map(); // transient_id hex -> { destinationHash, envelope, stamp }
+        this.peers = new Map(); // peer identity hash hex -> { peeringKey, handledMessages: Set<transient_id hex> }
 
         this.destination.registerRequestHandler('/get', (data, requestId, link) => this._onGetRequest(data, link));
+        this.destination.registerRequestHandler('/offer', (data, requestId, link) => this._onOfferRequest(data, link));
         this.destination.on('link', (link) => {
             link.on('resource', (resourceData) => this._onUpload(resourceData));
         });
@@ -96,7 +107,14 @@ export class PropagationNode {
 
             const key = crypto.bytesToHex(transientId);
             if (!this.messages.has(key)) {
-                this.messages.set(key, { destinationHash: envelope.slice(0, 16), envelope });
+                // The stamp is kept (not just the envelope): a client's own
+                // "/get" download doesn't need it (see _onGetRequest, which
+                // only ever serves `entry.envelope`), but forwarding this
+                // message on to a peer during sync does — a real propagation
+                // node re-validates a peer-forwarded message's original
+                // stamp exactly like a fresh upload's, so it has to still be
+                // attached (see syncToPeer() below).
+                this.messages.set(key, { destinationHash: envelope.slice(0, 16), envelope, stamp: stampBytes });
             }
         }
     }
@@ -156,6 +174,36 @@ export class PropagationNode {
         }
 
         return response;
+    }
+
+    // Node-to-node peer sync's offer step (matches real LXMF's
+    // LXMPeer.OFFER_REQUEST_PATH "/offer" handler,
+    // LXMRouter.offer_request()): `data = [peeringKey, transientIds]`. The
+    // requester must have already proven their identity over this Link
+    // (Link.identify()) — real RNS's request-dispatch machinery passes that
+    // straight to the handler as a parameter; this project's Link exposes it
+    // via getRemoteIdentity() instead, checked here directly. Returns:
+    //  - 0xf0 (no identity presented) if the link was never identified
+    //  - 0xf3 (invalid key) if the peering key doesn't meet peeringCost
+    //  - false if we don't want any of the offered transient_ids
+    //  - true if we want all of them
+    //  - an array of the specific transient_ids we want, otherwise
+    _onOfferRequest(data, link) {
+        const remoteIdentity = link.getRemoteIdentity();
+        if (!remoteIdentity) return 0xf0;
+
+        if (!Array.isArray(data) || data.length < 2) return null;
+        const [peeringKey, transientIds] = data;
+        if (!(peeringKey instanceof Uint8Array) || !Array.isArray(transientIds)) return null;
+
+        if (!stamp.validate_peering_key(this.identity.hash, remoteIdentity.hash, peeringKey, this.peeringCost)) {
+            return 0xf3;
+        }
+
+        const wantedIds = transientIds.filter((id) => id instanceof Uint8Array && !this.messages.has(crypto.bytesToHex(id)));
+        if (wantedIds.length === 0) return false;
+        if (wantedIds.length === transientIds.length) return true;
+        return wantedIds;
     }
 }
 
@@ -280,4 +328,82 @@ export async function syncFromRealPropagationNode(propagationLink, source) {
     await propagationLink.request('/get', [null, listing]).catch(() => {});
 
     return messages;
+}
+
+// --- Node-to-node peer sync (LXMPeer's "/offer" protocol) ---
+// Offers `node`'s stored messages to another propagation node (a peer) over
+// an already-established Link to their "lxmf.propagation" destination,
+// uploading whichever ones the peer doesn't already have. Mirrors real
+// LXMF's LXMPeer.sync()/offer_response()/resource_concluded() at the wire
+// level — the "/offer" request path, a peering-key stamp proving proof-of-
+// work for this specific (peer, us) relationship (see stamp.js), and a
+// Resource-based transfer of wanted messages, complete with their original
+// admission stamps still attached (a real node re-validates a peer-
+// forwarded message's stamp exactly like a fresh upload's, so removing it
+// the way a client-facing "/get" download does would break re-validation
+// three hops later) — without real LXMF's automatic background scheduling,
+// retry backoff, or transfer-rate tracking: this is one explicit sync
+// attempt, not a standing peer relationship that syncs itself over time.
+//
+// peeringCost must match what the peer actually requires (its own
+// LXMRouter.peering_cost/PropagationNode.peeringCost) — like propagateLXMF's
+// stampCost, this isn't learned automatically from an announce, so it has
+// to be supplied by the caller. The peering key is generated once per
+// `node` (cached on first sync) and on real LXMF, at the default cost of
+// 18, expect this to take several seconds — see stamp.js's module comment
+// on why there's no parallel search to speed it up.
+export async function syncToPeer(node, peerLink, peerIdentity, { peeringCost = 18 } = {}) {
+    peerLink.identify(node.identity);
+
+    const peerHashHex = crypto.bytesToHex(peerIdentity.hash);
+    let peerState = node.peers.get(peerHashHex);
+    if (!peerState) {
+        peerState = { peeringKey: null, handledMessages: new Set() };
+        node.peers.set(peerHashHex, peerState);
+    }
+    if (!peerState.peeringKey) {
+        const { stamp: peeringKey } = stamp.generate_peering_key(peerIdentity.hash, node.identity.hash, peeringCost);
+        peerState.peeringKey = peeringKey;
+    }
+
+    const unhandled = [];
+    for (const key of node.messages.keys()) {
+        if (!peerState.handledMessages.has(key)) unhandled.push(key);
+    }
+    if (unhandled.length === 0) return { offered: 0, synced: 0 };
+
+    // A longer timeout than the request() default: the peer must validate our
+    // peering key by recomputing its stamp workblock, which (like generating
+    // one) is a deliberately expensive hashcash-style computation.
+    const response = await peerLink.request('/offer', [peerState.peeringKey, unhandled.map((key) => crypto.hexToBytes(key))], { timeout: 30000 });
+
+    if (response === 0xf0) throw new Error('Peer indicated no identity was received');
+    if (response === 0xf1) throw new Error('Peer denied access');
+    if (response === 0xf3) {
+        peerState.peeringKey = null; // cost may have changed; regenerate next time
+        throw new Error('Peer rejected our peering key (insufficient cost)');
+    }
+
+    let wanted;
+    if (response === false) wanted = [];
+    else if (response === true) wanted = unhandled;
+    else if (Array.isArray(response)) wanted = response.map((id) => crypto.bytesToHex(id));
+    else throw new Error('Unexpected /offer response');
+
+    const wantedSet = new Set(wanted);
+    for (const key of unhandled) {
+        if (!wantedSet.has(key)) peerState.handledMessages.add(key); // peer already has it via another path
+    }
+
+    if (wanted.length > 0) {
+        const envelopes = wanted
+            .map((key) => node.messages.get(key))
+            .filter(Boolean)
+            .map((entry) => crypto.concat(entry.envelope, entry.stamp));
+        const container = msgpack.pack([new msgpack.Float64(Date.now() / 1000), envelopes]);
+        await peerLink.sendResource(container);
+        for (const key of wanted) peerState.handledMessages.add(key);
+    }
+
+    return { offered: unhandled.length, synced: wanted.length };
 }

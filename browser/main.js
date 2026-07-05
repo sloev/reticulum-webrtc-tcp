@@ -6,9 +6,16 @@ import { Buffer } from 'buffer';
 // not exposed as a global by default.
 if (typeof globalThis.Buffer === 'undefined') globalThis.Buffer = Buffer;
 
-import { Reticulum, Destination, Identity } from '../shared/rns/index.js';
+import { Reticulum, Destination, Identity, Link } from '../shared/rns/index.js';
 import { WebRTCBrowser } from './webrtc-browser.js';
 import * as crypto from '../shared/rns/crypto.js';
+
+// Chat messages are sent as a Channel message over an established Link, not
+// as one-shot LXMF packets — this is what actually exercises Link/Channel's
+// reliable delivery (and Link.identify(), so the recipient can show who a
+// message is from) in the demo, rather than just being available as a
+// verified API nothing here used.
+const CHAT_MSGTYPE = 0x0001;
 
 const logEl = document.getElementById('log');
 const knownPeersEl = document.getElementById('known-peers');
@@ -95,7 +102,8 @@ dest.on('packet', (event) => {
   }
 });
 
-// Handle LXMF messages
+// Handle LXMF messages (kept for interop with an older/different peer that
+// still sends this way — this demo's own send() now uses Link/Channel below)
 dest.on('lxmf', (lxmf) => {
   const from = crypto.bytesToHex(lxmf.source_hash).slice(0, 12);
   try {
@@ -106,6 +114,61 @@ dest.on('lxmf', (lxmf) => {
   }
 });
 
+// A peer establishing a Link to us for chat: wire up its Channel to receive
+// CHAT_MSGTYPE messages, and note who it's from once (if) the initiator
+// identifies themselves via Link.identify().
+dest.on('link', (link) => {
+  log('system', 'Incoming chat link established');
+  let fromRid = null;
+  link.on('remote-identified', (remoteIdentity) => {
+    fromRid = crypto.bytesToHex(remoteIdentity.hash).slice(0, 12);
+  });
+  link.getChannel().addMessageHandler((msgtype, data) => {
+    if (msgtype !== CHAT_MSGTYPE) return false;
+    try {
+      const msg = new TextDecoder().decode(data);
+      log('recv', fromRid ? `from ${fromRid}…: ${msg}` : msg);
+    } catch (e) {
+      log('recv', fromRid ? `from ${fromRid}…: [binary data]` : '[binary data]');
+    }
+    return true;
+  });
+});
+
+// Outgoing chat Links, keyed by the recipient's RID hex — established
+// lazily on first send to a peer and reused afterward.
+const outgoingLinks = new Map();
+
+function getOrCreateChatLink(toHex) {
+  const existing = outgoingLinks.get(toHex);
+  if (existing && existing.status !== Link.CLOSED) {
+    if (existing.status === Link.ACTIVE) return Promise.resolve(existing);
+    return new Promise((resolve, reject) => {
+      existing.once('established', () => resolve(existing));
+      existing.once('closed', () => reject(new Error('Link closed before it was established')));
+    });
+  }
+
+  const toHash = crypto.hexToBytes(toHex);
+  const outDest = new Destination(rns, identity, Destination.OUT, Destination.SINGLE, 'webrtc_demo', 'chat');
+  outDest.hash = toHash;
+
+  const link = new Link(rns, outDest);
+  outgoingLinks.set(toHex, link);
+  link.on('closed', () => {
+    if (outgoingLinks.get(toHex) === link) outgoingLinks.delete(toHex);
+  });
+
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('Link establishment timed out')), 15000);
+    link.once('established', () => {
+      clearTimeout(timer);
+      link.identify(identity); // lets the recipient show who this chat is from
+      resolve(link);
+    });
+  });
+}
+
 // Periodically announce so others can cache our identity for encryption
 setInterval(() => dest.announce(), 10000);
 dest.announce();
@@ -115,24 +178,30 @@ document.getElementById('copy-rid').onclick = async () => {
   log('system', 'RID copied to clipboard');
 };
 
-const send = () => {
+const send = async () => {
   const toHex = destInput.value.trim();
   const msg = msgInput.value;
   if (!toHex || !msg) return;
 
-  const toHash = crypto.hexToBytes(toHex);
-  const outDest = new Destination(rns, identity, Destination.OUT, Destination.SINGLE, 'webrtc_demo', 'chat');
-  outDest.hash = toHash;
-
-  const payload = new TextEncoder().encode(msg);
-
-  if (knownPeers.has(toHex)) {
-    outDest.sendLXMF(dest, 'Chat', payload);
-    log('sent', `to ${toHex.slice(0, 12)}…: ${msg}`);
-    msgInput.value = '';
-  } else {
+  if (!knownPeers.has(toHex)) {
     log('system', `Haven't heard an announce from ${toHex.slice(0, 12)}… yet — re-announcing to prompt them.`);
     dest.announce();
+    return;
+  }
+
+  msgInput.value = '';
+  const payload = new TextEncoder().encode(msg);
+
+  try {
+    const link = await getOrCreateChatLink(toHex);
+    const channel = link.getChannel();
+    while (!channel.isReadyToSend()) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    channel.send(CHAT_MSGTYPE, payload);
+    log('sent', `to ${toHex.slice(0, 12)}…: ${msg}`);
+  } catch (e) {
+    log('system', `Failed to send to ${toHex.slice(0, 12)}…: ${e.message}`);
   }
 };
 
