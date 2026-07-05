@@ -1,0 +1,305 @@
+# Compliance execution plan: full RNS/LXMF parity
+
+A stepped, self-contained execution plan for closing every gap documented in
+[README#compliance](./README.md#compliance), ending in a fully compliant JavaScript
+port of the Reticulum Network Stack (`rns` 1.3.7) and LXMF (`lxmf` 1.0.1). It doubles
+as the living **feature parity checklist**: every feature, with a reference to where it
+lives in the real Python source and where it lives (or will live) here.
+
+This document is written to be executed by Claude (or any contributor) one phase at a
+time, in order. Update the checklist row and the README's Compliance section as part of
+completing each step — a step is not done until both say so.
+
+## Ground rules
+
+**Reference sources.** Everything is verified against the real packages, never from
+memory:
+
+```bash
+pip install --target=/path/to/pylibs rns==1.3.7 lxmf==1.0.1
+```
+
+Read the Python source in `pylibs/RNS/` and `pylibs/LXMF/` (or unzip the wheels).
+Every step below starts by reading the referenced Python code, porting constants and
+algorithms exactly, and only then implementing.
+
+**Verification ladder.** In order of preference, each feature gets:
+
+1. **Byte-exact unit tests** (`test/rns-compliance.test.js`, `test/lxmf-compliance.test.js`)
+   whenever a wire format is involved — ground-truth bytes captured from the real
+   Python package with a fixed identity/timestamp.
+2. **Live cross-language checks** (`test-integration/*-cross-language-check.mjs`) that
+   spawn a real Python `rns`/`lxmf` process over real TCP:
+   `PYLIBS=/path/to/pylibs npm run test:integration:<name>`. Re-run 2–3× — live checks
+   involving proof-of-work or timing have real variance.
+3. **Full regression** before every commit: `npm test`, `npx vite build`, and the
+   existing integration checks touching the changed layer
+   (`test:integration:resource`, `:channel`, `:lxmf`, `:lxmf-propagation`,
+   `:lxmf-peer-sync`, `:integration` for the sparse mesh).
+
+**Process.** After each completed step: update this file's checklist row, update the
+README Compliance section, commit with a descriptive message, push. Never open a PR
+unless the user asks. Never claim a step done without the verification it names.
+
+**Sandbox notes.** Public Nostr relays are blocked by the environment's egress proxy —
+browser-demo verification uses an in-page loopback `Interface` bridging two `Reticulum`
+instances, driven by Playwright (`/opt/pw-browsers/chromium`,
+`import ... from '/opt/node22/lib/node_modules/playwright/index.mjs'`). `pip` works
+through the proxy.
+
+## Feature parity checklist
+
+Status: **DONE** (implemented + verified) · **PARTIAL** (implemented with documented
+deviations) · **MISSING** (not implemented) · **N/A** (deliberately out of scope, with
+reason).
+
+### Core wire format & identity
+
+| Feature | Python reference | JS location | Status | Verified by |
+|---|---|---|---|---|
+| Packet framing (flags/hops/dest/context) | `RNS/Packet.py` `Packet.pack()/unpack()` | `shared/rns/protocol.js` `packet_pack/packet_unpack` | DONE | byte-exact tests |
+| Identity & destination hashing | `RNS/Identity.py` `full_hash/truncated_hash`, `RNS/Destination.py` `expand_name/hash` | `shared/rns/protocol.js` `identity_hash/destination_hash` | DONE | byte-exact tests |
+| Announces (ratchet, random_hash, Ed25519 sig) | `RNS/Destination.py` `announce()`, `RNS/Identity.py` `validate_announce()` | `shared/rns/protocol.js` `build_announce/validate_announce` | DONE | byte-exact tests |
+| Single-destination encryption (ratchet + fallback) | `RNS/Identity.py` `encrypt()/decrypt()` | `shared/rns/protocol.js` `build_data/message_decrypt` | DONE | byte-exact tests |
+| Packet delivery proofs (implicit form) | `RNS/Packet.py` `prove()`, `PacketReceipt.validate_proof()` | `shared/rns/protocol.js` `build_packet_proof/validate_packet_proof` | DONE | byte-exact tests |
+| MessagePack byte-compat with `umsgpack` | `RNS/vendor/umsgpack.py` | `shared/rns/msgpack.js` | DONE | byte-exact tests |
+| HDLC TCP framing | `RNS/Interfaces/TCPInterface.py` `HDLC` | `node/hdlc.js` | DONE | byte-exact tests |
+
+### Link
+
+| Feature | Python reference | JS location | Status | Verified by |
+|---|---|---|---|---|
+| Handshake (LINKREQUEST/PROOF/LRRTT), Token encryption, LINKCLOSE | `RNS/Link.py` | `shared/rns/index.js` `Link`, `shared/rns/protocol.js` | DONE | byte-exact + live |
+| `identify()` / `get_remote_identity()` | `RNS/Link.py` `identify()` | `shared/rns/index.js` `Link.identify/getRemoteIdentity` | DONE | live vs real `LXMRouter` |
+| Request/Response (single-packet) | `RNS/Link.py` `request()`, `RNS/Destination.py` `register_request_handler()` | `shared/rns/index.js` `Link.request`, `Destination.registerRequestHandler` | DONE | byte-exact + live |
+| RTT-adaptive keepalive/stale/timeout state machine | `RNS/Link.py:75–108` (constants), `__watchdog_job` (:710–775), `__update_keepalive` (:794) | `shared/rns/index.js` `Link` | MISSING — fixed intervals instead | **Phase 1** |
+| Hop-scaled establishment timeout | `RNS/Link.py:75,206,284` (`ESTABLISHMENT_TIMEOUT_PER_HOP=6`) | `shared/rns/index.js` `Link` | MISSING — fixed 15 s | **Phase 1** |
+| Request/Response Resource fallback (oversized payloads) | `RNS/Link.py:506` (request), `:844–850` (response) | `shared/rns/index.js` `Link.request/_handleRequest` | MISSING | **Phase 3** |
+
+### Resource / Channel / Buffer
+
+| Feature | Python reference | JS location | Status | Verified by |
+|---|---|---|---|---|
+| Resource send/receive, part hashmap, completion proof | `RNS/Resource.py` | `shared/rns/index.js` `Link.sendResource` + `shared/rns/protocol.js` | DONE | byte-exact + live both directions |
+| Multi-segment transfers (send) | `RNS/Resource.py:274–310` | `shared/rns/index.js` `_sendResourceSegment` | DONE | live (real peer reassembles) |
+| Incoming bz2 decompression | `RNS/Resource.py` assemble | `shared/rns/compression.js` `bz2_decompress` | DONE | live (real compressed data) |
+| Rate-adaptive request window | `RNS/Resource.py:58–99` (`WINDOW=4, WINDOW_MIN=2, WINDOW_MAX_SLOW=10, WINDOW_MAX_FAST=75, WINDOW_FLEXIBILITY=4, RATE_FAST=(50*1000)/8`), ramp at `:852–856` | `shared/rns/index.js` resource receive path | PARTIAL — fixed window | **Phase 2.1** |
+| Outgoing bz2 compression | `RNS/Resource.py` (`AUTO_COMPRESS_MAX_SIZE=64MiB`, :124,364) | `shared/rns/compression.js` (decode-only today) | MISSING — needs a JS bz2 *encoder* | **Phase 2.2** |
+| HMU (hashmap update) receive path, large single segments | `RNS/Resource.py:483–499` `hashmap_update_packet`, `HASHMAP_IS_EXHAUSTED=0xFF` (:140), `:953–960` | — | MISSING — can't receive a real segment > `RESOURCE_SEGMENT_MAX_SIZE` | **Phase 2.3** |
+| Channel (envelope, proofs, RTT-adaptive send window) | `RNS/Channel.py` | `shared/rns/channel.js` | DONE | byte-exact + live both directions |
+| Buffer (stream reader/writer, compressed chunks) | `RNS/Buffer.py` | `shared/rns/buffer.js` | DONE | live both directions |
+
+### Transport / routing
+
+| Feature | Python reference | JS location | Status | Verified by |
+|---|---|---|---|---|
+| Path requests/responses (wire format) | `RNS/Transport.py` `request_path/path_request_handler` (:2799–2939) | `shared/rns/index.js` `requestPath/_handlePathRequest` | DONE | byte-exact + live |
+| Multi-hop DATA/PROOF forwarding | `RNS/Transport.py` inbound/outbound | `shared/rns/index.js` `_forward` | PARTIAL — simplified single-destination analog | functional 3-peer test |
+| Multi-hop Link relaying (link table) | `RNS/Transport.py` link_table | `shared/rns/index.js` `_forwardLinkRequest/_forwardLinkTraffic` | DONE (functional) | 3-peer relay test |
+| Path-request rate limiting & grace | `RNS/Transport.py:77–96` (`PATH_REQUEST_MI=20, PATH_REQUEST_GRACE=0.4, PATH_REQUEST_RG=1.5, LOCAL_REBROADCASTS_MAX=2, DESTINATION_TIMEOUT=7d, MAX_RATE_TIMESTAMPS=16`), `:3012–3028` | — | MISSING | **Phase 4** |
+| Transport instance identity + 3-field path requests | `RNS/Transport.py:2811` (`dest+transport_identity.hash+tag`) | — (2-field form only) | MISSING | **Phase 4** |
+| Announce rate table enforcement | `RNS/Transport.py:1890–1911` | — | MISSING | **Phase 4** |
+
+### LXMF
+
+| Feature | Python reference | JS location | Status | Verified by |
+|---|---|---|---|---|
+| Message envelope + signature (OPPORTUNISTIC) | `LXMF/LXMessage.py` `pack()` | `shared/rns/protocol.js` `lxmf_build/lxmf_parse` | DONE | byte-exact + live both directions |
+| Admission stamps (message) | `LXMF/LXStamper.py` | `shared/rns/stamp.js` | DONE | byte-exact + live |
+| Peering-key stamps | `LXMF/LXStamper.py` `generate_peering_key` | `shared/rns/stamp.js` `generate/validate_peering_key` | DONE | byte-exact + live |
+| Propagation node store & client sync (`/get`) | `LXMF/LXMRouter.py` `message_get_request` | `shared/rns/propagation.js` `PropagationNode`, `syncFromRealPropagationNode` | DONE | live (upload + download vs real node) |
+| Node-to-node peer sync (`/offer`) | `LXMF/LXMPeer.py`, `LXMRouter.offer_request` | `shared/rns/propagation.js` `syncToPeer/_onOfferRequest` | DONE | live (real node accepts + stores) |
+| DIRECT delivery (over a Link; packet or Resource) | `LXMF/LXMessage.py:30–34` (methods), `:390–460` (representation), `:534/:654` (send) | — | MISSING | **Phase 5.1** |
+| Delivery announce app_data (`[display_name, stamp_cost, [SF_COMPRESSION]]`) | `LXMF/LXMRouter.py:985–1000` `get_announce_app_data`, `LXMF/LXMF.py:174` `stamp_cost_from_app_data` | — | MISSING | **Phase 5.2** |
+| Compression negotiation (`SF_COMPRESSION` → `auto_compress`) | `LXMF/LXMessage.py:510–517` `determine_compression_support` | — | MISSING (needs Phase 2.2) | **Phase 5.2** |
+| Propagation-node announce app_data (7-element list) | `LXMF/LXMRouter.py:300–318` `get_propagation_node_app_data`, `LXMF/LXMF.py:224` `pn_announce_data_is_valid` | — (stamp cost must be known out of band) | MISSING | **Phase 5.3** |
+| Interop with end-user clients (NomadNet, Sideband) | n/a | — | UNTESTED | **Phase 6** |
+| PAPER delivery method (QR-encoded messages) | `LXMF/LXMessage.py:33,446–456` | — | N/A — no meaningful use over WebRTC/TCP; revisit on request | — |
+
+### Persistence & environment
+
+| Feature | Python reference | JS location | Status | Verified by |
+|---|---|---|---|---|
+| Browser demo identity persistence | n/a (environment adaptation) | `browser/main.js` `loadOrCreateIdentity` (sessionStorage) | DONE | Playwright (reload keeps RID, new tab differs) |
+| Known-destinations / identity-cache persistence | `RNS/Identity.py:101–260` `remember/recall/save_known_destinations` | — (in-memory `Reticulum.identities`) | MISSING | **Phase 7** |
+| Ratchet rotation & persistence | `RNS/Destination.py:210–243` `rotate_ratchets` | — (single static ratchet) | MISSING | **Phase 7** |
+| Propagation store persistence | `LXMF/LXMRouter.py` storagepath handling | — (in-memory `PropagationNode.messages`) | MISSING | **Phase 7** |
+| IFAC (interface access codes) | `RNS/Interfaces/Interface.py` | — | N/A — private-network access control for shared physical media; revisit on request | — |
+| Radio/serial interfaces (RNode, LoRa, I2P, …) | `RNS/Interfaces/*` | `shared/webrtc-rns-interface.js`, `node/tcp-gateway.js` | N/A — this project's transports are WebRTC + TCP by design | — |
+
+## Execution phases
+
+Work strictly in order; each phase ends with the full regression suite green, this
+checklist updated, README updated, and a commit.
+
+### Phase 0 — housekeeping ✅
+
+Commit the verified sessionStorage identity persistence (`browser/main.js`,
+`browser/index.html`). Done: commit `b3f95fe`.
+
+### Phase 1 — Link timing parity
+
+Goal: replace the fixed 15 s establishment / 30 s keepalive timers with real RNS's
+state machine.
+
+1. Read `RNS/Link.py` in full — especially constants (:75–108), `__watchdog_job`
+   (:710–775), `__update_keepalive` (:794–795), the `last_inbound/last_proof/last_data`
+   bookkeeping in `__update_timestamps`/inbound handling (:922–930), and hop scaling
+   (:206, :284).
+2. In `shared/rns/index.js` `Link`: add `STALE = 3` (RNS values 0/1/2/4 already match);
+   port constants `KEEPALIVE_MAX=360, KEEPALIVE_MIN=5, KEEPALIVE_MAX_RTT=1.75,
+   STALE_FACTOR=2, STALE_GRACE=5, KEEPALIVE_TIMEOUT_FACTOR=4, TRAFFIC_TIMEOUT_FACTOR=6,
+   WATCHDOG_MAX_SLEEP=5, ESTABLISHMENT_TIMEOUT_PER_HOP=6` (seconds — JS timers take ms).
+3. Replace `_startKeepalive`/`_armEstablishmentTimeout` with a single rescheduling
+   watchdog (chained `setTimeout`, not `setInterval`): PENDING/HANDSHAKE → establishment
+   timeout (`PER_HOP × max(1, hops) + keepalive`, using the path table's hop count);
+   ACTIVE → initiator sends keepalive when idle ≥ `keepalive`, transition to STALE when
+   idle ≥ `stale_time`, then after `rtt × KEEPALIVE_TIMEOUT_FACTOR + STALE_GRACE`
+   teardown with reason TIMEOUT; any inbound while STALE → back to ACTIVE.
+4. On RTT measurement (both sides): `keepalive = clamp(rtt × KEEPALIVE_MAX /
+   KEEPALIVE_MAX_RTT, KEEPALIVE_MIN, KEEPALIVE_MAX)`, `stale_time = keepalive ×
+   STALE_FACTOR`. Track `lastInbound` on every packet for this link, `lastProof`
+   on proofs; keepalive responses (0xFE) count as inbound but not data.
+5. Tests: unit — keepalive formula vectors (e.g. rtt=0.01 → keepalive≈5 (MIN),
+   rtt=1.75 → 360 (MAX)); STALE→ACTIVE recovery; teardown fires with reason TIMEOUT.
+   Live — re-run `test:integration:channel` and `test:integration:resource`; add an
+   idle-hold check (JS link to real `rns` stays ACTIVE through ≥ 2 keepalive cycles at a
+   short RTT-scaled interval; keep wall time bounded).
+
+Done when: fixed-interval constants are gone, all tests green, checklist + README rows
+updated.
+
+### Phase 2 — Resource parity
+
+**2.1 Rate-adaptive window.** Read `RNS/Resource.py` `request_next`/`receive_part`
+(:820–970). Port: start `window=WINDOW=4`, `window_max=WINDOW_MAX_SLOW=10`; grow window
+by 1 per successful round while `window < window_max`; when
+`window == window_max - WINDOW_FLEXIBILITY`, track fast-rate rounds — if measured rate
+`> RATE_FAST` for `FAST_RATE_THRESHOLD` consecutive rounds, raise `window_max` to
+`WINDOW_MAX_FAST=75`; shrink on retries. Port part-timeout factors
+(`PART_TIMEOUT_FACTOR=4`, `_AFTER_RTT=2`, `MAX_RETRIES=16`, `MAX_ADV_RETRIES=4`) and
+retry logic. Live: extend `resource-cross-language-check.mjs` with a transfer big enough
+to observe ramping (log window growth), both directions.
+
+**2.2 Outgoing bz2 compression.** seek-bzip decodes only. Evaluate `compressjs` (pure-JS
+bzip2 encoder): `bzip2.compressFile(data)` output must round-trip through Python
+`bz2.decompress` — write a scratch cross-check first. If unusable, fall back to a WASM
+bz2 encoder; if none works, document and stop this sub-step. Wire into
+`resource_prepare()` with RNS's rule: compress when `len(compressed) < len(raw)` and
+`size ≤ AUTO_COMPRESS_MAX_SIZE`; set the advertisement's compressed flag (`f` bitfield —
+already parsed on receive). Buffer/`StreamDataMessage` gets the same treatment
+(compressed bit in the header — decode already implemented in `channel.js`/`buffer.js`).
+Live: real `RNS.Resource`/`RNS.Buffer` receives highly-compressible data from JS and the
+Python process asserts equality after its own transparent decompression.
+
+**2.3 HMU receive path + larger segments.** Read `Resource.py` hashmap flow: the
+advertisement carries only the first hashmap slice; the receiver requests parts and,
+when its hashmap is exhausted (`HASHMAP_IS_EXHAUSTED=0xFF` marker in the part request,
+:953–960), the sender answers with `CONTEXT_RESOURCE_HMU` packets
+(`hashmap_update_packet`, :483–499, msgpack `[segment, hashmap_bytes]`). Implement both
+directions; then raise send-side segmentation from `RESOURCE_SEGMENT_MAX_SIZE` (~58 KB)
+toward `MAX_EFFICIENT_SIZE = 1 MiB − 1`. Live: Python sends a single ≥ 200 KB segment
+(forces HMU on our receiver); JS sends ≥ 200 KB in one segment to a real receiver.
+
+### Phase 3 — Request/Response Resource fallback
+
+Read `RNS/Link.py:490–530` (request path) and `:830–860` (response path). When a packed
+request exceeds the link MDU, it is sent as a Resource whose `request_id` field ties it
+to the request (`RNS.Resource(..., request_id=..., is_response=False)`); oversized
+responses come back as a Resource with `is_response=True` (metadata + `auto_compress`
+honored). Implement in `Link.request()`/`_handleRequest()`/resource-arrival dispatch:
+a completed incoming Resource with a `request_id` resolves the pending request (or
+invokes the handler) instead of surfacing as a plain resource. The advertisement's
+`q`/`u` flags mark request/response resources — parse + emit. Live: query a real
+`LXMRouter` `/get` with enough stored messages that the response exceeds one packet;
+also exercise JS-side handler returning an oversized response to a real requester.
+
+### Phase 4 — Transport parity
+
+Read `RNS/Transport.py` jobs loop (:540–800) and announce handling (:1770–1915), path
+request handling (:2894–3030). Implement in `shared/rns/index.js` `Reticulum`:
+
+1. Path-request throttling: per-destination minimum interval `PATH_REQUEST_MI=20 s`;
+   response grace `PATH_REQUEST_GRACE=0.4 s` (+`PATH_REQUEST_RG` on roaming-class
+   interfaces — map WebRTC to non-roaming defaults); local announce rebroadcast cap
+   `LOCAL_REBROADCASTS_MAX=2`; path-table entry expiry `DESTINATION_TIMEOUT` (7 d) with
+   a periodic cleanup job.
+2. Announce rate table: per-destination timestamps (cap `MAX_RATE_TIMESTAMPS=16`),
+   violations counted against a per-interface `announce_rate_target` (default off,
+   matching RNS interface defaults — implement the mechanism, keep defaults null).
+3. Transport instance identity: a persistent per-`Reticulum` identity whose hash goes
+   into the 3-field path request form (`dest + transport_identity.hash + tag`,
+   :2811) when transport is enabled; parse both forms on receive (already tolerant —
+   verify against `path_request_handler`, :2894).
+
+Live: sparse-mesh check re-run; add a check that a real `rns` transport node accepts and
+answers our 3-field path request, and that repeated `requestPath` calls inside 20 s are
+suppressed.
+
+### Phase 5 — LXMF outbound parity
+
+**5.1 DIRECT delivery.** Read `LXMF/LXMessage.py:380–540` and `LXMRouter`'s outbound
+processing. Implement (new `shared/rns/lxmessage.js` or extend `protocol.js`): method
+constants (OPPORTUNISTIC=0x01, DIRECT=0x02, PROPAGATED=0x03); DIRECT packs *without* the
+destination-hash prefix (the link implies it — note `DESTINATION_LENGTH` handling in
+`packed_size` math, :79–90); fits-in-one-packet → plain link packet (:534); otherwise a
+Resource over the link (:654) with `auto_compress`. Receive side: a link-data packet or
+completed Resource on an `lxmf.delivery` destination's link parses as an LXMF message
+(prepend the destination hash back before `lxmf_parse`). Live: extend
+`lxmf-cross-language-check.mjs` — real `lxmf` client sends DIRECT to JS over a link and
+vice versa, both packet-sized and Resource-sized (≥ LINK_PACKET_MAX_CONTENT) messages.
+
+**5.2 Delivery announce app_data + compression negotiation.** Implement
+`[display_name|null, stamp_cost|null, [SF_COMPRESSION]]` (msgpack) as the demo/LXMF
+destinations' announce app_data; parse inbound ones (`stamp_cost_from_app_data`
+semantics: only list-typed app_data, index 1). Honor a peer's advertised
+`SF_COMPRESSION` when choosing `auto_compress` for DIRECT Resources
+(`determine_compression_support`). Depends on 2.2. Byte-exact: capture real
+`get_announce_app_data` output for a fixed name/cost and match.
+
+**5.3 Propagation-node announce app_data.** Implement
+`[False, timebase, node_state, per_transfer_limit_kb, per_sync_limit, [stamp_cost,
+flexibility, peering_cost], metadata]` on `PropagationNode.announce()`; validate inbound
+with `pn_announce_data_is_valid` rules (LXMF.py:224). Senders (`propagateLXMF`,
+`syncToPeer`) read the required stamp/peering cost from the announce instead of taking
+it as an argument (keep the argument as an override). Live: JS uploads to a real node
+using *only* its announce to learn the stamp cost; JS node's announce parses cleanly
+with real `pn_announce_data_is_valid` and a real router lists it as a candidate node.
+
+### Phase 6 — end-user client interop
+
+1. `pip install --target=$PYLIBS nomadnet`; run headless (`nomadnet --daemon
+   --config <tmp>`) attached to the TCP gateway; exchange LXMF messages with the JS
+   stack both directions — direct and via a propagation node. NomadNet is textual/UI-driven;
+   drive it via its config + filesystem inbox, or fall back to scripting `lxmf`
+   directly with NomadNet's exact announce/app_data conventions if the TUI can't be
+   automated — document which was possible.
+2. Attempt Sideband (`pip install sbapp`, kivy GUI): expected infeasible headless; if
+   so, record that honestly (do not claim interop).
+3. Update README's "hasn't been tested" language to the actual, verified state.
+
+### Phase 7 — persistence parity
+
+1. Storage adapter interface (Node: filesystem under a configdir like RNS's
+   `~/.reticulum`; browser: localStorage/IndexedDB — identity already session-cached).
+2. Persist + reload: identity cache/known destinations (`Identity.remember/recall`,
+   `save_known_destinations` msgpack format), path table, `PropagationNode.messages`
+   (mirror `LXMRouter`'s `storagepath` layout: one file per transient_id, stamp
+   attached).
+3. Ratchet rotation per `Destination.rotate_ratchets` (interval + retained count),
+   persisted.
+   Marked *adaptation* in the checklist — formats need only round-trip with ourselves,
+   but follow RNS's on-disk formats where practical.
+
+### Phase 8 — docs finalization
+
+README Compliance section rewritten against the finished checklist; demo page copy
+re-checked against actual behavior; final sweep of this file — every row DONE/N/A with
+its "verified by" filled in; remove stale caveats elsewhere (module comments citing
+"fixed intervals", "decode-only", etc.).
+
+## Status log
+
+| Date | Phase | Result |
+|---|---|---|
+| 2026-07-05 | Phase 0 | Identity persistence committed (`b3f95fe`); this document created. |

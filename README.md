@@ -157,6 +157,8 @@ One-time setup for a fork or new repo: in **Settings → Pages**, set **Source**
 
 This project is a from-scratch reimplementation, checked against the real [`rns`](https://pypi.org/project/rns/) package (v1.3.7) rather than assumed compatible. It is **not fully compliant with Reticulum v1.0+ or with LXMF**, and still cannot join the official Reticulum/LXMF network — but part of the wire format now is verified, not just "protocol-compatible in spirit."
 
+A complete per-feature parity checklist — every feature with references to both the Python original and this port, plus the stepped execution plan for closing every remaining gap — lives in [compliance.md](./compliance.md).
+
 **Verified byte-for-byte against the reference implementation** (see `test/rns-compliance.test.js`, which encodes exact expected bytes captured from a real `rns` install for a fixed test identity):
 
 - Identity hash (`SHA-256(public_key)[:16]`) and destination hash (`SHA-256(name_hash + identity_hash)[:16]`). An earlier version of this hashed the raw public key directly instead of the identity hash, producing destination hashes that were never compatible with real Reticulum — this is now fixed.
