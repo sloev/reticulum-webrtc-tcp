@@ -83,7 +83,7 @@ reason).
 | Resource send/receive, part hashmap, completion proof | `RNS/Resource.py` | `shared/rns/index.js` `Link.sendResource` + `shared/rns/protocol.js` | DONE | byte-exact + live both directions |
 | Multi-segment transfers (send) | `RNS/Resource.py:274–310` | `shared/rns/index.js` `_sendResourceSegment` | DONE | live (real peer reassembles) |
 | Incoming bz2 decompression | `RNS/Resource.py` assemble | `shared/rns/compression.js` `bz2_decompress` | DONE | live (real compressed data) |
-| Rate-adaptive request window | `RNS/Resource.py:58–99` (`WINDOW=4, WINDOW_MIN=2, WINDOW_MAX_SLOW=10, WINDOW_MAX_FAST=75, WINDOW_FLEXIBILITY=4, RATE_FAST=(50*1000)/8`), ramp at `:852–856` | `shared/rns/index.js` resource receive path | PARTIAL — fixed window | **Phase 2.1** |
+| Rate-adaptive request window | `RNS/Resource.py:58–99` (`WINDOW=4, WINDOW_MIN=2, WINDOW_MAX_SLOW=10, WINDOW_MAX_FAST=75, WINDOW_FLEXIBILITY=4, RATE_FAST=(50*1000)/8, RATE_VERY_SLOW=(2*1000)/8`), ramp at `:900–924` | `shared/rns/index.js` `Link._growResourceWindow/_requestNextResourceParts` | PARTIAL — growth + fast/very-slow-rate window_max promotion/demotion implemented; retry-driven shrinking not (no per-part retry/timeout mechanism exists) | unit test (window grows over multiple rounds, monotonic) + live (`test:integration:resource` re-verified, incl. a real `RNS.Resource` sender's ~180KB multi-segment transfer) |
 | Outgoing bz2 compression | `RNS/Resource.py` (`AUTO_COMPRESS_MAX_SIZE=64MiB`, :124,364) | `shared/rns/compression.js` (decode-only today) | MISSING — needs a JS bz2 *encoder* | **Phase 2.2** |
 | HMU (hashmap update) receive path, large single segments | `RNS/Resource.py:483–499` `hashmap_update_packet`, `HASHMAP_IS_EXHAUSTED=0xFF` (:140), `:953–960` | — | MISSING — can't receive a real segment > `RESOURCE_SEGMENT_MAX_SIZE` | **Phase 2.3** |
 | Channel (envelope, proofs, RTT-adaptive send window) | `RNS/Channel.py` | `shared/rns/channel.js` | DONE | byte-exact + live both directions |
@@ -197,15 +197,33 @@ updated.
 
 ### Phase 2 — Resource parity
 
-**2.1 Rate-adaptive window.** Read `RNS/Resource.py` `request_next`/`receive_part`
-(:820–970). Port: start `window=WINDOW=4`, `window_max=WINDOW_MAX_SLOW=10`; grow window
-by 1 per successful round while `window < window_max`; when
-`window == window_max - WINDOW_FLEXIBILITY`, track fast-rate rounds — if measured rate
-`> RATE_FAST` for `FAST_RATE_THRESHOLD` consecutive rounds, raise `window_max` to
-`WINDOW_MAX_FAST=75`; shrink on retries. Port part-timeout factors
-(`PART_TIMEOUT_FACTOR=4`, `_AFTER_RTT=2`, `MAX_RETRIES=16`, `MAX_ADV_RETRIES=4`) and
-retry logic. Live: extend `resource-cross-language-check.mjs` with a transfer big enough
-to observe ramping (log window growth), both directions.
+**2.1 Rate-adaptive window. ✅ Done (growth half; retry-shrink still open).**
+Implemented in `shared/rns/index.js`'s `Link._growResourceWindow()`/
+`_requestNextResourceParts()`/`_onResourcePart()`: each incoming Resource tracks its own
+`window` (starts at `RESOURCE_WINDOW=4`), `windowMax` (starts at
+`RESOURCE_WINDOW_MAX_SLOW=10`), `windowMin` (`RESOURCE_WINDOW_MIN=2`), and per-round byte/
+time counters. On each fully-satisfied request round: `window` grows by 1 while `window <
+windowMax` (with `windowMin` creeping up once the gap exceeds `RESOURCE_WINDOW_FLEXIBILITY`,
+matching `Resource.py:900-903`); the round's throughput (`bytes received this round / round
+duration`) is compared against `RESOURCE_RATE_FAST`/`RESOURCE_RATE_VERY_SLOW` to promote
+`windowMax` to `RESOURCE_WINDOW_MAX_FAST=75` after `RESOURCE_FAST_RATE_THRESHOLD` consecutive
+fast rounds, or demote it to `RESOURCE_WINDOW_MAX_VERY_SLOW=4` after
+`RESOURCE_VERY_SLOW_RATE_THRESHOLD` consecutive very-slow ones (`Resource.py:914-924`).
+Constants live in `shared/rns/protocol.js`.
+
+**Not implemented, and intentionally out of scope for this step**: retry-driven window
+*shrinking* (`Resource.py:612-621`) and the part-timeout/retry mechanism it depends on
+(`PART_TIMEOUT_FACTOR=4`, `_AFTER_RTT=2`, `MAX_RETRIES=16`, `MAX_ADV_RETRIES=4`) — this
+project's Resource receiver has no per-part timeout/retry at all yet (it relies on the
+outer `sendResource()`-level timeout only), so there's nothing for a shrink to attach to.
+Adding that is a distinct, separable piece of work from window growth; revisit as its own
+step if real-world packet loss on WebRTC/TCP ever makes it worth doing (it doesn't affect
+interop — a real peer doesn't care how the receiver paces its own requests).
+
+Verified: unit test (`test/rns-compliance.test.js`) sends a 30-part payload and asserts the
+observed window sequence is monotonically non-decreasing and exceeds the initial window of
+4. Live: `test:integration:resource` re-verified in both directions, including a real
+`RNS.Resource` sender's ~180KB multi-segment transfer to our (window-adaptive) receiver.
 
 **2.2 Outgoing bz2 compression.** seek-bzip decodes only. Evaluate `compressjs` (pure-JS
 bzip2 encoder): `bzip2.compressFile(data)` output must round-trip through Python
@@ -330,3 +348,4 @@ its "verified by" filled in; remove stale caveats elsewhere (module comments cit
 |---|---|---|
 | 2026-07-05 | Phase 0 | Identity persistence committed (`b3f95fe`); this document created. |
 | 2026-07-05 | Phase 1 | Link's RTT-adaptive keepalive/stale/timeout state machine implemented, plus a real bug fix (made `stamp.generate_stamp()`/`generate_peering_key()` non-blocking — see Phase 1 writeup). 51/51 unit tests pass; live `resource`/`channel`/`lxmf-propagation`/`lxmf-peer-sync` checks re-verified. |
+| 2026-07-05 | Phase 2.1 | Resource's rate-adaptive request window (growth + fast/very-slow-rate `window_max` promotion/demotion) implemented; retry-driven shrinking scoped out (no per-part retry mechanism exists). 52/52 unit tests pass; live `test:integration:resource` re-verified in both directions. |

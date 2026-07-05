@@ -658,9 +658,23 @@ export const RESOURCE_MAX_PARTS = 128;
 // within RESOURCE_MAX_PARTS parts after the random-hash prefix, PKCS7
 // padding, and the link Token's IV+HMAC overhead — see resource_prepare().
 export const RESOURCE_SEGMENT_MAX_SIZE = RESOURCE_MAX_PARTS * RESOURCE_SDU - 128;
-// Matches RNS.Resource.WINDOW, the window size RNS.Resource itself starts
-// at before adapting — used here as a fixed size, with no ramp-up.
+// Matches RNS.Resource's rate-adaptive request window (RNS/Resource.py):
+// starts small and grows by 1 each round the previous window was fully
+// satisfied, up to window_max — which itself starts modest and is promoted
+// to RESOURCE_WINDOW_MAX_FAST once the measured transfer rate has been
+// "fast" for RESOURCE_FAST_RATE_THRESHOLD consecutive rounds (or demoted to
+// RESOURCE_WINDOW_MAX_VERY_SLOW if it's been "very slow" instead). See
+// Link._requestNextResourceParts()/_onResourcePart() in index.js.
 export const RESOURCE_WINDOW = 4;
+export const RESOURCE_WINDOW_MIN = 2;
+export const RESOURCE_WINDOW_MAX_SLOW = 10;
+export const RESOURCE_WINDOW_MAX_VERY_SLOW = 4;
+export const RESOURCE_WINDOW_MAX_FAST = 75;
+export const RESOURCE_WINDOW_FLEXIBILITY = 4;
+export const RESOURCE_RATE_FAST = (50 * 1000) / 8; // bytes/sec (50kbit/s)
+export const RESOURCE_RATE_VERY_SLOW = (2 * 1000) / 8; // bytes/sec (2kbit/s)
+export const RESOURCE_FAST_RATE_THRESHOLD = RESOURCE_WINDOW_MAX_SLOW - RESOURCE_WINDOW - 2;
+export const RESOURCE_VERY_SLOW_RATE_THRESHOLD = 2;
 
 export function resource_map_hash(part_data, random_hash) {
     return crypto.sha256(crypto.concat(part_data, random_hash)).slice(0, RESOURCE_MAPHASH_LEN);

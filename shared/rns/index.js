@@ -701,12 +701,15 @@ export class Link extends EventEmitter {
     // at a time (each with its own full advertise/request/part/proof cycle,
     // linked by a shared "original hash" — see protocol.js's "RNS.Resource"
     // section) — real RNS peers handle this correctly since they only ever
-    // trust whatever segment size this sender advertises. See protocol.js
-    // for exactly what's implemented (fixed-size request window, and a
-    // segment size much smaller than real RNS's 1MiB-1 — so *sending* an
-    // arbitrarily large payload works, but *receiving* one bigger than a
-    // single segment from a real peer still doesn't, since that needs HMU
-    // packets this project doesn't implement) versus real RNS's Resource.
+    // trust whatever segment size this sender advertises. The receiver's
+    // request window is rate-adaptive, matching RNS.Resource's own growth/
+    // fast-rate-promotion logic (see _growResourceWindow() below) — not yet
+    // implemented: retry-driven window *shrinking* (no per-part retry/
+    // timeout mechanism exists yet), and a segment size much smaller than
+    // real RNS's 1MiB-1 — so *sending* an arbitrarily large payload works,
+    // but *receiving* one bigger than a single segment from a real peer
+    // still doesn't, since that needs HMU packets this project doesn't
+    // implement. See compliance.md for the full parity checklist.
     sendResource(data, { timeout = 30000 } = {}) {
         if (this.status !== Link.ACTIVE) return Promise.reject(new Error('Link is not active'));
 
@@ -785,6 +788,16 @@ export class Link extends EventEmitter {
             segmentIndex: adv.segmentIndex, totalSegments: adv.totalSegments, originalHash: adv.originalHash,
             hashmapEntries, parts: new Array(adv.totalParts).fill(null),
             receivedCount: 0, consecutiveCompletedHeight: -1, outstandingParts: 0,
+            // Rate-adaptive request window — matches RNS.Resource's own
+            // starting values (see protocol.js's RESOURCE_WINDOW* constants).
+            window: protocol.RESOURCE_WINDOW,
+            windowMax: protocol.RESOURCE_WINDOW_MAX_SLOW,
+            windowMin: protocol.RESOURCE_WINDOW_MIN,
+            fastRateRounds: 0,
+            verySlowRateRounds: 0,
+            reqSentAt: 0,
+            rttRxdBytes: 0,
+            rttRxdBytesAtPartReq: 0,
         });
 
         this._requestNextResourceParts(resourceHashHex);
@@ -792,22 +805,25 @@ export class Link extends EventEmitter {
 
     // Requests the next window's worth of not-yet-received parts, starting
     // right after the longest known consecutive run of received parts —
-    // matches RNS.Resource.request_next(), but with a fixed window instead
-    // of one that adapts to measured throughput (see protocol.js's
-    // "RNS.Resource" section).
+    // matches RNS.Resource.request_next(), including its rate-adaptive
+    // window size (see _onResourcePart() below for how the window grows/its
+    // ceiling is promoted).
     _requestNextResourceParts(resourceHashHex) {
         const incoming = this._incomingResources.get(resourceHashHex);
         if (!incoming) return;
 
         const requested = [];
         incoming.outstandingParts = 0;
-        for (let i = incoming.consecutiveCompletedHeight + 1; i < incoming.hashmapEntries.length && requested.length < protocol.RESOURCE_WINDOW; i++) {
+        for (let i = incoming.consecutiveCompletedHeight + 1; i < incoming.hashmapEntries.length && requested.length < incoming.window; i++) {
             if (incoming.parts[i] === null) {
                 requested.push(incoming.hashmapEntries[i]);
                 incoming.outstandingParts++;
             }
         }
         if (requested.length === 0) return;
+
+        incoming.reqSentAt = Date.now();
+        incoming.rttRxdBytesAtPartReq = incoming.rttRxdBytes;
 
         const requestPayload = protocol.build_resource_request(incoming.resourceHash, crypto.concat(...requested));
         const requestPacket = protocol.build_link_packet(this.linkId, this.derivedKey, requestPayload, protocol.CONTEXT_RESOURCE_REQ);
@@ -840,7 +856,7 @@ export class Link extends EventEmitter {
     _onResourcePart(partData) {
         for (const [resourceHashHex, incoming] of this._incomingResources.entries()) {
             const windowStart = incoming.consecutiveCompletedHeight >= 0 ? incoming.consecutiveCompletedHeight : 0;
-            const windowEnd = Math.min(windowStart + protocol.RESOURCE_WINDOW, incoming.hashmapEntries.length);
+            const windowEnd = Math.min(windowStart + incoming.window, incoming.hashmapEntries.length);
             const mapHash = crypto.bytesToHex(protocol.resource_map_hash(partData, incoming.randomHash));
 
             let matchedIndex = -1;
@@ -856,6 +872,7 @@ export class Link extends EventEmitter {
             incoming.parts[matchedIndex] = partData;
             incoming.receivedCount++;
             incoming.outstandingParts--;
+            incoming.rttRxdBytes += partData.length;
 
             let cp = incoming.consecutiveCompletedHeight + 1;
             while (cp < incoming.parts.length && incoming.parts[cp] !== null) {
@@ -866,9 +883,48 @@ export class Link extends EventEmitter {
             if (incoming.receivedCount === incoming.hashmapEntries.length) {
                 this._assembleResource(resourceHashHex, incoming);
             } else if (incoming.outstandingParts <= 0) {
+                this._growResourceWindow(incoming);
                 this._requestNextResourceParts(resourceHashHex);
             }
             return;
+        }
+    }
+
+    // Grows the request window (and, if the measured transfer rate over
+    // this round has been consistently fast or very slow, promotes/demotes
+    // its ceiling) — matches RNS.Resource.receive_part()'s window-adaptation
+    // logic (RNS/Resource.py:900-924). Retry-driven window *shrinking* isn't
+    // implemented — this project's Resource has no per-part retry/timeout
+    // mechanism yet (see compliance.md).
+    _growResourceWindow(incoming) {
+        if (incoming.window < incoming.windowMax) {
+            incoming.window += 1;
+            if (incoming.window - incoming.windowMin > protocol.RESOURCE_WINDOW_FLEXIBILITY - 1) {
+                incoming.windowMin += 1;
+            }
+        }
+
+        if (incoming.reqSentAt) {
+            const rtt = (Date.now() - incoming.reqSentAt) / 1000;
+            const transferred = incoming.rttRxdBytes - incoming.rttRxdBytesAtPartReq;
+            if (rtt > 0) {
+                const rate = transferred / rtt;
+
+                if (rate > protocol.RESOURCE_RATE_FAST && incoming.fastRateRounds < protocol.RESOURCE_FAST_RATE_THRESHOLD) {
+                    incoming.fastRateRounds += 1;
+                    if (incoming.fastRateRounds === protocol.RESOURCE_FAST_RATE_THRESHOLD) {
+                        incoming.windowMax = protocol.RESOURCE_WINDOW_MAX_FAST;
+                    }
+                }
+
+                if (incoming.fastRateRounds === 0 && rate < protocol.RESOURCE_RATE_VERY_SLOW
+                    && incoming.verySlowRateRounds < protocol.RESOURCE_VERY_SLOW_RATE_THRESHOLD) {
+                    incoming.verySlowRateRounds += 1;
+                    if (incoming.verySlowRateRounds === protocol.RESOURCE_VERY_SLOW_RATE_THRESHOLD) {
+                        incoming.windowMax = protocol.RESOURCE_WINDOW_MAX_VERY_SLOW;
+                    }
+                }
+            }
         }
     }
 

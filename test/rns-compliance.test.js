@@ -525,6 +525,61 @@ test('Link.sendResource() splits a payload bigger than one segment into multiple
   initiatorLink.close();
 });
 
+test('Link.sendResource()\'s receive window grows round over round, matching RNS.Resource\'s rate-adaptive window instead of a fixed size', async () => {
+  const rnsA = new Reticulum();
+  const rnsB = new Reticulum();
+
+  class Bridge extends Interface {
+    connect() {}
+    sendData(data) { setTimeout(() => this.other.rns.onPacketReceived(data, this.other), 0); }
+  }
+  const ifaceA = new Bridge('A');
+  const ifaceB = new Bridge('B');
+  ifaceA.other = ifaceB;
+  ifaceB.other = ifaceA;
+  rnsA.addInterface(ifaceA);
+  rnsB.addInterface(ifaceB);
+
+  const identityB = Identity.create();
+  const destB = new Destination(rnsB, identityB, Destination.IN, Destination.SINGLE, 'test', 'window');
+
+  const responderLinkPromise = new Promise((resolve) => destB.on('link', resolve));
+  const outDest = new Destination(rnsA, identityB, Destination.OUT, Destination.SINGLE, 'test', 'window');
+  outDest.hash = destB.hash;
+  const initiatorLink = new Link(rnsA, outDest);
+
+  await new Promise((resolve) => initiatorLink.once('established', resolve));
+  const responderLink = await responderLinkPromise;
+  await new Promise((resolve) => (responderLink.status === Link.ACTIVE ? resolve() : responderLink.once('established', resolve)));
+
+  // Enough parts (well over the initial window of 4) to observe several
+  // rounds of growth toward window_max.
+  const payload = crypto.randomBytes(protocol.RESOURCE_SDU * 30);
+
+  const observedWindows = [];
+  const originalGrow = responderLink._growResourceWindow.bind(responderLink);
+  responderLink._growResourceWindow = (incoming) => {
+    originalGrow(incoming);
+    observedWindows.push(incoming.window);
+  };
+
+  const responderGot = new Promise((resolve) => responderLink.once('resource', resolve));
+  const sendPromise = initiatorLink.sendResource(payload);
+  const received = await responderGot;
+  assert.equal(crypto.bytesToHex(received), crypto.bytesToHex(payload));
+  await sendPromise;
+
+  assert.ok(observedWindows.length > 1, 'transfer took multiple request rounds');
+  assert.ok(Math.max(...observedWindows) > protocol.RESOURCE_WINDOW, `window grew beyond the initial ${protocol.RESOURCE_WINDOW} (observed: ${observedWindows})`);
+  // Monotonically non-decreasing — this test's fast/local rate never
+  // demotes window_max, so window should never shrink.
+  for (let i = 1; i < observedWindows.length; i++) {
+    assert.ok(observedWindows[i] >= observedWindows[i - 1], `window shrank unexpectedly: ${observedWindows}`);
+  }
+
+  initiatorLink.close();
+});
+
 test('resource_prepare() throws if a single segment alone would still need more than RESOURCE_MAX_PARTS parts', () => {
   // Link.sendResource() always chops at RESOURCE_SEGMENT_MAX_SIZE, which is
   // sized so no chunk it produces can ever hit this — so this guard is only
