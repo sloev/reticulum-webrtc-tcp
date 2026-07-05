@@ -438,6 +438,73 @@ test('Link.request()/registerRequestHandler() round-trip a request and response 
   initiatorLink.close();
 });
 
+test('build_resource_advertisement()/parse_resource_advertisement() round-trip the is_request/is_response flags and request_id ("q") field, matching RNS.ResourceAdvertisement\'s layout', () => {
+  const resourceHash = crypto.randomBytes(32);
+  const randomHash = crypto.randomBytes(4);
+  const requestId = crypto.randomBytes(16);
+
+  const reqAdv = protocol.build_resource_advertisement({
+    transferSize: 100, dataSize: 90, totalParts: 1, resourceHash, randomHash, hashmap: crypto.randomBytes(4),
+    requestId, isRequest: true,
+  });
+  const parsedReq = protocol.parse_resource_advertisement(reqAdv);
+  assert.equal(parsedReq.isRequest, true);
+  assert.equal(parsedReq.isResponse, false);
+  assert.equal(crypto.bytesToHex(parsedReq.requestId), crypto.bytesToHex(requestId));
+
+  const respAdv = protocol.build_resource_advertisement({
+    transferSize: 100, dataSize: 90, totalParts: 1, resourceHash, randomHash, hashmap: crypto.randomBytes(4),
+    requestId, isResponse: true,
+  });
+  const parsedResp = protocol.parse_resource_advertisement(respAdv);
+  assert.equal(parsedResp.isRequest, false);
+  assert.equal(parsedResp.isResponse, true);
+  assert.equal(crypto.bytesToHex(parsedResp.requestId), crypto.bytesToHex(requestId));
+
+  const plainAdv = protocol.build_resource_advertisement({
+    transferSize: 100, dataSize: 90, totalParts: 1, resourceHash, randomHash, hashmap: crypto.randomBytes(4),
+  });
+  const parsedPlain = protocol.parse_resource_advertisement(plainAdv);
+  assert.equal(parsedPlain.isRequest, false);
+  assert.equal(parsedPlain.isResponse, false);
+  assert.equal(parsedPlain.requestId, null);
+});
+
+test('Link.request() falls back to a Resource transfer for a request and/or response too large for a single packet, matching RNS.Link.request()\'s own fallback', async () => {
+  const rnsA = new Reticulum();
+  const rnsB = new Reticulum();
+  class Bridge extends Interface {
+    connect() {}
+    sendData(data) { setTimeout(() => this.other.rns.onPacketReceived(data, this.other), 0); }
+  }
+  const ifaceA = new Bridge('A');
+  const ifaceB = new Bridge('B');
+  ifaceA.other = ifaceB;
+  ifaceB.other = ifaceA;
+  rnsA.addInterface(ifaceA);
+  rnsB.addInterface(ifaceB);
+
+  const responderIdentity = Identity.create();
+  const responderDest = new Destination(rnsB, responderIdentity, Destination.IN, Destination.SINGLE, 'test', 'bigreqresp');
+  // A large reply (bigger than LINK_MDU), forcing the response side of the
+  // fallback regardless of the request's own size.
+  const bigReply = 'y'.repeat(protocol.LINK_MDU * 2);
+  responderDest.registerRequestHandler('echo-big', (data) => ({ echoedLength: data.name.length, reply: bigReply }));
+
+  const outDest = new Destination(rnsA, responderIdentity, Destination.OUT, Destination.SINGLE, 'test', 'bigreqresp');
+  outDest.hash = responderDest.hash;
+  const initiatorLink = new Link(rnsA, outDest);
+  await new Promise((resolve) => initiatorLink.once('established', resolve));
+
+  // A large request payload too, forcing the request side of the fallback.
+  const bigName = 'x'.repeat(protocol.LINK_MDU * 2);
+  const response = await initiatorLink.request('echo-big', { name: bigName }, { timeout: 5000 });
+  assert.equal(response.echoedLength, bigName.length);
+  assert.equal(response.reply, bigReply);
+
+  initiatorLink.close();
+});
+
 test('Link.sendResource() transfers a multi-part payload and resolves once the receiver proves it, with content and hash verified on both ends', async () => {
   const rnsA = new Reticulum();
   const rnsB = new Reticulum();

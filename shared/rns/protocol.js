@@ -734,27 +734,33 @@ export function resource_prepare(plaintext, link_encrypt_fn, { compressed = fals
 
 // Matches ResourceAdvertisement's msgpack field layout ({t,d,n,h,r,o,i,l,q,f,m}).
 // f (flags) sets the "encrypted" bit (always, this project always encrypts),
-// the "split" bit when totalSegments > 1, and the "compressed" bit when the
-// sender bz2-compressed this segment's data, matching
-// `0x00 | has_metadata<<5 | is_response<<4 | is_request<<3 | split<<2 |
-// compressed<<1 | encrypted` — has_metadata/is_response/is_request aren't
-// implemented on send, so those bits are always 0. i (segment_index) and l
-// (total_segments) are 1-based in real RNS — a receiver only treats a
-// resource as fully concluded once segment_index == total_segments, so a
-// single (first-and-only) segment must be numbered 1, not 0. originalHash
-// defaults to resourceHash (matching a first/only segment); a later segment
-// passes the *first* segment's resourceHash here instead, linking it back
-// to the same overall transfer.
+// the "split" bit when totalSegments > 1, the "compressed" bit when the
+// sender bz2-compressed this segment's data, and the "is_request"/
+// "is_response" bits when this Resource carries an oversized Link.request()/
+// response payload (see Link.request()/_handleRequest() in index.js) —
+// matching `0x00 | has_metadata<<5 | is_response<<4 | is_request<<3 |
+// split<<2 | compressed<<1 | encrypted`. has_metadata isn't implemented on
+// send, so that bit is always 0. i (segment_index) and l (total_segments)
+// are 1-based in real RNS — a receiver only treats a resource as fully
+// concluded once segment_index == total_segments, so a single (first-and-
+// only) segment must be numbered 1, not 0. originalHash defaults to
+// resourceHash (matching a first/only segment); a later segment passes the
+// *first* segment's resourceHash here instead, linking it back to the same
+// overall transfer.
 export function build_resource_advertisement({
     transferSize, dataSize, totalParts, resourceHash, randomHash, hashmap,
     segmentIndex = 1, totalSegments = 1, originalHash = resourceHash, compressed = false,
+    requestId = null, isRequest = false, isResponse = false,
 }) {
     const split = totalSegments > 1 ? 0x04 : 0x00;
     const compressedFlag = compressed ? 0x02 : 0x00;
+    const requestFlag = isRequest ? 0x08 : 0x00;
+    const responseFlag = isResponse ? 0x10 : 0x00;
     const dict = {
         t: transferSize, d: dataSize, n: totalParts,
         h: resourceHash, r: randomHash, o: originalHash,
-        i: segmentIndex, l: totalSegments, q: null, f: 0x01 | split | compressedFlag, m: hashmap,
+        i: segmentIndex, l: totalSegments, q: requestId,
+        f: 0x01 | split | compressedFlag | requestFlag | responseFlag, m: hashmap,
     };
     return lxmfMsgpack.pack(dict);
 }
@@ -769,9 +775,20 @@ export function parse_resource_advertisement(data) {
         encrypted: (flags & 0x01) === 0x01,
         compressed: ((flags >> 1) & 0x01) === 0x01,
         split: ((flags >> 2) & 0x01) === 0x01,
+        isRequest: ((flags >> 3) & 0x01) === 0x01,
+        isResponse: ((flags >> 4) & 0x01) === 0x01,
         hasMetadata: ((flags >> 5) & 0x01) === 0x01,
         hashmap: dict.m,
     };
+}
+
+// Matches RNS.Identity.truncated_hash(packed_request): the request ID for a
+// request (or its response) sent as a Resource rather than a single packet
+// — a plain hash of the packed [timestamp, path_hash, data] payload itself
+// (not of the outer packet, unlike the single-packet form's
+// packet_truncated_hash() — a real Resource has no single "packet" to hash).
+export function resource_request_id(packed_request) {
+    return crypto.sha256(packed_request).slice(0, 16);
 }
 
 // Matches Resource.request_next()'s request_data layout: a hashmap-exhausted

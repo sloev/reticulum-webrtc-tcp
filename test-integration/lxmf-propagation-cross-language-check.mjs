@@ -124,6 +124,19 @@ const status = await waitFor((m) => m.event === 'store_status', 10000);
 
 assertTrue(status.count >= 1, `the real LXMRouter's message store contains at least one message (count=${status.count})`);
 
+// --- Upload a few more, larger messages, so the eventual "/get" download
+// response is too big for a single packet — exercising Link.request()'s
+// Resource fallback (compliance.md Phase 3) against a real LXMRouter's own
+// "/get" response, not just a synthetic Resource transfer. ---
+const bulkContent = 'padding to make this message large enough to force a multi-message /get response over LINK_MDU. '.repeat(8);
+for (let i = 0; i < 3; i++) {
+  const bulkLink = new Link(rns, propNodeDest);
+  await new Promise((resolve) => bulkLink.once('established', resolve));
+  await propagation.propagateLXMF(bulkLink, destOut, senderSelf, `bulk ${i}`, bulkContent, {}, requiredCost);
+  bulkLink.close();
+}
+console.log('uploaded 3 additional bulk messages');
+
 // --- Download/sync: the recipient identifies to the real node over a fresh
 // Link (Link.identify()), then fetches the message back via the node's real
 // "/get" request path ---
@@ -132,14 +145,17 @@ await new Promise((resolve) => downloadLink.once('established', resolve));
 console.log('second real Link established for the download/sync half');
 
 const messages = await propagation.syncFromRealPropagationNode(downloadLink, recipientSelf);
-assertTrue(messages.length >= 1, `syncFromRealPropagationNode() got at least one message back (count=${messages.length})`);
-if (messages.length >= 1) {
-  const msg = messages[0];
-  assertTrue(msg.valid, "the downloaded message's signature validates against the sender's identity");
-  assertEqual(new TextDecoder().decode(msg.title), 'real interop', 'downloaded message title matches what was uploaded');
-  assertEqual(new TextDecoder().decode(msg.content), 'hello real LXMRouter', 'downloaded message content matches what was uploaded');
-  assertEqual(crypto.bytesToHex(msg.source_hash), crypto.bytesToHex(senderSelf.hash), "downloaded message's source_hash matches the real sender");
+assertTrue(messages.length >= 4, `syncFromRealPropagationNode() got all 4 messages back, over a "/get" response too large for one packet — Link.request()'s Resource fallback (count=${messages.length})`);
+const original = messages.find((m) => new TextDecoder().decode(m.title) === 'real interop');
+assertTrue(!!original, 'the original single-packet-sized message is among those downloaded');
+if (original) {
+  assertTrue(original.valid, "the downloaded message's signature validates against the sender's identity");
+  assertEqual(new TextDecoder().decode(original.content), 'hello real LXMRouter', 'downloaded message content matches what was uploaded');
+  assertEqual(crypto.bytesToHex(original.source_hash), crypto.bytesToHex(senderSelf.hash), "downloaded message's source_hash matches the real sender");
 }
+const bulkMessages = messages.filter((m) => new TextDecoder().decode(m.title).startsWith('bulk '));
+assertEqual(bulkMessages.length, 3, 'all 3 bulk messages are among those downloaded');
+assertTrue(bulkMessages.every((m) => new TextDecoder().decode(m.content) === bulkContent), 'every bulk message\'s content matches what was uploaded');
 
 link.close();
 downloadLink.close();

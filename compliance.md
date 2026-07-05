@@ -74,7 +74,7 @@ reason).
 | Request/Response (single-packet) | `RNS/Link.py` `request()`, `RNS/Destination.py` `register_request_handler()` | `shared/rns/index.js` `Link.request`, `Destination.registerRequestHandler` | DONE | byte-exact + live |
 | RTT-adaptive keepalive/stale/timeout state machine | `RNS/Link.py:75–108` (constants), `__watchdog_job` (:710–775), `__update_keepalive` (:794) | `shared/rns/index.js` `Link._watchdogTick/_updateKeepalive/_noteInbound` | DONE | unit tests (formula + STALE transition/recovery/teardown) + live (`test:integration:resource/:channel/:lxmf-propagation/:lxmf-peer-sync` re-verified) |
 | Hop-scaled establishment timeout | `RNS/Link.py:75,206,284` (`ESTABLISHMENT_TIMEOUT_PER_HOP=6`) | `shared/rns/index.js` `Link` constructor/`fromRequest` | DONE | live (established links across the existing integration suite) |
-| Request/Response Resource fallback (oversized payloads) | `RNS/Link.py:506` (request), `:844–850` (response) | `shared/rns/index.js` `Link.request/_handleRequest` | MISSING | **Phase 3** |
+| Request/Response Resource fallback (oversized payloads) | `RNS/Link.py:506` (request), `:844–850` (response) | `shared/rns/index.js` `Link.request/_handleRequest` | DONE | `test:integration:lxmf-propagation` (real `LXMRouter` `/get` fallback), unit |
 
 ### Resource / Channel / Buffer
 
@@ -298,18 +298,37 @@ correctly end to end. Live: `test:integration:resource` — a real `RNS.Resource
 advertisement and this project's receiver correctly requests, receives, and applies the HMU
 packet to reassemble it (re-run twice for stability).
 
-### Phase 3 — Request/Response Resource fallback
+### Phase 3 — Request/Response Resource fallback — ✅ Done
 
-Read `RNS/Link.py:490–530` (request path) and `:830–860` (response path). When a packed
-request exceeds the link MDU, it is sent as a Resource whose `request_id` field ties it
-to the request (`RNS.Resource(..., request_id=..., is_response=False)`); oversized
-responses come back as a Resource with `is_response=True` (metadata + `auto_compress`
-honored). Implement in `Link.request()`/`_handleRequest()`/resource-arrival dispatch:
-a completed incoming Resource with a `request_id` resolves the pending request (or
-invokes the handler) instead of surfacing as a plain resource. The advertisement's
-`q`/`u` flags mark request/response resources — parse + emit. Live: query a real
-`LXMRouter` `/get` with enough stored messages that the response exceeds one packet;
-also exercise JS-side handler returning an oversized response to a real requester.
+Read `RNS/Link.py:473–508` (request path) and `:842–850` (response path). A packed
+request or response that exceeds `LINK_MDU` is sent as a Resource instead of a single
+packet, tagged with a `request_id`: for a request this is `Identity.truncated_hash`
+of the packed `[timestamp, path_hash, data]` payload (`resource_request_id()` in
+`shared/rns/protocol.js` — a plain hash of the payload itself, distinct from the
+single-packet path's `packet_truncated_hash()` of the outer packet, since a Resource
+has no single "packet" to hash); for a response it's the same `request_id` the
+request carried. `build_resource_advertisement()`/`parse_resource_advertisement()`
+(`shared/rns/protocol.js`) now carry `q` (`request_id`) and the `is_request`/
+`is_response` flag bits, matching `ResourceAdvertisement`'s flags byte layout exactly.
+
+`Link.request()` (`shared/rns/index.js`) now checks payload size before choosing a
+single packet vs. `sendResource(payload, { requestId, isRequest: true })`; `_handleRequest()`
+does the same for the response. On the receive side, `_assembleResource()` checks the
+completed incoming Resource's `isRequest`/`isResponse` flags and routes it to
+`_handleRequest()`/`_handleResponse()` instead of emitting a generic `'resource'` event —
+matching how real RNS keeps these internal rather than exposing them to the application.
+
+Verified: unit tests (`test/rns-compliance.test.js`) — advertisement round-trip of the
+new flags/`request_id` field, and a full JS-to-JS request/response exchange forced
+through the Resource path in both directions (`'x'.repeat(LINK_MDU * 2)` used for both
+the request name and the handler's reply). Live: `test:integration:lxmf-propagation`
+extended to upload 4 LXMF messages (1 original + 3 padded "bulk" messages) to a real,
+unmodified `LXMF.LXMRouter` propagation node, then call `syncFromRealPropagationNode()`
+— its `/get` response now exceeds `LINK_MDU`, genuinely exercising the real reference
+implementation's own oversized-response-as-Resource path (not a synthetic one); all 4
+messages downloaded and verified byte-for-byte (re-run 3× for stability). Full
+regression also re-run clean: 59/59 unit tests, `vite build`, and the resource/channel
+live checks.
 
 ### Phase 4 — Transport parity
 
@@ -404,3 +423,4 @@ its "verified by" filled in; remove stale caveats elsewhere (module comments cit
 | 2026-07-05 | Phase 2.1 | Resource's rate-adaptive request window (growth + fast/very-slow-rate `window_max` promotion/demotion) implemented; retry-driven shrinking scoped out (no per-part retry mechanism exists). 52/52 unit tests pass; live `test:integration:resource` re-verified in both directions. |
 | 2026-07-05 | Phase 2.2 | Outgoing bz2 compression implemented for Resource and Buffer via `bzip2-wasm` (a WASM build of the real reference `libbzip2`, chosen over the GPL-licensed `compressjs`). Byte-exact vs real `bz2.compress()`; live checks confirm real `RNS.Resource`/`RNS.Buffer` explicitly recognize JS-compressed transfers; verified working in the actual production browser build via real headless Chromium (a dev-server-only WASM pre-bundling quirk was found and mitigated, doesn't affect the deployed demo). 54/54 unit tests pass. |
 | 2026-07-05 | Phase 2.3 | Resource HMU (hashmap update) receive path implemented — this project's receiver can now complete a transfer whose advertisement doesn't include the whole hashmap upfront, matching real RNS's `HASHMAP_MAX_LEN`-based truncation exactly. Send-side truncation/HMU-response scoped out (nothing currently needs it). 57/57 unit tests pass; live `test:integration:resource` confirms a genuine HMU exchange with a real ~87-part `RNS.Resource` sender (re-verified twice). Phase 2 (Resource parity) is now complete. |
+| 2026-07-05 | Phase 3 | Request/Response Resource fallback implemented for oversized payloads in both directions, matching `RNS.Link.request()`'s own fallback exactly (including its distinct `request_id` hash for the Resource form). 59/59 unit tests pass; live `test:integration:lxmf-propagation` extended to force a real, unmodified `LXMRouter`'s own `/get` response over `LINK_MDU` (4 uploaded messages) and confirms it downloads correctly via the new fallback (re-run 3× for stability). Full regression clean: unit tests, `vite build`, `resource`/`channel` live checks. |

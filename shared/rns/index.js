@@ -680,13 +680,20 @@ export class Link extends EventEmitter {
             this._handleRequest(protocol.packet_truncated_hash(rawBytes), plaintext);
         } else if (packet.context === protocol.CONTEXT_RESPONSE) {
             const { request_id, response_data } = protocol.parse_response_payload(plaintext);
-            const key = crypto.bytesToHex(request_id);
-            const pending = this.pendingRequests.get(key);
-            if (pending) {
-                clearTimeout(pending.timer);
-                this.pendingRequests.delete(key);
-                pending.resolve(response_data);
-            }
+            this._handleResponse(request_id, response_data);
+        }
+    }
+
+    // Resolves the pending request() promise matching `requestId`, however
+    // the response arrived — a single RESPONSE packet or an isResponse-
+    // flagged Resource (see _assembleResource() above).
+    _handleResponse(requestId, responseData) {
+        const key = crypto.bytesToHex(requestId);
+        const pending = this.pendingRequests.get(key);
+        if (pending) {
+            clearTimeout(pending.timer);
+            this.pendingRequests.delete(key);
+            pending.resolve(responseData);
         }
     }
 
@@ -713,7 +720,7 @@ export class Link extends EventEmitter {
     // but *receiving* one bigger than a single segment from a real peer
     // still doesn't, since that needs HMU packets this project doesn't
     // implement. See compliance.md for the full parity checklist.
-    sendResource(data, { timeout = 30000 } = {}) {
+    sendResource(data, { timeout = 30000, requestId = null, isRequest = false, isResponse = false } = {}) {
         if (this.status !== Link.ACTIVE) return Promise.reject(new Error('Link is not active'));
 
         const segments = [];
@@ -725,7 +732,7 @@ export class Link extends EventEmitter {
 
         return segments.reduce(
             (chain, chunk, i) => chain.then((originalHash) =>
-                this._sendResourceSegment(chunk, i + 1, totalSegments, originalHash, timeout)
+                this._sendResourceSegment(chunk, i + 1, totalSegments, originalHash, timeout, { requestId, isRequest, isResponse })
                     .then((resourceHash) => originalHash || resourceHash)),
             Promise.resolve(null),
         );
@@ -735,7 +742,10 @@ export class Link extends EventEmitter {
     // resourceHash once its completion proof arrives — sendResource() feeds
     // this back in as `originalHash` for the next segment, so every segment
     // after the first is linked back to the transfer's first segment.
-    async _sendResourceSegment(plaintext, segmentIndex, totalSegments, originalHash, timeout) {
+    // `requestId`/`isRequest`/`isResponse` tag this Resource as carrying an
+    // oversized Link.request()/response payload (see Link.request()/
+    // _handleRequest() below) rather than a plain application transfer.
+    async _sendResourceSegment(plaintext, segmentIndex, totalSegments, originalHash, timeout, { requestId = null, isRequest = false, isResponse = false } = {}) {
         // Matches RNS.Resource's own policy exactly: always try compressing
         // first, only actually send the compressed bytes if they came out
         // smaller (see compression.js's bz2_compress_if_beneficial()).
@@ -753,6 +763,7 @@ export class Link extends EventEmitter {
             transferSize: prepared.transferSize, dataSize: prepared.dataSize, totalParts: prepared.totalParts,
             resourceHash: prepared.resourceHash, randomHash: prepared.randomHash, hashmap: prepared.hashmap,
             segmentIndex, totalSegments, originalHash: originalHash || prepared.resourceHash, compressed: prepared.compressed,
+            requestId, isRequest, isResponse,
         });
         const advPacket = protocol.build_link_packet(this.linkId, this.derivedKey, advPayload, protocol.CONTEXT_RESOURCE_ADV);
 
@@ -799,6 +810,7 @@ export class Link extends EventEmitter {
         this._incomingResources.set(resourceHashHex, {
             randomHash: adv.randomHash, resourceHash: adv.resourceHash, compressed: adv.compressed,
             segmentIndex: adv.segmentIndex, totalSegments: adv.totalSegments, originalHash: adv.originalHash,
+            requestId: adv.requestId, isRequest: adv.isRequest, isResponse: adv.isResponse,
             hashmapEntries, parts: new Array(adv.totalParts).fill(null),
             receivedCount: 0, consecutiveCompletedHeight: -1, outstandingParts: 0, waitingForHmu: false,
             // Rate-adaptive request window — matches RNS.Resource's own
@@ -1014,7 +1026,24 @@ export class Link extends EventEmitter {
 
         if (incoming.segmentIndex >= incoming.totalSegments) {
             this._resourceSegments.delete(originalHashHex);
-            this.emit('resource', segmented.chunks.length === 1 ? segmented.chunks[0] : crypto.concat(...segmented.chunks));
+            const fullData = segmented.chunks.length === 1 ? segmented.chunks[0] : crypto.concat(...segmented.chunks);
+
+            // An oversized Link.request()/response arriving as a Resource
+            // (RNS.Link.request()'s fallback — see request()/_handleRequest()
+            // below) is routed there instead of surfacing as a generic
+            // 'resource' event, matching how real RNS keeps these internal.
+            if (incoming.isRequest) {
+                const requestId = protocol.resource_request_id(fullData);
+                this._handleRequest(requestId, fullData);
+                return;
+            }
+            if (incoming.isResponse) {
+                const { request_id, response_data } = protocol.parse_response_payload(fullData);
+                this._handleResponse(request_id, response_data);
+                return;
+            }
+
+            this.emit('resource', fullData);
         }
     }
 
@@ -1038,31 +1067,51 @@ export class Link extends EventEmitter {
     }
 
     // Sends a request to whichever peer is on the other end of this link,
-    // and resolves with the response data once it's received (or rejects
-    // on timeout). Only the direct-packet form is implemented — a request or
-    // response that doesn't fit in a single packet has no fallback here.
-    // For larger payloads, use sendResource() explicitly instead.
+    // and resolves with the response data once it's received (or rejects on
+    // timeout). A request (or its response) that doesn't fit in a single
+    // packet automatically falls back to a Resource transfer, matching
+    // RNS.Link.request()'s own fallback exactly (RNS/Link.py:490-506).
     request(path, data, { timeout = 10000 } = {}) {
         if (this.status !== Link.ACTIVE) return Promise.reject(new Error('Link is not active'));
 
         const payload = protocol.build_request_payload(path, data);
-        const requestPacket = protocol.build_link_packet(this.linkId, this.derivedKey, payload, protocol.CONTEXT_REQUEST);
-        const requestId = protocol.packet_truncated_hash(requestPacket);
-        const key = crypto.bytesToHex(requestId);
 
+        if (payload.length <= protocol.LINK_MDU) {
+            const requestPacket = protocol.build_link_packet(this.linkId, this.derivedKey, payload, protocol.CONTEXT_REQUEST);
+            const requestId = protocol.packet_truncated_hash(requestPacket);
+            const key = crypto.bytesToHex(requestId);
+            return new Promise((resolve, reject) => {
+                const timer = setTimeout(() => {
+                    this.pendingRequests.delete(key);
+                    reject(new Error(`Request to ${path} timed out`));
+                }, timeout);
+                this.pendingRequests.set(key, { resolve, reject, timer });
+                this.rns.sendData(requestPacket);
+            });
+        }
+
+        const requestId = protocol.resource_request_id(payload);
+        const key = crypto.bytesToHex(requestId);
         return new Promise((resolve, reject) => {
             const timer = setTimeout(() => {
                 this.pendingRequests.delete(key);
                 reject(new Error(`Request to ${path} timed out`));
             }, timeout);
             this.pendingRequests.set(key, { resolve, reject, timer });
-            this.rns.sendData(requestPacket);
+            this.sendResource(payload, { timeout, requestId, isRequest: true }).catch((e) => {
+                if (!this.pendingRequests.has(key)) return; // already resolved/rejected via the response
+                clearTimeout(timer);
+                this.pendingRequests.delete(key);
+                reject(e);
+            });
         });
     }
 
     // Looks up a handler registered on this link's destination via
     // Destination.registerRequestHandler() and, if it returns a value,
-    // sends it back as a RESPONSE packet.
+    // sends it back as a RESPONSE packet — or, if that doesn't fit in one
+    // packet, as an isResponse-flagged Resource (matching RNS.Link's own
+    // fallback, RNS/Link.py:842-850).
     _handleRequest(requestId, plaintext) {
         const { path_hash, data } = protocol.parse_request_payload(plaintext);
         const handlerEntry = this.destination?.requestHandlers?.get(crypto.bytesToHex(path_hash));
@@ -1072,7 +1121,11 @@ export class Link extends EventEmitter {
         if (response === undefined) return;
 
         const payload = protocol.build_response_payload(requestId, response);
-        this.rns.sendData(protocol.build_link_packet(this.linkId, this.derivedKey, payload, protocol.CONTEXT_RESPONSE));
+        if (payload.length <= protocol.LINK_MDU) {
+            this.rns.sendData(protocol.build_link_packet(this.linkId, this.derivedKey, payload, protocol.CONTEXT_RESPONSE));
+        } else {
+            this.sendResource(payload, { requestId, isResponse: true }).catch(() => {});
+        }
     }
 
     send(data) {
