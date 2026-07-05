@@ -37,7 +37,28 @@ const rns = new Reticulum();
 const webrtc = new WebRTCBrowser();
 rns.addInterface(webrtc);
 
-const identity = Identity.create();
+// Cached in sessionStorage (not localStorage): a reload of this tab keeps the
+// same identity/RID, but a new tab or a closed-and-reopened one gets a fresh
+// one — which is what lets two tabs of this same demo, in the same browser,
+// still stand in for two distinct peers (localStorage is shared across all
+// tabs of the same origin, which would collapse them into one identity).
+const IDENTITY_STORAGE_KEY = 'reticulum-demo-identity';
+
+function loadOrCreateIdentity() {
+  const stored = sessionStorage.getItem(IDENTITY_STORAGE_KEY);
+  if (stored) {
+    try {
+      return new Identity(crypto.hexToBytes(stored));
+    } catch (e) {
+      console.warn('Stored identity was invalid, generating a new one:', e);
+    }
+  }
+  const created = Identity.create();
+  sessionStorage.setItem(IDENTITY_STORAGE_KEY, crypto.bytesToHex(created.private));
+  return created;
+}
+
+const identity = loadOrCreateIdentity();
 const dest = new Destination(rns, identity, Destination.IN, Destination.SINGLE, 'webrtc_demo', 'chat');
 
 const ridHex = crypto.bytesToHex(dest.hash);
