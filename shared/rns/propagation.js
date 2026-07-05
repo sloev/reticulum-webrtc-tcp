@@ -211,6 +211,14 @@ export async function syncLXMF(propagationLink, source) {
     const wantList = listing.map(([transientId]) => transientId);
     const envelopes = await propagationLink.request('/get', [wantList, wantList, sourceHash, proof]);
 
+    return _decryptEnvelopes(propagationLink.rns, envelopes, source);
+}
+
+// Shared by syncLXMF() and syncFromRealPropagationNode(): both fetch back an
+// array of destination_hash(16) + identity_encrypt(...) envelopes and need
+// the same decrypt-then-parse step; only how they *ask* for those envelopes
+// (this project's own "/get" scheme vs. real LXMF's) differs.
+function _decryptEnvelopes(rns, envelopes, source) {
     const messages = [];
     for (const envelope of envelopes) {
         if (!(envelope instanceof Uint8Array) || envelope.length <= 16) continue;
@@ -220,8 +228,56 @@ export async function syncLXMF(propagationLink, source) {
         const decrypted = protocol.message_decrypt({ data: cipherBlob }, source.identity.public, [source.identity.ratchetPrivate, source.identity.private.slice(0, 32)]);
         if (!decrypted) continue;
 
-        const parsed = tryParseLxmf(propagationLink.rns, destinationHash, decrypted);
+        const parsed = tryParseLxmf(rns, destinationHash, decrypted);
         if (parsed) messages.push(parsed);
     }
+    return messages;
+}
+
+// Downloads and purges any messages a *real* LXMF.LXMRouter propagation node
+// (enable_propagation()) is holding for `source` (your own IN lxmf/delivery
+// destination — same convention as syncLXMF()), over an already-established
+// Link to that node's real "lxmf.propagation" destination. Unlike syncLXMF()
+// (this project's own JS-only scheme), a real node authenticates the
+// requester via RNS.Link.identify() rather than a signature embedded in the
+// request payload — proving `source.identity` is what tells the node which
+// stored messages (filed by *their* recipient's delivery-destination hash)
+// belong to us — and its "/get" response shapes differ slightly (see below).
+// The stored envelope format itself turned out to be identical (confirmed
+// via propagateLXMF() uploading to a real node — see README's Compliance
+// section), so the same decrypt/parse step applies once the envelopes are
+// back.
+//
+// Real RNS's LXMPeer.message_get_request():
+//  - Listing (`data = [null, null]`) responds with a flat array of bare
+//    transient_id hashes — not this project's own `[transientId, size]`
+//    pairs.
+//  - Fetching (`data = [want, have]`) responds with an array of raw
+//    envelope bytes, the trailing admission stamp already stripped off.
+// Both are matched here by requesting the exact same shapes — except a real
+// node's request handler processes the "have" (purge) list *before* the
+// "want" (fetch) list within a single request (found by testing against a
+// live node: passing the same list as both, like this project's own
+// PropagationNode intentionally supports, silently purges everything before
+// it can be looked up to serve back — this project's own node was written
+// to fetch first specifically to avoid this footgun, but a real node has
+// the opposite order). So this fetches in one request, then purges what was
+// retrieved in a separate, later one — matching how LXMRouter's own client
+// code (message_list_response/message_get_response) does it.
+export async function syncFromRealPropagationNode(propagationLink, source) {
+    if (!source || source.direction !== Destination.IN) {
+        throw new Error("LXMF sync source must be your own IN destination.");
+    }
+
+    propagationLink.identify(source.identity);
+
+    const listing = await propagationLink.request('/get', [null, null]);
+    if (!Array.isArray(listing) || listing.length === 0) return [];
+
+    const envelopes = await propagationLink.request('/get', [listing, null]);
+    const messages = _decryptEnvelopes(propagationLink.rns, envelopes, source);
+
+    await propagationLink.request('/get', [null, listing]).catch(() => {});
+
     return messages;
 }
