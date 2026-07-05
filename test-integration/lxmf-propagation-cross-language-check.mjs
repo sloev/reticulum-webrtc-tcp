@@ -8,12 +8,11 @@
 // independently — genuine upload-side interop with the reference
 // implementation, not just this project's own PropagationNode.
 //
-// Download/sync interop is NOT covered here: a real LXMRouter's "/get"
-// handler identifies the requester via RNS's own Link identification
-// (RNS.Link.identify()), which isn't implemented in this project (see
-// shared/rns/propagation.js's own request/proof scheme, which is a
-// different, JS-only mechanism) — so only the upload half of real LXMF
-// propagation-node interop is verified here.
+// Also confirms the download/sync half now works too:
+// syncFromRealPropagationNode() (shared/rns/propagation.js) uses
+// Link.identify() to prove the recipient's identity to the node exactly
+// like a real LXMRouter client does, then fetches the same message back
+// over the node's real "/get" request path and decrypts/parses it.
 import { spawn } from 'node:child_process';
 import { rmSync } from 'node:fs';
 import { Reticulum, Identity, Destination, Link } from '../shared/rns/index.js';
@@ -32,6 +31,11 @@ let failed = false;
 function assertTrue(cond, msg) {
   console.log(`${cond ? 'PASS' : 'FAIL'}: ${msg}`);
   if (!cond) failed = true;
+}
+function assertEqual(actual, expected, msg) {
+  const ok = actual === expected;
+  console.log(`${ok ? 'PASS' : 'FAIL'}: ${msg}`, ok ? '' : `(got ${JSON.stringify(actual)}, expected ${JSON.stringify(expected)})`);
+  if (!ok) failed = true;
 }
 
 const rns = new Reticulum();
@@ -96,6 +100,9 @@ rns.identities.set(crypto.bytesToHex(recipientSelf.hash), { public_key: recipien
 
 const senderIdentity = Identity.create();
 const senderSelf = new Destination(rns, senderIdentity, Destination.IN, Destination.SINGLE, 'lxmf', 'delivery');
+// So the recipient's later tryParseLxmf() (on download) can validate the
+// sender's signature — in real use this would come from an earlier announce.
+rns.identities.set(crypto.bytesToHex(senderSelf.hash), { public_key: senderIdentity.public, ratchet: senderIdentity.ratchetPublic });
 
 const destOut = new Destination(rns, recipientIdentity, Destination.OUT, Destination.SINGLE, 'lxmf', 'delivery');
 
@@ -117,7 +124,25 @@ const status = await waitFor((m) => m.event === 'store_status', 10000);
 
 assertTrue(status.count >= 1, `the real LXMRouter's message store contains at least one message (count=${status.count})`);
 
+// --- Download/sync: the recipient identifies to the real node over a fresh
+// Link (Link.identify()), then fetches the message back via the node's real
+// "/get" request path ---
+const downloadLink = new Link(rns, propNodeDest);
+await new Promise((resolve) => downloadLink.once('established', resolve));
+console.log('second real Link established for the download/sync half');
+
+const messages = await propagation.syncFromRealPropagationNode(downloadLink, recipientSelf);
+assertTrue(messages.length >= 1, `syncFromRealPropagationNode() got at least one message back (count=${messages.length})`);
+if (messages.length >= 1) {
+  const msg = messages[0];
+  assertTrue(msg.valid, "the downloaded message's signature validates against the sender's identity");
+  assertEqual(new TextDecoder().decode(msg.title), 'real interop', 'downloaded message title matches what was uploaded');
+  assertEqual(new TextDecoder().decode(msg.content), 'hello real LXMRouter', 'downloaded message content matches what was uploaded');
+  assertEqual(crypto.bytesToHex(msg.source_hash), crypto.bytesToHex(senderSelf.hash), "downloaded message's source_hash matches the real sender");
+}
+
 link.close();
+downloadLink.close();
 py.kill();
 gateway.server.close();
 

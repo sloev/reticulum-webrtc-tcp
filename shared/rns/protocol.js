@@ -22,6 +22,7 @@ export const CONTEXT_RESPONSE = 0x0a;
 export const CONTEXT_PATH_RESPONSE = 0x0b;
 export const CONTEXT_CHANNEL = 0x0e;
 export const CONTEXT_KEEPALIVE = 0xfa;
+export const CONTEXT_LINKIDENTIFY = 0xfb;
 export const CONTEXT_LINKCLOSE = 0xfc;
 export const CONTEXT_LRRTT = 0xfe;
 export const CONTEXT_LRPROOF = 0xff;
@@ -372,6 +373,32 @@ export function validate_link_proof(packet, link_id, peer_sig_pub) {
     if (!crypto.ed25519_validate(signature, signed_data, peer_sig_pub)) return null;
 
     return { peer_x_pub, mtu };
+}
+
+// RNS.Link.identify(): the initiator proves their real identity to the
+// responder over an already-established (and thus already-encrypted) link —
+// an opt-in authentication step distinct from the link handshake itself
+// (which never reveals either side's identity). Only the initiator may call
+// this (real RNS also restricts it that way); the payload is the identity's
+// full 64-byte public key plus an Ed25519 signature (using that same
+// identity's signing key) over `link_id + public_key`, wrapped and encrypted
+// like ordinary link data (build_link_packet(..., CONTEXT_LINKIDENTIFY)).
+export function build_link_identify_payload(link_id, identity_priv) {
+    const identity_pub = crypto.public_identity(identity_priv);
+    const signed_data = crypto.concat(link_id, identity_pub);
+    const signature = crypto.ed25519_sign(identity_priv.slice(32), signed_data);
+    return crypto.concat(identity_pub, signature);
+}
+
+// Returns the revealed 64-byte identity public key if the signature over
+// `link_id + identity_pub` checks out, otherwise null.
+export function parse_link_identify_payload(link_id, plaintext) {
+    if (plaintext.length !== 64 + 64) return null;
+    const identity_pub = plaintext.slice(0, 64);
+    const signature = plaintext.slice(64, 128);
+    const signed_data = crypto.concat(link_id, identity_pub);
+    if (!crypto.ed25519_validate(signature, signed_data, identity_pub.slice(32, 64))) return null;
+    return identity_pub;
 }
 
 // Matches RNS.Link.handshake(): ECDH between the two link-ephemeral X25519

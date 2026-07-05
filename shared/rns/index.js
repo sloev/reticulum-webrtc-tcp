@@ -464,6 +464,7 @@ export class Link extends EventEmitter {
         this._outgoingResources = new Map(); // resource_hash hex -> { parts, hashmapEntries, expectedProof, resolve, reject, timer }
         this._incomingResources = new Map(); // resource_hash hex -> { randomHash, hashmapEntries, parts, receivedCount }
         this._channel = null; // lazily created by getChannel()
+        this._remoteIdentity = null; // set once identify() is proven (initiator's identity, seen by a responder)
 
         this.initiator = true;
         this.xPrivate = crypto.private_ratchet();
@@ -503,6 +504,7 @@ export class Link extends EventEmitter {
         link._outgoingResources = new Map();
         link._incomingResources = new Map();
         link._channel = null;
+        link._remoteIdentity = null;
 
         link.peerXPublic = parsed.peer_x_pub;
         link.peerSigPublic = parsed.peer_sig_pub;
@@ -625,6 +627,12 @@ export class Link extends EventEmitter {
             this.emit('established', this);
         } else if (packet.context === protocol.CONTEXT_LINKCLOSE) {
             if (crypto.bytesToHex(plaintext) === crypto.bytesToHex(this.linkId)) this._teardown();
+        } else if (packet.context === protocol.CONTEXT_LINKIDENTIFY && !this.initiator) {
+            const identityPub = protocol.parse_link_identify_payload(this.linkId, plaintext);
+            if (identityPub) {
+                this._remoteIdentity = { public: identityPub, hash: protocol.identity_hash(identityPub) };
+                this.emit('remote-identified', this._remoteIdentity);
+            }
         } else if (packet.context === protocol.CONTEXT_REQUEST) {
             this._handleRequest(protocol.packet_truncated_hash(rawBytes), plaintext);
         } else if (packet.context === protocol.CONTEXT_RESPONSE) {
@@ -874,6 +882,24 @@ export class Link extends EventEmitter {
     send(data) {
         if (this.status !== Link.ACTIVE) return;
         this.rns.sendData(protocol.build_link_packet(this.linkId, this.derivedKey, data, protocol.CONTEXT_NONE));
+    }
+
+    // Proves `identity` to the peer on the other end of this link — an
+    // opt-in authentication step, only meaningful for the initiator (matches
+    // RNS.Link.identify()). The responder learns the initiator's real
+    // identity (see the 'remote-identified' event/getRemoteIdentity()) but
+    // the initiator's anonymity is otherwise preserved — nothing about this
+    // link's handshake reveals it unless this is called.
+    identify(identity) {
+        if (!this.initiator || this.status !== Link.ACTIVE) return;
+        const payload = protocol.build_link_identify_payload(this.linkId, identity.private);
+        this.rns.sendData(protocol.build_link_packet(this.linkId, this.derivedKey, payload, protocol.CONTEXT_LINKIDENTIFY));
+    }
+
+    // The initiator's identity, once proven via identify() — null until
+    // then. Matches RNS.Link.get_remote_identity().
+    getRemoteIdentity() {
+        return this._remoteIdentity;
     }
 
     // Returns this link's Channel (a reliable, sequenced message layer — see

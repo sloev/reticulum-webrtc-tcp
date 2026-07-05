@@ -224,6 +224,50 @@ test('Link establishes, exchanges data both ways, and tears down between two ind
   assert.equal(rnsB.links.size, 0);
 });
 
+test('Link.identify() reveals the initiator\'s real identity to the responder, matching RNS.Link.identify()/get_remote_identity()', async () => {
+  const rnsA = new Reticulum();
+  const rnsB = new Reticulum();
+  class Bridge extends Interface {
+    connect() {}
+    sendData(data) { setTimeout(() => this.other.rns.onPacketReceived(data, this.other), 0); }
+  }
+  const ifaceA = new Bridge('A');
+  const ifaceB = new Bridge('B');
+  ifaceA.other = ifaceB;
+  ifaceB.other = ifaceA;
+  rnsA.addInterface(ifaceA);
+  rnsB.addInterface(ifaceB);
+
+  const responderIdentity = Identity.create();
+  const responderDest = new Destination(rnsB, responderIdentity, Destination.IN, Destination.SINGLE, 'test', 'identify');
+  const outDest = new Destination(rnsA, responderIdentity, Destination.OUT, Destination.SINGLE, 'test', 'identify');
+  outDest.hash = responderDest.hash;
+
+  const responderLinkPromise = new Promise((resolve) => responderDest.on('link', resolve));
+  const initiatorLink = new Link(rnsA, outDest);
+  await new Promise((resolve) => initiatorLink.once('established', resolve));
+  const responderLink = await responderLinkPromise;
+  await new Promise((resolve) => (responderLink.status === Link.ACTIVE ? resolve() : responderLink.once('established', resolve)));
+
+  assert.equal(responderLink.getRemoteIdentity(), null);
+
+  const initiatorIdentity = Identity.create();
+  const remoteIdentified = new Promise((resolve) => responderLink.once('remote-identified', resolve));
+  initiatorLink.identify(initiatorIdentity);
+  const revealed = await remoteIdentified;
+
+  assert.equal(crypto.bytesToHex(revealed.public), crypto.bytesToHex(initiatorIdentity.public));
+  assert.equal(crypto.bytesToHex(revealed.hash), crypto.bytesToHex(initiatorIdentity.hash));
+  assert.equal(crypto.bytesToHex(responderLink.getRemoteIdentity().hash), crypto.bytesToHex(initiatorIdentity.hash));
+
+  // The responder never calls identify() (matches real RNS: only the
+  // initiator can prove identity this way), so the initiator's own link
+  // never learns a "remote identity" for the other side.
+  assert.equal(initiatorLink.getRemoteIdentity(), null);
+
+  initiatorLink.close();
+});
+
 // --- RNS.Link Request/Response: ground truth captured from a real link
 // (same fixed ephemeral keys as above, destination app "test.reqresp") ---
 
