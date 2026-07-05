@@ -20,7 +20,7 @@ Events (stdout, one JSON object per line):
   {"event": "packet_received", "dest_hash": "<hex>", "text": "..."}
   {"event": "lxmf_received", "source_hash": "<hex>", "title": "...", "content": "...", "valid": bool}
   {"event": "link_established"} — a peer established a real RNS.Link to this node's `destination`
-  {"event": "resource_received", "data_hex": "<hex>"} — a real RNS.Resource completed over that link
+  {"event": "resource_received", "data_hex": "<hex>", "compressed": bool} — a real RNS.Resource completed over that link
   {"event": "resource_failed", "status": N}
   {"event": "channel_message", "hex": "..."} — a real RNS.Channel message arrived
   {"event": "buffer_received", "hex": "..."} — a real RNS.Buffer stream (id 1) reached eof
@@ -120,7 +120,7 @@ loglevel = 3
     def on_resource_concluded(resource):
         if resource.status == RNS.Resource.COMPLETE:
             data = resource.data.read()
-            emit("resource_received", data_hex=data.hex())
+            emit("resource_received", data_hex=data.hex(), compressed=resource.compressed)
         else:
             emit("resource_failed", status=resource.status)
 

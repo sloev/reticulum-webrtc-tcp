@@ -84,7 +84,7 @@ reason).
 | Multi-segment transfers (send) | `RNS/Resource.py:274–310` | `shared/rns/index.js` `_sendResourceSegment` | DONE | live (real peer reassembles) |
 | Incoming bz2 decompression | `RNS/Resource.py` assemble | `shared/rns/compression.js` `bz2_decompress` | DONE | live (real compressed data) |
 | Rate-adaptive request window | `RNS/Resource.py:58–99` (`WINDOW=4, WINDOW_MIN=2, WINDOW_MAX_SLOW=10, WINDOW_MAX_FAST=75, WINDOW_FLEXIBILITY=4, RATE_FAST=(50*1000)/8, RATE_VERY_SLOW=(2*1000)/8`), ramp at `:900–924` | `shared/rns/index.js` `Link._growResourceWindow/_requestNextResourceParts` | PARTIAL — growth + fast/very-slow-rate window_max promotion/demotion implemented; retry-driven shrinking not (no per-part retry/timeout mechanism exists) | unit test (window grows over multiple rounds, monotonic) + live (`test:integration:resource` re-verified, incl. a real `RNS.Resource` sender's ~180KB multi-segment transfer) |
-| Outgoing bz2 compression | `RNS/Resource.py` (`AUTO_COMPRESS_MAX_SIZE=64MiB`, :124,364) | `shared/rns/compression.js` (decode-only today) | MISSING — needs a JS bz2 *encoder* | **Phase 2.2** |
+| Outgoing bz2 compression | `RNS/Resource.py` (compress-if-beneficial policy, :384-421, `AUTO_COMPRESS_MAX_SIZE=64MiB` :124,364) | `shared/rns/compression.js` `bz2_compress/bz2_compress_if_beneficial`, wired into `Link._sendResourceSegment` (Resource) and `buffer.js`'s `RawChannelWriter.write` (Buffer, per-chunk) | DONE | byte-exact (matches real `bz2.compress()` output exactly) + live (`test:integration:resource`/`:channel`: real `RNS.Resource`/`RNS.Buffer` explicitly report `compressed=True`) + real headless-Chromium production-build test |
 | HMU (hashmap update) receive path, large single segments | `RNS/Resource.py:483–499` `hashmap_update_packet`, `HASHMAP_IS_EXHAUSTED=0xFF` (:140), `:953–960` | — | MISSING — can't receive a real segment > `RESOURCE_SEGMENT_MAX_SIZE` | **Phase 2.3** |
 | Channel (envelope, proofs, RTT-adaptive send window) | `RNS/Channel.py` | `shared/rns/channel.js` | DONE | byte-exact + live both directions |
 | Buffer (stream reader/writer, compressed chunks) | `RNS/Buffer.py` | `shared/rns/buffer.js` | DONE | live both directions |
@@ -225,16 +225,48 @@ observed window sequence is monotonically non-decreasing and exceeds the initial
 4. Live: `test:integration:resource` re-verified in both directions, including a real
 `RNS.Resource` sender's ~180KB multi-segment transfer to our (window-adaptive) receiver.
 
-**2.2 Outgoing bz2 compression.** seek-bzip decodes only. Evaluate `compressjs` (pure-JS
-bzip2 encoder): `bzip2.compressFile(data)` output must round-trip through Python
-`bz2.decompress` — write a scratch cross-check first. If unusable, fall back to a WASM
-bz2 encoder; if none works, document and stop this sub-step. Wire into
-`resource_prepare()` with RNS's rule: compress when `len(compressed) < len(raw)` and
-`size ≤ AUTO_COMPRESS_MAX_SIZE`; set the advertisement's compressed flag (`f` bitfield —
-already parsed on receive). Buffer/`StreamDataMessage` gets the same treatment
-(compressed bit in the header — decode already implemented in `channel.js`/`buffer.js`).
-Live: real `RNS.Resource`/`RNS.Buffer` receives highly-compressible data from JS and the
-Python process asserts equality after its own transparent decompression.
+**2.2 Outgoing bz2 compression. ✅ Done.**
+
+`compressjs` (the obvious pure-JS bzip2 encoder, same author as `seek-bzip`) turned out to
+be GPL-licensed — bundling it would attach copyleft obligations to this project's
+MIT-licensed browser bundle, so it was rejected on licensing grounds rather than technical
+ones. Used `bzip2-wasm` instead: a WebAssembly build of the actual reference `libbzip2` C
+library (the same one Python's `bz2` module wraps), under `libbzip2`'s own permissive
+BSD-style license. Being the real reference implementation rather than an independent
+reimplementation, its output isn't just *a* valid bz2 stream — it's byte-identical to what
+`bz2.compress()` itself produces for the same input (verified directly).
+
+Implemented in `shared/rns/compression.js`: `bz2_compress()` (sizes the output buffer to
+libbzip2's own documented worst-case bound — its own default guess of `input.length` isn't
+big enough for incompressible data and throws `BZ_OUTBUFF_FULL`, which is what actually
+happened first) and `bz2_compress_if_beneficial()`, matching `RNS.Resource`'s exact policy
+(`Resource.py:384-421`): always attempt compression up to `AUTO_COMPRESS_MAX_SIZE` (64MiB),
+use the compressed bytes only if they're smaller. Wired into `Link._sendResourceSegment()`
+(Resource — the resource's hash/proof/`dataSize` are always computed over the *original*
+uncompressed plaintext, matching real RNS, since compression is transparent to the
+resource's own identity) and `buffer.js`'s `RawChannelWriter.write()` (Buffer, per chunk —
+this made `write()` async, so its two callers now `await` it; its return value is still the
+count of *uncompressed* input bytes consumed, matching real RNS's contract for offset
+tracking). The advertisement/`StreamDataMessage` compressed bit (already parsed on receive)
+is now also set on send.
+
+**Known caveat, environment-specific, not a compliance gap**: `bzip2-wasm`'s Emscripten
+glue resolves its `.wasm` file relative to its own script location, which doesn't survive
+Vite's dev-server dependency pre-bundling cleanly in every case (`optimizeDeps.exclude:
+['bzip2-wasm']` in `vite.config.js` was added to help). This doesn't affect the deployed
+demo — the demo's chat UI never calls `sendResource()`/`Buffer` at all, and the actual
+*production* build (`vite build`, what's deployed to GitHub Pages) was verified working
+end-to-end in real headless Chromium (compress, decompress, and the incompressible-data
+fallback all correct). It would only matter for a consumer directly exercising
+Resource/Buffer from browser code under `vite dev`-style tooling.
+
+Verified: byte-exact unit test (`bz2_compress()` output matches real `bz2.compress(data,
+9)` for a fixed input) and a compressible-vs-incompressible decision test
+(`test/compression.test.js`); live — `test:integration:resource` (real `RNS.Resource`
+explicitly reports `compressed=True` for a compressible JS-sent transfer and `False` for a
+high-entropy one) and `test:integration:channel` (real `RNS.Buffer` correctly reassembles a
+compressed JS-sent stream); a real headless-Chromium session running the actual
+`vite build` production bundle.
 
 **2.3 HMU receive path + larger segments.** Read `Resource.py` hashmap flow: the
 advertisement carries only the first hashmap slice; the receiver requests parts and,
@@ -349,3 +381,4 @@ its "verified by" filled in; remove stale caveats elsewhere (module comments cit
 | 2026-07-05 | Phase 0 | Identity persistence committed (`b3f95fe`); this document created. |
 | 2026-07-05 | Phase 1 | Link's RTT-adaptive keepalive/stale/timeout state machine implemented, plus a real bug fix (made `stamp.generate_stamp()`/`generate_peering_key()` non-blocking — see Phase 1 writeup). 51/51 unit tests pass; live `resource`/`channel`/`lxmf-propagation`/`lxmf-peer-sync` checks re-verified. |
 | 2026-07-05 | Phase 2.1 | Resource's rate-adaptive request window (growth + fast/very-slow-rate `window_max` promotion/demotion) implemented; retry-driven shrinking scoped out (no per-part retry mechanism exists). 52/52 unit tests pass; live `test:integration:resource` re-verified in both directions. |
+| 2026-07-05 | Phase 2.2 | Outgoing bz2 compression implemented for Resource and Buffer via `bzip2-wasm` (a WASM build of the real reference `libbzip2`, chosen over the GPL-licensed `compressjs`). Byte-exact vs real `bz2.compress()`; live checks confirm real `RNS.Resource`/`RNS.Buffer` explicitly recognize JS-compressed transfers; verified working in the actual production browser build via real headless Chromium (a dev-server-only WASM pre-bundling quirk was found and mitigated, doesn't affect the deployed demo). 54/54 unit tests pass. |

@@ -692,9 +692,10 @@ export class Link extends EventEmitter {
     // Resource (chunked across multiple packets), resolving once the peer's
     // completion proof is received, or rejecting on timeout or a failed
     // integrity check. Useful for payloads too large for a single Request/
-    // Response or LXMF packet. Never compresses on send (see
-    // shared/rns/compression.js), but transparently decompresses an
-    // incoming compressed transfer from a real RNS peer.
+    // Response or LXMF packet. Each segment is bz2-compressed if that's
+    // smaller (see shared/rns/compression.js), matching RNS.Resource's own
+    // policy exactly, and an incoming compressed transfer from a real RNS
+    // peer is transparently decompressed the same way it always was.
     //
     // Payloads larger than one segment's worth (protocol.
     // RESOURCE_SEGMENT_MAX_SIZE) are split into multiple segments, sent one
@@ -732,10 +733,15 @@ export class Link extends EventEmitter {
     // resourceHash once its completion proof arrives — sendResource() feeds
     // this back in as `originalHash` for the next segment, so every segment
     // after the first is linked back to the transfer's first segment.
-    _sendResourceSegment(plaintext, segmentIndex, totalSegments, originalHash, timeout) {
+    async _sendResourceSegment(plaintext, segmentIndex, totalSegments, originalHash, timeout) {
+        // Matches RNS.Resource's own policy exactly: always try compressing
+        // first, only actually send the compressed bytes if they came out
+        // smaller (see compression.js's bz2_compress_if_beneficial()).
+        const { data: sendData, compressed } = await compression.bz2_compress_if_beneficial(plaintext);
+
         let prepared;
         try {
-            prepared = protocol.resource_prepare(plaintext, (pt) => protocol.link_encrypt(this.derivedKey, pt));
+            prepared = protocol.resource_prepare(plaintext, (pt) => protocol.link_encrypt(this.derivedKey, pt), { compressed, sendData });
         } catch (e) {
             return Promise.reject(e);
         }
@@ -744,7 +750,7 @@ export class Link extends EventEmitter {
         const advPayload = protocol.build_resource_advertisement({
             transferSize: prepared.transferSize, dataSize: prepared.dataSize, totalParts: prepared.totalParts,
             resourceHash: prepared.resourceHash, randomHash: prepared.randomHash, hashmap: prepared.hashmap,
-            segmentIndex, totalSegments, originalHash: originalHash || prepared.resourceHash,
+            segmentIndex, totalSegments, originalHash: originalHash || prepared.resourceHash, compressed: prepared.compressed,
         });
         const advPacket = protocol.build_link_packet(this.linkId, this.derivedKey, advPayload, protocol.CONTEXT_RESOURCE_ADV);
 

@@ -687,13 +687,21 @@ export function resource_map_hash(part_data, random_hash) {
 // segment alone would need more than RESOURCE_MAX_PARTS parts — callers
 // transferring more than RESOURCE_SEGMENT_MAX_SIZE bytes are expected to
 // call this once per segment (see index.js's Link.sendResource()).
-export function resource_prepare(plaintext, link_encrypt_fn) {
+//
+// `compressed`/`sendData` let a caller pass in an already bz2-compressed
+// version of `plaintext` to actually encrypt and send (see
+// compression.js's bz2_compress_if_beneficial(), which decides whether
+// compressing was worthwhile) — matching real RNS.Resource, the resource's
+// hash/proof/dataSize are always computed over the original, uncompressed
+// `plaintext` regardless, since compression is purely a transport-level
+// optimization transparent to the resource's own identity.
+export function resource_prepare(plaintext, link_encrypt_fn, { compressed = false, sendData = plaintext } = {}) {
     const embeddedSalt = crypto.randomBytes(RESOURCE_RANDOM_HASH_LEN);
-    const cipherBlob = link_encrypt_fn(crypto.concat(embeddedSalt, plaintext));
+    const cipherBlob = link_encrypt_fn(crypto.concat(embeddedSalt, sendData));
 
     const totalParts = Math.max(1, Math.ceil(cipherBlob.length / RESOURCE_SDU));
     if (totalParts > RESOURCE_MAX_PARTS) {
-        throw new Error(`Resource of ${plaintext.length} bytes needs ${totalParts} parts, exceeding the ${RESOURCE_MAX_PARTS}-part single-segment limit (see README's Compliance section)`);
+        throw new Error(`Resource of ${sendData.length} bytes needs ${totalParts} parts, exceeding the ${RESOURCE_MAX_PARTS}-part single-segment limit (see README's Compliance section)`);
     }
 
     const randomHash = crypto.randomBytes(RESOURCE_RANDOM_HASH_LEN);
@@ -709,33 +717,35 @@ export function resource_prepare(plaintext, link_encrypt_fn) {
     }
 
     return {
-        randomHash, resourceHash, expectedProof, parts, hashmapEntries,
+        randomHash, resourceHash, expectedProof, parts, hashmapEntries, compressed,
         hashmap: crypto.concat(...hashmapEntries),
         totalParts, transferSize: cipherBlob.length, dataSize: plaintext.length,
     };
 }
 
 // Matches ResourceAdvertisement's msgpack field layout ({t,d,n,h,r,o,i,l,q,f,m}).
-// f (flags) sets the "encrypted" bit (always, this project always encrypts)
-// and the "split" bit when totalSegments > 1, matching
+// f (flags) sets the "encrypted" bit (always, this project always encrypts),
+// the "split" bit when totalSegments > 1, and the "compressed" bit when the
+// sender bz2-compressed this segment's data, matching
 // `0x00 | has_metadata<<5 | is_response<<4 | is_request<<3 | split<<2 |
-// compressed<<1 | encrypted` — has_metadata/is_response/is_request/
-// compressed aren't implemented on send, so those bits are always 0. i
-// (segment_index) and l (total_segments) are 1-based in real RNS — a
-// receiver only treats a resource as fully concluded once segment_index ==
-// total_segments, so a single (first-and-only) segment must be numbered 1,
-// not 0. originalHash defaults to resourceHash (matching a first/only
-// segment); a later segment passes the *first* segment's resourceHash here
-// instead, linking it back to the same overall transfer.
+// compressed<<1 | encrypted` — has_metadata/is_response/is_request aren't
+// implemented on send, so those bits are always 0. i (segment_index) and l
+// (total_segments) are 1-based in real RNS — a receiver only treats a
+// resource as fully concluded once segment_index == total_segments, so a
+// single (first-and-only) segment must be numbered 1, not 0. originalHash
+// defaults to resourceHash (matching a first/only segment); a later segment
+// passes the *first* segment's resourceHash here instead, linking it back
+// to the same overall transfer.
 export function build_resource_advertisement({
     transferSize, dataSize, totalParts, resourceHash, randomHash, hashmap,
-    segmentIndex = 1, totalSegments = 1, originalHash = resourceHash,
+    segmentIndex = 1, totalSegments = 1, originalHash = resourceHash, compressed = false,
 }) {
     const split = totalSegments > 1 ? 0x04 : 0x00;
+    const compressedFlag = compressed ? 0x02 : 0x00;
     const dict = {
         t: transferSize, d: dataSize, n: totalParts,
         h: resourceHash, r: randomHash, o: originalHash,
-        i: segmentIndex, l: totalSegments, q: null, f: 0x01 | split, m: hashmap,
+        i: segmentIndex, l: totalSegments, q: null, f: 0x01 | split | compressedFlag, m: hashmap,
     };
     return lxmfMsgpack.pack(dict);
 }

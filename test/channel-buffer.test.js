@@ -206,7 +206,7 @@ test('Buffer round-trips a multi-chunk stream end to end, split across many writ
     while (!writerChannel.isReadyToSend()) {
       await new Promise((resolve) => setTimeout(resolve, 5));
     }
-    const sent = writer.write(payload.slice(offset));
+    const sent = await writer.write(payload.slice(offset));
     offset += sent;
   }
   await writer.close();
