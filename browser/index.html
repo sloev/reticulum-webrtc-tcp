@@ -4,19 +4,24 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Reticulum over WebRTC — live demo</title>
-  <meta name="description" content="Browser peer for a Reticulum Network Stack subset running over WebRTC, signaled through public Nostr relays." />
+  <meta name="description" content="Browser peer for a from-scratch JavaScript implementation of the Reticulum Network Stack (RNS) and LXMF, verified against the real Python packages, running over a sparse WebRTC mesh signaled through public Nostr relays." />
   <link rel="stylesheet" href="./style.css" />
 </head>
 <body>
   <header>
     <h1>Reticulum over WebRTC</h1>
     <p class="tagline">
-      A browser peer in a WebRTC mesh running a JavaScript subset of the
-      <a href="https://reticulum.network/" target="_blank" rel="noopener">Reticulum</a> protocol.
-      Peer discovery and connection signaling go over public Nostr relays — no server involved.
+      A browser peer in a sparse WebRTC mesh, running a from-scratch JavaScript implementation of
+      the <a href="https://reticulum.network/" target="_blank" rel="noopener">Reticulum</a> (RNS)
+      wire protocol and LXMF — not every feature of either, but the parts this page uses (announces,
+      encrypted <code>Link</code>s, identity proofs, reliable <code>Channel</code> messaging, multi-hop
+      relaying) are verified byte-for-byte or via live interop against the real Python
+      <code>rns</code>/<code>lxmf</code> packages, not just against this project's own code. Peer
+      discovery and connection signaling go over public Nostr relays — no server involved.
     </p>
     <p class="repo-link">
       <a href="https://github.com/sloev/reticulum-webrtc-tcp" target="_blank" rel="noopener">Source on GitHub</a>
+      · <a href="https://github.com/sloev/reticulum-webrtc-tcp#compliance" target="_blank" rel="noopener">exactly what's covered</a>
     </p>
   </header>
 
@@ -49,6 +54,11 @@
       <div id="known-peers" class="peer-chips">
         <span class="hint">No peers announced yet — waiting for announces…</span>
       </div>
+      <p class="hint">
+        Each peer connects directly to at most 4 others, not the whole mesh — announces and
+        messages to a peer you're not directly connected to are relayed automatically through
+        whichever peers you are connected to, hop by hop.
+      </p>
     </section>
 
     <section class="card">
@@ -64,8 +74,9 @@
         <button id="send" type="button">Send</button>
       </div>
       <p class="hint">
-        Messages are sent as LXMF-style envelopes once you've received an announce from that
-        RID. If you haven't heard from them yet, clicking send just re-announces your identity.
+        Sending establishes a Link to that RID, proves your identity over it, and delivers the
+        message as a reliable Channel message — once you've received an announce from them. If
+        you haven't heard from them yet, clicking send just re-announces your identity.
       </p>
     </section>
   </main>
