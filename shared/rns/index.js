@@ -3,6 +3,7 @@ import { EventEmitter } from 'events';
 import * as crypto from './crypto.js';
 import { pack, unpack } from 'msgpackr';
 import { Channel } from './channel.js';
+import * as compression from './compression.js';
 
 export class Reticulum extends EventEmitter {
     constructor() {
@@ -463,6 +464,7 @@ export class Link extends EventEmitter {
         this.pendingRequests = new Map(); // request_id hex -> { resolve, reject, timer }
         this._outgoingResources = new Map(); // resource_hash hex -> { parts, hashmapEntries, expectedProof, resolve, reject, timer }
         this._incomingResources = new Map(); // resource_hash hex -> { randomHash, hashmapEntries, parts, receivedCount }
+        this._resourceSegments = new Map(); // original_hash hex -> { chunks, totalSegments } — multi-segment reassembly
         this._channel = null; // lazily created by getChannel()
         this._remoteIdentity = null; // set once identify() is proven (initiator's identity, seen by a responder)
 
@@ -503,6 +505,7 @@ export class Link extends EventEmitter {
         link.pendingRequests = new Map();
         link._outgoingResources = new Map();
         link._incomingResources = new Map();
+        link._resourceSegments = new Map();
         link._channel = null;
         link._remoteIdentity = null;
 
@@ -651,15 +654,47 @@ export class Link extends EventEmitter {
     // Resource (chunked across multiple packets), resolving once the peer's
     // completion proof is received, or rejecting on timeout or a failed
     // integrity check. Useful for payloads too large for a single Request/
-    // Response or LXMF packet. See protocol.js's "RNS.Resource" section for
-    // exactly what's implemented (single-segment, uncompressed, fixed-size
-    // request window) versus real RNS's Resource.
+    // Response or LXMF packet. Never compresses on send (see
+    // shared/rns/compression.js), but transparently decompresses an
+    // incoming compressed transfer from a real RNS peer.
+    //
+    // Payloads larger than one segment's worth (protocol.
+    // RESOURCE_SEGMENT_MAX_SIZE) are split into multiple segments, sent one
+    // at a time (each with its own full advertise/request/part/proof cycle,
+    // linked by a shared "original hash" — see protocol.js's "RNS.Resource"
+    // section) — real RNS peers handle this correctly since they only ever
+    // trust whatever segment size this sender advertises. See protocol.js
+    // for exactly what's implemented (fixed-size request window, and a
+    // segment size much smaller than real RNS's 1MiB-1 — so *sending* an
+    // arbitrarily large payload works, but *receiving* one bigger than a
+    // single segment from a real peer still doesn't, since that needs HMU
+    // packets this project doesn't implement) versus real RNS's Resource.
     sendResource(data, { timeout = 30000 } = {}) {
         if (this.status !== Link.ACTIVE) return Promise.reject(new Error('Link is not active'));
 
+        const segments = [];
+        for (let offset = 0; offset < data.length; offset += protocol.RESOURCE_SEGMENT_MAX_SIZE) {
+            segments.push(data.slice(offset, offset + protocol.RESOURCE_SEGMENT_MAX_SIZE));
+        }
+        if (segments.length === 0) segments.push(data);
+        const totalSegments = segments.length;
+
+        return segments.reduce(
+            (chain, chunk, i) => chain.then((originalHash) =>
+                this._sendResourceSegment(chunk, i + 1, totalSegments, originalHash, timeout)
+                    .then((resourceHash) => originalHash || resourceHash)),
+            Promise.resolve(null),
+        );
+    }
+
+    // Sends a single Resource segment and resolves with that segment's own
+    // resourceHash once its completion proof arrives — sendResource() feeds
+    // this back in as `originalHash` for the next segment, so every segment
+    // after the first is linked back to the transfer's first segment.
+    _sendResourceSegment(plaintext, segmentIndex, totalSegments, originalHash, timeout) {
         let prepared;
         try {
-            prepared = protocol.resource_prepare(data, (plaintext) => protocol.link_encrypt(this.derivedKey, plaintext));
+            prepared = protocol.resource_prepare(plaintext, (pt) => protocol.link_encrypt(this.derivedKey, pt));
         } catch (e) {
             return Promise.reject(e);
         }
@@ -668,18 +703,20 @@ export class Link extends EventEmitter {
         const advPayload = protocol.build_resource_advertisement({
             transferSize: prepared.transferSize, dataSize: prepared.dataSize, totalParts: prepared.totalParts,
             resourceHash: prepared.resourceHash, randomHash: prepared.randomHash, hashmap: prepared.hashmap,
+            segmentIndex, totalSegments, originalHash: originalHash || prepared.resourceHash,
         });
         const advPacket = protocol.build_link_packet(this.linkId, this.derivedKey, advPayload, protocol.CONTEXT_RESOURCE_ADV);
 
         return new Promise((resolve, reject) => {
             const timer = setTimeout(() => {
                 this._outgoingResources.delete(resourceHashHex);
-                reject(new Error('Resource transfer timed out'));
+                reject(new Error(`Resource transfer timed out (segment ${segmentIndex}/${totalSegments})`));
             }, timeout);
 
             this._outgoingResources.set(resourceHashHex, {
                 parts: prepared.parts, hashmapEntries: prepared.hashmapEntries,
-                expectedProof: prepared.expectedProof, resolve, reject, timer,
+                expectedProof: prepared.expectedProof,
+                resolve: () => resolve(prepared.resourceHash), reject, timer,
             });
 
             this.rns.sendData(advPacket);
@@ -696,7 +733,7 @@ export class Link extends EventEmitter {
         } catch {
             return;
         }
-        if (adv.compressed || adv.split || adv.hasMetadata) return; // not implemented — see protocol.js
+        if (adv.hasMetadata) return; // not implemented — see protocol.js
         if (!adv.totalParts || adv.totalParts > protocol.RESOURCE_MAX_PARTS) return;
 
         const hashmapEntries = [];
@@ -706,7 +743,8 @@ export class Link extends EventEmitter {
 
         const resourceHashHex = crypto.bytesToHex(adv.resourceHash);
         this._incomingResources.set(resourceHashHex, {
-            randomHash: adv.randomHash, resourceHash: adv.resourceHash,
+            randomHash: adv.randomHash, resourceHash: adv.resourceHash, compressed: adv.compressed,
+            segmentIndex: adv.segmentIndex, totalSegments: adv.totalSegments, originalHash: adv.originalHash,
             hashmapEntries, parts: new Array(adv.totalParts).fill(null),
             receivedCount: 0, consecutiveCompletedHeight: -1, outstandingParts: 0,
         });
@@ -809,7 +847,15 @@ export class Link extends EventEmitter {
             return;
         }
 
-        const plaintext = preEncryptBlob.slice(protocol.RESOURCE_RANDOM_HASH_LEN);
+        let plaintext = preEncryptBlob.slice(protocol.RESOURCE_RANDOM_HASH_LEN);
+        if (incoming.compressed) {
+            try {
+                plaintext = compression.bz2_decompress(plaintext);
+            } catch {
+                this.emit('resource-failed', { reason: 'decompress-failed' });
+                return;
+            }
+        }
         const calculatedHash = crypto.sha256(crypto.concat(plaintext, incoming.randomHash));
         if (crypto.bytesToHex(calculatedHash) !== resourceHashHex) {
             this.emit('resource-failed', { reason: 'hash-mismatch' });
@@ -819,7 +865,25 @@ export class Link extends EventEmitter {
         const proofValue = crypto.sha256(crypto.concat(plaintext, calculatedHash));
         this.rns.sendData(protocol.build_resource_proof_packet(this.linkId, incoming.resourceHash, proofValue));
 
-        this.emit('resource', plaintext);
+        // Every segment gets proved individually (above), but 'resource' only
+        // fires once the *last* segment of a (possibly multi-segment)
+        // transfer has arrived, with every segment's plaintext concatenated
+        // in order — segments are always sent (and thus concluded) strictly
+        // in order, since a real sender never starts segment N+1 until
+        // segment N's proof has come back, so a simple ordered accumulator
+        // keyed by the shared original_hash is enough.
+        const originalHashHex = crypto.bytesToHex(incoming.originalHash);
+        let segmented = this._resourceSegments.get(originalHashHex);
+        if (!segmented) {
+            segmented = { chunks: [] };
+            this._resourceSegments.set(originalHashHex, segmented);
+        }
+        segmented.chunks.push(plaintext);
+
+        if (incoming.segmentIndex >= incoming.totalSegments) {
+            this._resourceSegments.delete(originalHashHex);
+            this.emit('resource', segmented.chunks.length === 1 ? segmented.chunks[0] : crypto.concat(...segmented.chunks));
+        }
     }
 
     // Sender side: the receiver's completion proof for a resource we sent.
@@ -945,6 +1009,7 @@ export class Link extends EventEmitter {
         }
         this._outgoingResources.clear();
         this._incomingResources.clear();
+        this._resourceSegments.clear();
         if (this._channel) this._channel._shutdown();
         this.emit('closed', this);
     }

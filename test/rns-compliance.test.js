@@ -389,7 +389,7 @@ test('Link.sendResource() transfers a multi-part payload and resolves once the r
   initiatorLink.close();
 });
 
-test('Link.sendResource() rejects when the payload would need more than the single-segment part limit', async () => {
+test('Link.sendResource() splits a payload bigger than one segment into multiple segments, reassembled correctly on the receiver', async () => {
   const rnsA = new Reticulum();
   const rnsB = new Reticulum();
 
@@ -405,20 +405,40 @@ test('Link.sendResource() rejects when the payload would need more than the sing
   rnsB.addInterface(ifaceB);
 
   const identityB = Identity.create();
-  const destB = new Destination(rnsB, identityB, Destination.IN, Destination.SINGLE, 'test', 'resource-toobig');
+  const destB = new Destination(rnsB, identityB, Destination.IN, Destination.SINGLE, 'test', 'resource-segments');
 
   const responderLinkPromise = new Promise((resolve) => destB.on('link', resolve));
-  const outDest = new Destination(rnsA, identityB, Destination.OUT, Destination.SINGLE, 'test', 'resource-toobig');
+  const outDest = new Destination(rnsA, identityB, Destination.OUT, Destination.SINGLE, 'test', 'resource-segments');
   outDest.hash = destB.hash;
   const initiatorLink = new Link(rnsA, outDest);
 
   await new Promise((resolve) => initiatorLink.once('established', resolve));
-  await responderLinkPromise;
+  const responderLink = await responderLinkPromise;
+  await new Promise((resolve) => (responderLink.status === Link.ACTIVE ? resolve() : responderLink.once('established', resolve)));
 
-  const tooBig = new Uint8Array(protocol.RESOURCE_MAX_PARTS * protocol.RESOURCE_SDU + 1000);
-  await assert.rejects(initiatorLink.sendResource(tooBig));
+  // Bigger than two full segments, forcing at least 3 segments — built from
+  // several smaller randomBytes() calls, since crypto.getRandomValues()
+  // (which crypto.randomBytes() wraps) rejects requests over 64KiB.
+  const payload = crypto.concat(crypto.randomBytes(60000), crypto.randomBytes(60000), crypto.randomBytes(1000));
+  assert.ok(payload.length > protocol.RESOURCE_SEGMENT_MAX_SIZE * 2);
+
+  const responderGot = new Promise((resolve) => responderLink.once('resource', resolve));
+  const sendPromise = initiatorLink.sendResource(payload);
+
+  const received = await responderGot;
+  assert.equal(crypto.bytesToHex(received), crypto.bytesToHex(payload));
+
+  await sendPromise;
 
   initiatorLink.close();
+});
+
+test('resource_prepare() throws if a single segment alone would still need more than RESOURCE_MAX_PARTS parts', () => {
+  // Link.sendResource() always chops at RESOURCE_SEGMENT_MAX_SIZE, which is
+  // sized so no chunk it produces can ever hit this — so this guard is only
+  // reachable by calling resource_prepare() directly with an oversized chunk.
+  const tooBig = new Uint8Array(protocol.RESOURCE_MAX_PARTS * protocol.RESOURCE_SDU + 1000);
+  assert.throws(() => protocol.resource_prepare(tooBig, (pt) => pt));
 });
 
 // --- RNS.Transport: path requests/responses ---

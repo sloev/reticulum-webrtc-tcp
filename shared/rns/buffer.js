@@ -10,15 +10,14 @@
 // (`.write(bytes)`, `.close()`) — the wire format and chunking/EOF semantics
 // are what matters for interop, not the local consumption API.
 //
-// Not implemented: bz2 compression of outgoing chunks (this writer never
-// sets StreamDataMessage's `compressed` flag) or decompression of incoming
-// compressed chunks — same gap as RNS.Resource's `compressed` advertisements.
-// A real RNS peer only compresses a chunk when doing so shrinks it, so
-// highly-compressible streams from a real peer will not interoperate; see
-// README's Compliance section.
+// Not implemented: bz2 compression of *outgoing* chunks (this writer never
+// sets StreamDataMessage's `compressed` flag, since it has no need to
+// compress) — but an incoming compressed chunk from a real RNS peer is
+// transparently decompressed (see shared/rns/compression.js).
 import * as protocol from './protocol.js';
 import { EventEmitter } from 'events';
 import { ChannelError } from './channel.js';
+import * as compression from './compression.js';
 
 export class RawChannelReader extends EventEmitter {
     constructor(streamId, channel) {
@@ -32,23 +31,28 @@ export class RawChannelReader extends EventEmitter {
         this.channel.addMessageHandler(this._handler);
     }
 
-    _handleMessage(msgtype, data) {
+    _handleMessage(msgtype, envelopeData) {
         if (msgtype !== protocol.CHANNEL_MSGTYPE_STREAM_DATA) return false;
-        const message = protocol.parse_stream_data_message(data);
+        const message = protocol.parse_stream_data_message(envelopeData);
         if (!message || message.stream_id !== this.streamId) return false;
 
+        let data = message.data;
         if (message.compressed) {
-            this.emit('error', new Error('Received a compressed stream chunk; decompression is not implemented'));
-            return true;
+            try {
+                data = compression.bz2_decompress(data, protocol.STREAM_DATA_MAX_CHUNK_LEN);
+            } catch (e) {
+                this.emit('error', e);
+                return true;
+            }
         }
 
-        if (message.data.length > 0) {
-            this._buffer.push(message.data);
-            this._bufferedLength += message.data.length;
+        if (data.length > 0) {
+            this._buffer.push(data);
+            this._bufferedLength += data.length;
         }
         if (message.eof) this._eof = true;
 
-        this.emit('data', message.data);
+        this.emit('data', data);
         if (this._eof) this.emit('end');
         return true;
     }

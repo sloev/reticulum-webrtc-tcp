@@ -586,10 +586,23 @@ export function lxmf_parse(decrypted, destination_hash, sender_pub) {
 }
 
 // --- RNS.Resource (chunked large-transfer protocol over a Link) ---
-// A deliberately bounded implementation: single-segment only (no >
-// RESOURCE_MAX_PARTS-part transfers — real RNS splits those into multiple
-// advertised segments) and no compression (real RNS bz2-compresses by
-// default). The receiver requests parts in a fixed-size window (see
+// Transfers larger than one segment's worth (RESOURCE_SEGMENT_MAX_SIZE) are
+// split into multiple segments — each with its own independent advertise/
+// request/part/proof cycle (a fresh resourceHash and random_hash per
+// segment), linked only by a shared "original_hash" (the first segment's own
+// resourceHash) and 1-based segment_index/total_segments fields — same idea
+// as real RNS.Resource's segmenting, just at a much smaller per-segment size
+// (see RESOURCE_MAX_PARTS's comment for why). Sending a large payload this
+// way to a real RNS peer works (it just processes whatever segment size we
+// advertise); *receiving* one from a real peer only works up to one segment
+// still, since a real sender only segments past 1MiB-1 and a segment that
+// large needs RNS's HMU packets (splitting a hashmap across more than one
+// packet) to receive, which isn't implemented. No *outgoing* compression
+// either (real RNS bz2-compresses by default when it shrinks the payload;
+// this project's sender never does, since it has no need to — see
+// shared/rns/compression.js for why decoding a real peer's compressed
+// transfer is still supported).
+// The receiver requests parts in a fixed-size window (see
 // index.js's Link._requestNextResourceParts()) rather than RNS.Resource's
 // adaptive window (which grows from a small starting size up toward a much
 // larger one on a fast, well-behaved link, tuned for lossy shared-bandwidth
@@ -604,22 +617,47 @@ export function lxmf_parse(decrypted, destination_hash, sender_pub) {
 // advertisement, request, part, and proof packets, and the hashing scheme
 // that ties them together — match RNS.Resource/ResourceAdvertisement's
 // format and context bytes exactly. See README's Compliance section.
+// Bytes available per Link packet in general (Channel, Request/Response) —
+// matches RNS.Link's own `self.mdu` instance attribute exactly (with RNS's
+// default Reticulum.MTU=500), computed the same way RNS.Link.handshake()
+// does: floor((MTU-IFAC_MIN_SIZE-HEADER_MINSIZE-TOKEN_OVERHEAD)/
+// AES128_BLOCKSIZE)*AES128_BLOCKSIZE - 1.
+//
+// This is a *different*, smaller value than RESOURCE_SDU below — real RNS
+// computes them differently (Resource.sdu doesn't use this AES-block-
+// rounded formula at all, see below), a distinction easy to miss since both
+// are "the per-packet payload budget" in spirit. Conflating them silently
+// produced a resource part-count mismatch that only showed up once a
+// transfer's part count crossed a boundary where the two formulas disagree
+// (found via live testing with a large multi-segment transfer — small
+// transfers happened to land on the same part count either way).
+export const LINK_MDU = Math.floor((500 - 1 - 19 - 48) / 16) * 16 - 1;
 export const RESOURCE_MAPHASH_LEN = 4;
 export const RESOURCE_RANDOM_HASH_LEN = 4;
-// Bytes per part packet — matches RNS.Link.MDU exactly (with RNS's default
-// Reticulum.MTU=500), computed the same way RNS.Link does:
-// floor((MTU-IFAC_MIN_SIZE-HEADER_MINSIZE-TOKEN_OVERHEAD)/AES128_BLOCKSIZE)
-// *AES128_BLOCKSIZE - 1. This has to match exactly, not just fit under some
+// Bytes per Resource part packet. Matches RNS.Resource.sdu exactly (with
+// RNS's default Reticulum.MTU=500 and no IFAC): `self.link.mtu -
+// HEADER_MAXSIZE - IFAC_MIN_SIZE` — notably *not* AES-block-rounded, unlike
+// LINK_MDU above. This has to match exactly, not just fit under some
 // conservative bound: a real RNS receiver computes total_parts as
-// ceil(transfer_size / its own link.mdu) independently, without reading
+// ceil(transfer_size / its own resource.sdu) independently, without reading
 // this project's `n` (part count) advertisement field at all — a mismatched
 // SDU makes the two sides disagree on how many parts there are, and RNS
 // silently drops the whole transfer as corrupt.
-export const RESOURCE_SDU = Math.floor((500 - 1 - 19 - 48) / 16) * 16 - 1;
-// Caps a resource to what fits in a single advertisement's hashmap (real RNS
-// splits larger transfers into multiple advertised segments instead) — see
-// the module comment above.
+export const RESOURCE_SDU = 500 - 35 - 1;
+// Caps a single *segment* to what fits in one advertisement's hashmap (a
+// real RNS receiver expects the whole hashmap in the initial advertisement
+// packet; RNS.Resource's own HMU context, for hashmaps too big to fit in one
+// packet, isn't implemented here). Real RNS instead segments once transfer
+// size exceeds MAX_EFFICIENT_SIZE (1MiB-1) — this project segments much
+// smaller and more often, at this per-segment part-count limit, so it never
+// needs an HMU packet for any segment it sends. See resource_prepare()'s
+// segmenting comment below for what this means for interop in each
+// direction.
 export const RESOURCE_MAX_PARTS = 128;
+// The largest raw (pre-encryption) plaintext chunk that's guaranteed to fit
+// within RESOURCE_MAX_PARTS parts after the random-hash prefix, PKCS7
+// padding, and the link Token's IV+HMAC overhead — see resource_prepare().
+export const RESOURCE_SEGMENT_MAX_SIZE = RESOURCE_MAX_PARTS * RESOURCE_SDU - 128;
 // Matches RNS.Resource.WINDOW, the window size RNS.Resource itself starts
 // at before adapting — used here as a fixed size, with no ramp-up.
 export const RESOURCE_WINDOW = 4;
@@ -628,11 +666,13 @@ export function resource_map_hash(part_data, random_hash) {
     return crypto.sha256(crypto.concat(part_data, random_hash)).slice(0, RESOURCE_MAPHASH_LEN);
 }
 
-// Encrypts and slices `plaintext` into parts for a Link Resource transfer,
-// and computes the values both sides need to identify parts and verify the
-// transfer completed intact. `link_encrypt_fn` is usually
-// `(data) => link_encrypt(link.derivedKey, data)`. Throws if the data would
-// need more than RESOURCE_MAX_PARTS parts.
+// Encrypts and slices one segment's `plaintext` into parts for a Link
+// Resource transfer, and computes the values both sides need to identify
+// parts and verify that segment completed intact. `link_encrypt_fn` is
+// usually `(data) => link_encrypt(link.derivedKey, data)`. Throws if this
+// segment alone would need more than RESOURCE_MAX_PARTS parts — callers
+// transferring more than RESOURCE_SEGMENT_MAX_SIZE bytes are expected to
+// call this once per segment (see index.js's Link.sendResource()).
 export function resource_prepare(plaintext, link_encrypt_fn) {
     const embeddedSalt = crypto.randomBytes(RESOURCE_RANDOM_HASH_LEN);
     const cipherBlob = link_encrypt_fn(crypto.concat(embeddedSalt, plaintext));
@@ -662,17 +702,26 @@ export function resource_prepare(plaintext, link_encrypt_fn) {
 }
 
 // Matches ResourceAdvertisement's msgpack field layout ({t,d,n,h,r,o,i,l,q,f,m}).
-// f (flags) only ever sets the "encrypted" bit here — compression, segment
-// splitting, has-metadata, and the request/response variants aren't
-// implemented, so those bits are always 0. i (segment_index) and l
-// (total_segments) are 1-based in real RNS — a receiver only treats a
-// resource as fully concluded once segment_index == total_segments, so a
-// single (first-and-only) segment must be numbered 1, not 0.
-export function build_resource_advertisement({ transferSize, dataSize, totalParts, resourceHash, randomHash, hashmap }) {
+// f (flags) sets the "encrypted" bit (always, this project always encrypts)
+// and the "split" bit when totalSegments > 1, matching
+// `0x00 | has_metadata<<5 | is_response<<4 | is_request<<3 | split<<2 |
+// compressed<<1 | encrypted` — has_metadata/is_response/is_request/
+// compressed aren't implemented on send, so those bits are always 0. i
+// (segment_index) and l (total_segments) are 1-based in real RNS — a
+// receiver only treats a resource as fully concluded once segment_index ==
+// total_segments, so a single (first-and-only) segment must be numbered 1,
+// not 0. originalHash defaults to resourceHash (matching a first/only
+// segment); a later segment passes the *first* segment's resourceHash here
+// instead, linking it back to the same overall transfer.
+export function build_resource_advertisement({
+    transferSize, dataSize, totalParts, resourceHash, randomHash, hashmap,
+    segmentIndex = 1, totalSegments = 1, originalHash = resourceHash,
+}) {
+    const split = totalSegments > 1 ? 0x04 : 0x00;
     const dict = {
         t: transferSize, d: dataSize, n: totalParts,
-        h: resourceHash, r: randomHash, o: resourceHash,
-        i: 1, l: 1, q: null, f: 0x01, m: hashmap,
+        h: resourceHash, r: randomHash, o: originalHash,
+        i: segmentIndex, l: totalSegments, q: null, f: 0x01 | split, m: hashmap,
     };
     return lxmfMsgpack.pack(dict);
 }
@@ -749,9 +798,8 @@ export function build_resource_proof_packet(link_id, resource_hash, proof_value)
 // CONTEXT_CHANNEL), so it's encrypted exactly like any other Link app-data
 // packet.
 //
-// This matches real RNS.Link.MDU for the project's fixed default MTU of 500
-// (see RESOURCE_SDU above) — a real Channel's MDU is `link.mdu - 6`.
-export const LINK_MDU = RESOURCE_SDU;
+// A real Channel's MDU is `link.mdu - 6`; see LINK_MDU's definition above
+// for why that's a different value than RESOURCE_SDU.
 export const CHANNEL_HEADER_SIZE = 6;
 
 export function build_channel_envelope(msgtype, sequence, data) {
@@ -808,14 +856,18 @@ export function validate_link_packet_proof(proof_packet, peer_sig_pub) {
 // big-endian header (14-bit stream_id, then an eof flag at bit 15 and a
 // compressed flag at bit 14) followed by raw chunk data.
 //
-// Decompression of a `compressed` chunk (real RNS bz2-compresses a chunk
-// when doing so shrinks it) is not implemented — same known gap as
-// RNS.Resource's `compressed` advertisements (see README's Compliance
-// section). This project's own writer never sets the flag.
+// A `compressed` chunk (real RNS bz2-compresses a chunk when doing so
+// shrinks it) is decompressed on receive (see shared/rns/compression.js and
+// shared/rns/buffer.js's RawChannelReader) — this project's own writer just
+// never sets the flag, since it has no need to compress outgoing data.
 export const CHANNEL_MSGTYPE_STREAM_DATA = 0xff00;
 export const STREAM_ID_MAX = 0x3fff;
 export const STREAM_DATA_OVERHEAD = 2 + CHANNEL_HEADER_SIZE; // header + channel envelope
 export const STREAM_DATA_MAX_LEN = LINK_MDU - STREAM_DATA_OVERHEAD;
+// Matches RawChannelWriter.MAX_CHUNK_LEN: the cap real RNS uses both for how
+// much of a single write() call it'll compress at once, and as the
+// decompression-bomb guard when unpacking a received compressed chunk.
+export const STREAM_DATA_MAX_CHUNK_LEN = 1024 * 16;
 
 export function build_stream_data_message(stream_id, data, eof = false, compressed = false) {
     const payload = data || new Uint8Array(0);
