@@ -2,6 +2,7 @@ import * as protocol from './protocol.js';
 import { EventEmitter } from 'events';
 import * as crypto from './crypto.js';
 import { pack, unpack } from 'msgpackr';
+import { Channel } from './channel.js';
 
 export class Reticulum extends EventEmitter {
     constructor() {
@@ -462,6 +463,7 @@ export class Link extends EventEmitter {
         this.pendingRequests = new Map(); // request_id hex -> { resolve, reject, timer }
         this._outgoingResources = new Map(); // resource_hash hex -> { parts, hashmapEntries, expectedProof, resolve, reject, timer }
         this._incomingResources = new Map(); // resource_hash hex -> { randomHash, hashmapEntries, parts, receivedCount }
+        this._channel = null; // lazily created by getChannel()
 
         this.initiator = true;
         this.xPrivate = crypto.private_ratchet();
@@ -500,6 +502,7 @@ export class Link extends EventEmitter {
         link.pendingRequests = new Map();
         link._outgoingResources = new Map();
         link._incomingResources = new Map();
+        link._channel = null;
 
         link.peerXPublic = parsed.peer_x_pub;
         link.peerSigPublic = parsed.peer_sig_pub;
@@ -543,6 +546,14 @@ export class Link extends EventEmitter {
         if (packet.context === protocol.CONTEXT_RESOURCE_PRF) {
             this._onResourceProof(packet.data);
             return;
+        }
+
+        // Explicit Channel packet delivery proof (context NONE, packet_type
+        // PROOF) — real RNS's only user of RNS.Packet.prove()/Link.
+        // prove_packet(). Only possible once ACTIVE and only meaningful if a
+        // Channel has actually been opened on this link.
+        if (this.status === Link.ACTIVE && this._channel && packet.context === protocol.CONTEXT_NONE) {
+            if (this._channel._onPacketProof(packet)) return;
         }
 
         if (this.status !== Link.PENDING || !this.initiator) return;
@@ -600,6 +611,11 @@ export class Link extends EventEmitter {
             this._onResourceRequest(plaintext);
         } else if (packet.context === protocol.CONTEXT_NONE) {
             this.emit('packet', plaintext);
+        } else if (packet.context === protocol.CONTEXT_CHANNEL) {
+            if (this._channel) {
+                this._sendChannelPacketProof(rawBytes);
+                this._channel._onReceive(plaintext);
+            }
         } else if (packet.context === protocol.CONTEXT_LRRTT && !this.initiator) {
             const reportedRtt = unpack(plaintext);
             this.rtt = Math.max((Date.now() - this.requestTime) / 1000, reportedRtt);
@@ -860,6 +876,22 @@ export class Link extends EventEmitter {
         this.rns.sendData(protocol.build_link_packet(this.linkId, this.derivedKey, data, protocol.CONTEXT_NONE));
     }
 
+    // Returns this link's Channel (a reliable, sequenced message layer — see
+    // shared/rns/channel.js), creating it on first use. Matches
+    // RNS.Link.get_channel().
+    getChannel() {
+        if (!this._channel) this._channel = new Channel(this);
+        return this._channel;
+    }
+
+    // Sends back an explicit packet delivery proof for a received CHANNEL
+    // packet — see protocol.js's build_link_packet_proof().
+    _sendChannelPacketProof(rawBytes) {
+        const packetHash = protocol.packet_full_hash(rawBytes);
+        const proofPacket = protocol.build_link_packet_proof(this.linkId, packetHash, this.sigPrivate);
+        this.rns.sendData(proofPacket);
+    }
+
     _startKeepalive() {
         clearInterval(this._keepaliveTimer);
         if (!this.initiator) return;
@@ -887,6 +919,7 @@ export class Link extends EventEmitter {
         }
         this._outgoingResources.clear();
         this._incomingResources.clear();
+        if (this._channel) this._channel._shutdown();
         this.emit('closed', this);
     }
 }

@@ -20,6 +20,7 @@ export const CONTEXT_RESOURCE_PRF = 0x05;
 export const CONTEXT_REQUEST = 0x09;
 export const CONTEXT_RESPONSE = 0x0a;
 export const CONTEXT_PATH_RESPONSE = 0x0b;
+export const CONTEXT_CHANNEL = 0x0e;
 export const CONTEXT_KEEPALIVE = 0xfa;
 export const CONTEXT_LINKCLOSE = 0xfc;
 export const CONTEXT_LRRTT = 0xfe;
@@ -711,4 +712,99 @@ export function build_resource_proof_packet(link_id, resource_hash, proof_value)
         header_type: 0, context_flag: 0, transport_type: 0, destination_type: DEST_LINK,
         packet_type: PACKET_PROOF, hops: 0, destination_hash: link_id, context: CONTEXT_RESOURCE_PRF, data: build_resource_proof(resource_hash, proof_value),
     });
+}
+
+// --- RNS.Channel (reliable, bidirectional, sequenced messaging over a Link) ---
+// Verified byte-for-byte against the real `rns` package: RNS.Channel.Envelope
+// wraps every message as struct.pack(">HHH", msgtype, sequence, len(data)) +
+// data — a plain 6-byte big-endian header, no further framing. The envelope
+// itself is then sent as an ordinary Link packet (build_link_packet(),
+// CONTEXT_CHANNEL), so it's encrypted exactly like any other Link app-data
+// packet.
+//
+// This matches real RNS.Link.MDU for the project's fixed default MTU of 500
+// (see RESOURCE_SDU above) — a real Channel's MDU is `link.mdu - 6`.
+export const LINK_MDU = RESOURCE_SDU;
+export const CHANNEL_HEADER_SIZE = 6;
+
+export function build_channel_envelope(msgtype, sequence, data) {
+    const payload = data || new Uint8Array(0);
+    const header = new Uint8Array(CHANNEL_HEADER_SIZE);
+    const view = new DataView(header.buffer);
+    view.setUint16(0, msgtype, false);
+    view.setUint16(2, sequence, false);
+    view.setUint16(4, payload.length, false);
+    return crypto.concat(header, payload);
+}
+
+export function parse_channel_envelope(raw) {
+    if (raw.length < CHANNEL_HEADER_SIZE) return null;
+    const view = new DataView(raw.buffer, raw.byteOffset, raw.length);
+    const msgtype = view.getUint16(0, false);
+    const sequence = view.getUint16(2, false);
+    const length = view.getUint16(4, false);
+    if (raw.length < CHANNEL_HEADER_SIZE + length) return null;
+    return { msgtype, sequence, data: raw.slice(CHANNEL_HEADER_SIZE, CHANNEL_HEADER_SIZE + length) };
+}
+
+// Explicit packet-level delivery proof (RNS.Packet.prove()/Link.prove_packet()
+// on the receiver, RNS.PacketReceipt.validate_proof_packet() on the sender).
+// In real RNS this is only ever triggered by Channel traffic (Link.receive()'s
+// CHANNEL case calls packet.prove() unconditionally whenever a channel is
+// open) — unlike RESOURCE_PRF (an HMAC-style proof over a shared secret) or
+// the destination-level identity.prove() used for LXMF opportunistic
+// delivery, this is a plain Ed25519 signature over the packet's own full
+// hash, signed with the link's own signing key (see shared/rns/index.js's
+// Link constructor for why that key is ephemeral for an initiator but the
+// real destination identity key for a responder) and verified against the
+// peer's link signing public key.
+export function build_link_packet_proof(link_id, packet_hash, sig_priv) {
+    const signature = crypto.ed25519_sign(sig_priv, packet_hash);
+    return packet_pack({
+        header_type: 0, context_flag: 0, transport_type: 0, destination_type: DEST_LINK,
+        packet_type: PACKET_PROOF, hops: 0, destination_hash: link_id, context: CONTEXT_NONE,
+        data: crypto.concat(packet_hash, signature),
+    });
+}
+
+export function validate_link_packet_proof(proof_packet, peer_sig_pub) {
+    if (proof_packet.data.length !== 32 + 64) return null;
+    const packet_hash = proof_packet.data.slice(0, 32);
+    const signature = proof_packet.data.slice(32, 96);
+    if (!crypto.ed25519_validate(signature, packet_hash, peer_sig_pub)) return null;
+    return packet_hash;
+}
+
+// --- RNS.Buffer (raw byte-stream reader/writer built on top of Channel) ---
+// Verified byte-for-byte against the real `rns` package: StreamDataMessage
+// uses Channel's system-reserved MSGTYPE 0xff00, and packs a 2-byte
+// big-endian header (14-bit stream_id, then an eof flag at bit 15 and a
+// compressed flag at bit 14) followed by raw chunk data.
+//
+// Decompression of a `compressed` chunk (real RNS bz2-compresses a chunk
+// when doing so shrinks it) is not implemented — same known gap as
+// RNS.Resource's `compressed` advertisements (see README's Compliance
+// section). This project's own writer never sets the flag.
+export const CHANNEL_MSGTYPE_STREAM_DATA = 0xff00;
+export const STREAM_ID_MAX = 0x3fff;
+export const STREAM_DATA_OVERHEAD = 2 + CHANNEL_HEADER_SIZE; // header + channel envelope
+export const STREAM_DATA_MAX_LEN = LINK_MDU - STREAM_DATA_OVERHEAD;
+
+export function build_stream_data_message(stream_id, data, eof = false, compressed = false) {
+    const payload = data || new Uint8Array(0);
+    const header_val = (stream_id & STREAM_ID_MAX) | (eof ? 0x8000 : 0) | (compressed ? 0x4000 : 0);
+    const header = new Uint8Array(2);
+    new DataView(header.buffer).setUint16(0, header_val, false);
+    return crypto.concat(header, payload);
+}
+
+export function parse_stream_data_message(raw) {
+    if (raw.length < 2) return null;
+    const header_val = new DataView(raw.buffer, raw.byteOffset, raw.length).getUint16(0, false);
+    return {
+        stream_id: header_val & STREAM_ID_MAX,
+        eof: (header_val & 0x8000) !== 0,
+        compressed: (header_val & 0x4000) !== 0,
+        data: raw.slice(2),
+    };
 }
