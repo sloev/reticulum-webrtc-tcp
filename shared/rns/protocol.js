@@ -20,6 +20,7 @@ export const CONTEXT_RESOURCE_PRF = 0x05;
 export const CONTEXT_REQUEST = 0x09;
 export const CONTEXT_RESPONSE = 0x0a;
 export const CONTEXT_PATH_RESPONSE = 0x0b;
+export const CONTEXT_CHANNEL = 0x0e;
 export const CONTEXT_KEEPALIVE = 0xfa;
 export const CONTEXT_LINKCLOSE = 0xfc;
 export const CONTEXT_LRRTT = 0xfe;
@@ -216,15 +217,21 @@ export function validate_announce(packet) {
   return { public_key, name_hash: name_hash_bytes, random_hash, ratchet, signature, app_data };
 }
 
-export function build_data(plaintext, receiver_identity_pub, receiver_ratchet_pub, full_name) {
-  const destination_hash = get_identity_destination_hash(receiver_identity_pub, full_name);
+// Matches RNS.Identity.encrypt(): the same X25519 ECDH + HKDF + AES-256-CBC +
+// HMAC-SHA256 token used for single-destination DATA packets, but as a
+// standalone operation rather than a full packet — reused as-is for
+// encrypting an LXMF message to its recipient before handing it to a
+// propagation node for store-and-forward (see propagation.js), where the
+// prefixed destination_hash needs to stay outside the ciphertext so the
+// propagation node can index by it without being able to read the message.
+export function identity_encrypt(plaintext, receiver_identity_pub, receiver_ratchet_pub) {
   const salt = identity_hash(receiver_identity_pub);
 
   const ephemeral_priv = crypto.private_ratchet();
   const ephemeral_pub = crypto.public_ratchet(ephemeral_priv);
 
-  // Matches RNS.Identity.encrypt(): use the announced ratchet if the sender
-  // has one, otherwise fall back to the receiver's primary X25519 key.
+  // Use the announced ratchet if the sender has one, otherwise fall back to
+  // the receiver's primary X25519 key.
   const target_pub = (receiver_ratchet_pub && receiver_ratchet_pub.length > 0)
       ? receiver_ratchet_pub
       : receiver_identity_pub.slice(0, 32);
@@ -238,7 +245,12 @@ export function build_data(plaintext, receiver_identity_pub, receiver_ratchet_pu
   const signed_data = crypto.concat(iv, ciphertext);
   const message_hmac = crypto.hmac_sha256(derived_key.slice(0, 32), signed_data);
 
-  const data = crypto.concat(ephemeral_pub, signed_data, message_hmac);
+  return crypto.concat(ephemeral_pub, signed_data, message_hmac);
+}
+
+export function build_data(plaintext, receiver_identity_pub, receiver_ratchet_pub, full_name) {
+  const destination_hash = get_identity_destination_hash(receiver_identity_pub, full_name);
+  const data = identity_encrypt(plaintext, receiver_identity_pub, receiver_ratchet_pub);
 
   return packet_pack({
       header_type: 0, context_flag: 0, transport_type: 0, destination_type: DEST_SINGLE,
@@ -549,26 +561,41 @@ export function lxmf_parse(decrypted, destination_hash, sender_pub) {
 // --- RNS.Resource (chunked large-transfer protocol over a Link) ---
 // A deliberately bounded implementation: single-segment only (no >
 // RESOURCE_MAX_PARTS-part transfers — real RNS splits those into multiple
-// advertised segments), no compression (real RNS bz2-compresses by default),
-// and no windowed rate-adaptation/retransmission (real RNS's Resource
-// requests parts in adaptive windows and retries on loss, tuned for lossy
-// shared-bandwidth radio links — this project's transports, WebRTC data
-// channels and TCP, are already reliable and ordered, so the receiver just
-// requests every part in one shot). The wire primitives that remain —
+// advertised segments) and no compression (real RNS bz2-compresses by
+// default). The receiver requests parts in a fixed-size window (see
+// index.js's Link._requestNextResourceParts()) rather than RNS.Resource's
+// adaptive window (which grows from a small starting size up toward a much
+// larger one on a fast, well-behaved link, tuned for lossy shared-bandwidth
+// radio links) — a real RNS sender doesn't care how a receiver paces its
+// requests (it just resends whatever's asked for from its own already-built
+// part list, unconditionally), so this fixed window is enough for genuine
+// interop with a real RNS peer in either direction, just without RNS's
+// throughput ramp-up on fast links. Also not implemented: retrying a request
+// after a timeout with no response, since this project's transports (WebRTC
+// data channels, TCP) are already reliable and ordered, unlike the lossy
+// radio links that timeout/retry logic is for. The wire primitives —
 // advertisement, request, part, and proof packets, and the hashing scheme
 // that ties them together — match RNS.Resource/ResourceAdvertisement's
 // format and context bytes exactly. See README's Compliance section.
 export const RESOURCE_MAPHASH_LEN = 4;
 export const RESOURCE_RANDOM_HASH_LEN = 4;
-// Plaintext (post link-encryption) bytes per part packet. Conservative
-// relative to a real RNS link's ~431-byte MDU, leaving headroom for this
-// project's 19-byte packet header without needing to compute an exact
-// per-platform MTU budget.
-export const RESOURCE_SDU = 400;
+// Bytes per part packet — matches RNS.Link.MDU exactly (with RNS's default
+// Reticulum.MTU=500), computed the same way RNS.Link does:
+// floor((MTU-IFAC_MIN_SIZE-HEADER_MINSIZE-TOKEN_OVERHEAD)/AES128_BLOCKSIZE)
+// *AES128_BLOCKSIZE - 1. This has to match exactly, not just fit under some
+// conservative bound: a real RNS receiver computes total_parts as
+// ceil(transfer_size / its own link.mdu) independently, without reading
+// this project's `n` (part count) advertisement field at all — a mismatched
+// SDU makes the two sides disagree on how many parts there are, and RNS
+// silently drops the whole transfer as corrupt.
+export const RESOURCE_SDU = Math.floor((500 - 1 - 19 - 48) / 16) * 16 - 1;
 // Caps a resource to what fits in a single advertisement's hashmap (real RNS
 // splits larger transfers into multiple advertised segments instead) — see
 // the module comment above.
 export const RESOURCE_MAX_PARTS = 128;
+// Matches RNS.Resource.WINDOW, the window size RNS.Resource itself starts
+// at before adapting — used here as a fixed size, with no ramp-up.
+export const RESOURCE_WINDOW = 4;
 
 export function resource_map_hash(part_data, random_hash) {
     return crypto.sha256(crypto.concat(part_data, random_hash)).slice(0, RESOURCE_MAPHASH_LEN);
@@ -610,12 +637,15 @@ export function resource_prepare(plaintext, link_encrypt_fn) {
 // Matches ResourceAdvertisement's msgpack field layout ({t,d,n,h,r,o,i,l,q,f,m}).
 // f (flags) only ever sets the "encrypted" bit here — compression, segment
 // splitting, has-metadata, and the request/response variants aren't
-// implemented, so those bits are always 0.
+// implemented, so those bits are always 0. i (segment_index) and l
+// (total_segments) are 1-based in real RNS — a receiver only treats a
+// resource as fully concluded once segment_index == total_segments, so a
+// single (first-and-only) segment must be numbered 1, not 0.
 export function build_resource_advertisement({ transferSize, dataSize, totalParts, resourceHash, randomHash, hashmap }) {
     const dict = {
         t: transferSize, d: dataSize, n: totalParts,
         h: resourceHash, r: randomHash, o: resourceHash,
-        i: 0, l: 1, q: null, f: 0x01, m: hashmap,
+        i: 1, l: 1, q: null, f: 0x01, m: hashmap,
     };
     return lxmfMsgpack.pack(dict);
 }
@@ -682,4 +712,99 @@ export function build_resource_proof_packet(link_id, resource_hash, proof_value)
         header_type: 0, context_flag: 0, transport_type: 0, destination_type: DEST_LINK,
         packet_type: PACKET_PROOF, hops: 0, destination_hash: link_id, context: CONTEXT_RESOURCE_PRF, data: build_resource_proof(resource_hash, proof_value),
     });
+}
+
+// --- RNS.Channel (reliable, bidirectional, sequenced messaging over a Link) ---
+// Verified byte-for-byte against the real `rns` package: RNS.Channel.Envelope
+// wraps every message as struct.pack(">HHH", msgtype, sequence, len(data)) +
+// data — a plain 6-byte big-endian header, no further framing. The envelope
+// itself is then sent as an ordinary Link packet (build_link_packet(),
+// CONTEXT_CHANNEL), so it's encrypted exactly like any other Link app-data
+// packet.
+//
+// This matches real RNS.Link.MDU for the project's fixed default MTU of 500
+// (see RESOURCE_SDU above) — a real Channel's MDU is `link.mdu - 6`.
+export const LINK_MDU = RESOURCE_SDU;
+export const CHANNEL_HEADER_SIZE = 6;
+
+export function build_channel_envelope(msgtype, sequence, data) {
+    const payload = data || new Uint8Array(0);
+    const header = new Uint8Array(CHANNEL_HEADER_SIZE);
+    const view = new DataView(header.buffer);
+    view.setUint16(0, msgtype, false);
+    view.setUint16(2, sequence, false);
+    view.setUint16(4, payload.length, false);
+    return crypto.concat(header, payload);
+}
+
+export function parse_channel_envelope(raw) {
+    if (raw.length < CHANNEL_HEADER_SIZE) return null;
+    const view = new DataView(raw.buffer, raw.byteOffset, raw.length);
+    const msgtype = view.getUint16(0, false);
+    const sequence = view.getUint16(2, false);
+    const length = view.getUint16(4, false);
+    if (raw.length < CHANNEL_HEADER_SIZE + length) return null;
+    return { msgtype, sequence, data: raw.slice(CHANNEL_HEADER_SIZE, CHANNEL_HEADER_SIZE + length) };
+}
+
+// Explicit packet-level delivery proof (RNS.Packet.prove()/Link.prove_packet()
+// on the receiver, RNS.PacketReceipt.validate_proof_packet() on the sender).
+// In real RNS this is only ever triggered by Channel traffic (Link.receive()'s
+// CHANNEL case calls packet.prove() unconditionally whenever a channel is
+// open) — unlike RESOURCE_PRF (an HMAC-style proof over a shared secret) or
+// the destination-level identity.prove() used for LXMF opportunistic
+// delivery, this is a plain Ed25519 signature over the packet's own full
+// hash, signed with the link's own signing key (see shared/rns/index.js's
+// Link constructor for why that key is ephemeral for an initiator but the
+// real destination identity key for a responder) and verified against the
+// peer's link signing public key.
+export function build_link_packet_proof(link_id, packet_hash, sig_priv) {
+    const signature = crypto.ed25519_sign(sig_priv, packet_hash);
+    return packet_pack({
+        header_type: 0, context_flag: 0, transport_type: 0, destination_type: DEST_LINK,
+        packet_type: PACKET_PROOF, hops: 0, destination_hash: link_id, context: CONTEXT_NONE,
+        data: crypto.concat(packet_hash, signature),
+    });
+}
+
+export function validate_link_packet_proof(proof_packet, peer_sig_pub) {
+    if (proof_packet.data.length !== 32 + 64) return null;
+    const packet_hash = proof_packet.data.slice(0, 32);
+    const signature = proof_packet.data.slice(32, 96);
+    if (!crypto.ed25519_validate(signature, packet_hash, peer_sig_pub)) return null;
+    return packet_hash;
+}
+
+// --- RNS.Buffer (raw byte-stream reader/writer built on top of Channel) ---
+// Verified byte-for-byte against the real `rns` package: StreamDataMessage
+// uses Channel's system-reserved MSGTYPE 0xff00, and packs a 2-byte
+// big-endian header (14-bit stream_id, then an eof flag at bit 15 and a
+// compressed flag at bit 14) followed by raw chunk data.
+//
+// Decompression of a `compressed` chunk (real RNS bz2-compresses a chunk
+// when doing so shrinks it) is not implemented — same known gap as
+// RNS.Resource's `compressed` advertisements (see README's Compliance
+// section). This project's own writer never sets the flag.
+export const CHANNEL_MSGTYPE_STREAM_DATA = 0xff00;
+export const STREAM_ID_MAX = 0x3fff;
+export const STREAM_DATA_OVERHEAD = 2 + CHANNEL_HEADER_SIZE; // header + channel envelope
+export const STREAM_DATA_MAX_LEN = LINK_MDU - STREAM_DATA_OVERHEAD;
+
+export function build_stream_data_message(stream_id, data, eof = false, compressed = false) {
+    const payload = data || new Uint8Array(0);
+    const header_val = (stream_id & STREAM_ID_MAX) | (eof ? 0x8000 : 0) | (compressed ? 0x4000 : 0);
+    const header = new Uint8Array(2);
+    new DataView(header.buffer).setUint16(0, header_val, false);
+    return crypto.concat(header, payload);
+}
+
+export function parse_stream_data_message(raw) {
+    if (raw.length < 2) return null;
+    const header_val = new DataView(raw.buffer, raw.byteOffset, raw.length).getUint16(0, false);
+    return {
+        stream_id: header_val & STREAM_ID_MAX,
+        eof: (header_val & 0x8000) !== 0,
+        compressed: (header_val & 0x4000) !== 0,
+        data: raw.slice(2),
+    };
 }
