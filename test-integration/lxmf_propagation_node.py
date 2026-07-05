@@ -10,8 +10,8 @@ Commands (stdin):
   {"cmd": "check_store"}
 
 Events (stdout):
-  {"event": "ready", "dest_hash": "<hex>", "public_key": "<hex>",
-   "propagation_stamp_cost": N, "propagation_stamp_cost_flexibility": N}
+  {"event": "ready", "dest_hash": "<hex>", "public_key": "<hex>", "identity_hash": "<hex>",
+   "propagation_stamp_cost": N, "propagation_stamp_cost_flexibility": N, "peering_cost": N}
   {"event": "store_status", "count": N, "keys": ["<transient_id hex>", ...]}
 """
 import sys
@@ -69,8 +69,10 @@ loglevel = 3
         "ready",
         dest_hash=router.propagation_destination.hash.hex(),
         public_key=identity.get_public_key().hex(),
+        identity_hash=identity.hash.hex(),
         propagation_stamp_cost=router.propagation_stamp_cost,
         propagation_stamp_cost_flexibility=router.propagation_stamp_cost_flexibility,
+        peering_cost=router.peering_cost,
     )
 
     def handle_command(line):

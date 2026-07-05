@@ -5,21 +5,29 @@
 // HKDF-SHA256 keyed by the message's transient_id, with a per-round salt)
 // and the stamp validity check (full_hash(workblock+stamp) interpreted as a
 // big-endian integer, must have at least `target_cost` leading zero bits) —
-// so the *cost* of a given target_cost is the same as in real LXMF. What's
-// not implemented: peering-key stamps (LXMPeer node-to-node sync isn't
-// implemented either — see propagation.js) and multi-process/worker-thread
-// parallel search (LXStamper spawns OS processes to search faster; this
-// runs single-threaded, so the same target_cost takes longer here than in
-// the reference implementation).
+// so the *cost* of a given target_cost is the same as in real LXMF.
+//
+// Also implements peering-key stamps (see generate_peering_key()/
+// validate_peering_key() below), the same proof-of-work idea applied to a
+// node-to-node peering relationship instead of a single message — used by
+// propagation.js's node-to-node sync ("/offer" protocol).
+//
+// Not implemented: multi-process/worker-thread parallel search (LXStamper
+// spawns OS processes to search faster; this runs single-threaded, so the
+// same target_cost takes longer here than in the reference implementation).
 import * as crypto from './crypto.js';
 import * as msgpack from './msgpack.js';
 
 export const STAMP_SIZE = 32; // full_hash length
 // Matches LXStamper.WORKBLOCK_EXPAND_ROUNDS_PN — the round count used for
 // propagation-node message stamps specifically (as opposed to the higher
-// round count LXMF uses for peer-to-peer message stamps, or the lower one
-// for peering keys — neither of those is implemented here).
+// round count LXMF uses for peer-to-peer message stamps, which isn't
+// implemented here).
 export const WORKBLOCK_EXPAND_ROUNDS_PN = 1000;
+// Matches LXStamper.WORKBLOCK_EXPAND_ROUNDS_PEERING — the (much cheaper)
+// round count used for a peering key, since it's generated once per peer
+// relationship rather than once per message.
+export const WORKBLOCK_EXPAND_ROUNDS_PEERING = 25;
 
 // A large, deterministic pseudo-random blob derived from `material` (a
 // message's transient_id): both generating and validating a stamp require
@@ -71,4 +79,29 @@ export function generate_stamp(material, target_cost, expand_rounds = WORKBLOCK_
         const value = stamp_value(workblock, stamp);
         if (value >= target_cost) return { stamp, value, attempts };
     }
+}
+
+// A peering key proves proof-of-work tied to a specific (responder,
+// requester) node pair, rather than to a single message — matches
+// LXStamper's `validate_peering_key(peering_id, peering_key, target_cost)`,
+// where `peering_id` is always `responder_identity.hash + requester_
+// identity.hash`, computed the same way by whichever side is checking (the
+// responder's node handling an incoming "/offer" computes it as
+// `self.identity.hash + remote_identity.hash`; the requester, generating
+// its own key ahead of time, computes it as `peer.identity.hash + router.
+// identity.hash` — the same concatenation, just derived from each side's
+// own perspective).
+export function peering_key_material(responder_identity_hash, requester_identity_hash) {
+    return crypto.concat(responder_identity_hash, requester_identity_hash);
+}
+
+export function generate_peering_key(responder_identity_hash, requester_identity_hash, target_cost) {
+    const material = peering_key_material(responder_identity_hash, requester_identity_hash);
+    return generate_stamp(material, target_cost, WORKBLOCK_EXPAND_ROUNDS_PEERING);
+}
+
+export function validate_peering_key(responder_identity_hash, requester_identity_hash, peering_key, target_cost) {
+    const material = peering_key_material(responder_identity_hash, requester_identity_hash);
+    const workblock = stamp_workblock(material, WORKBLOCK_EXPAND_ROUNDS_PEERING);
+    return stamp_valid(peering_key, target_cost, workblock);
 }

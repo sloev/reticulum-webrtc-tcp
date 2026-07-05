@@ -314,3 +314,113 @@ test('a propagation node configured with a stampCost rejects an unproven upload 
   await new Promise((r) => setTimeout(r, 50));
   assert.equal(propNode.messages.size, 1);
 });
+
+// --- Node-to-node peer sync ("/offer" protocol, peering-key stamps) ---
+
+test('validate_peering_key matches LXStamper.validate_peering_key\'s workblock (WORKBLOCK_EXPAND_ROUNDS_PEERING) byte-for-byte', () => {
+  const material = new Uint8Array(32);
+  for (let i = 0; i < 32; i++) material[i] = i;
+
+  const workblock = stamp.stamp_workblock(material, stamp.WORKBLOCK_EXPAND_ROUNDS_PEERING);
+  // Real LXStamper.stamp_workblock(material, expand_rounds=25) produces the
+  // same first 256-byte round as expand_rounds=1 (already verified above),
+  // just repeated/salted 25 times instead of 1000 — confirmed byte-for-byte
+  // against a real `LXStamper.stamp_workblock` call with expand_rounds=25.
+  assert.equal(workblock.length, 25 * 256);
+  assert.equal(
+    crypto.bytesToHex(workblock.slice(0, 32)),
+    'c025bbe68a4017092b9878de5c0819fafc668096b2208a3f1caa61563d5d7bd4'
+  );
+});
+
+test('syncToPeer() offers a stored message to another propagation node, which accepts, stores, and can serve it back to the intended recipient', async () => {
+  const rnsSender = new Reticulum();
+  const rnsNodeA = new Reticulum();
+  const rnsNodeB = new Reticulum();
+  const rnsRecipient = new Reticulum();
+  makeBridgedPair(rnsSender, rnsNodeA);
+  makeBridgedPair(rnsNodeA, rnsNodeB);
+  makeBridgedPair(rnsNodeB, rnsRecipient);
+
+  const nodeAIdentity = Identity.create();
+  const nodeA = new propagation.PropagationNode(rnsNodeA, nodeAIdentity, { peeringCost: 8 });
+  const nodeBIdentity = Identity.create();
+  const nodeB = new propagation.PropagationNode(rnsNodeB, nodeBIdentity, { peeringCost: 8 });
+
+  const senderIdentity = Identity.create();
+  const senderSelf = new Destination(rnsSender, senderIdentity, Destination.IN, Destination.SINGLE, 'lxmf', 'delivery');
+  const recipientIdentity = Identity.create();
+  const recipientSelf = new Destination(rnsRecipient, recipientIdentity, Destination.IN, Destination.SINGLE, 'lxmf', 'delivery');
+
+  const senderKnowsNodeA = new Promise((resolve) => rnsSender.once('announce', resolve));
+  const senderKnowsRecipient = new Promise((resolve) => rnsSender.on('announce', (a) => { if (crypto.bytesToHex(a.destination_hash) === crypto.bytesToHex(recipientSelf.hash)) resolve(); }));
+  const recipientKnowsSender = new Promise((resolve) => rnsRecipient.on('announce', (a) => { if (crypto.bytesToHex(a.destination_hash) === crypto.bytesToHex(senderSelf.hash)) resolve(); }));
+  nodeA.announce();
+  recipientSelf.announce();
+  senderSelf.announce();
+  await Promise.all([senderKnowsNodeA, senderKnowsRecipient, recipientKnowsSender]);
+
+  // A sender uploads a message (for a recipient neither node has a direct
+  // path to) to node A only.
+  const destOut = new Destination(rnsSender, recipientIdentity, Destination.OUT, Destination.SINGLE, 'lxmf', 'delivery');
+  const nodeAOutFromSender = new Destination(rnsSender, nodeAIdentity, Destination.OUT, Destination.SINGLE, 'lxmf', 'propagation');
+  const senderLink = new Link(rnsSender, nodeAOutFromSender);
+  await new Promise((resolve) => senderLink.once('established', resolve));
+  await propagation.propagateLXMF(senderLink, destOut, senderSelf, 'peer sync', 'hello via node A then node B', {});
+  senderLink.close();
+
+  assert.equal(nodeA.messages.size, 1);
+  assert.equal(nodeB.messages.size, 0);
+
+  // Node A syncs its stored messages to node B.
+  const nodeBOutFromA = new Destination(rnsNodeA, nodeBIdentity, Destination.OUT, Destination.SINGLE, 'lxmf', 'propagation');
+  const peerLink = new Link(rnsNodeA, nodeBOutFromA);
+  await new Promise((resolve) => peerLink.once('established', resolve));
+
+  const result = await propagation.syncToPeer(nodeA, peerLink, nodeB.identity, { peeringCost: 8 });
+  assert.equal(result.offered, 1);
+  assert.equal(result.synced, 1);
+  assert.equal(nodeB.messages.size, 1);
+
+  // A second sync attempt has nothing new to offer.
+  const result2 = await propagation.syncToPeer(nodeA, peerLink, nodeB.identity, { peeringCost: 8 });
+  assert.equal(result2.offered, 0);
+  assert.equal(result2.synced, 0);
+  peerLink.close();
+
+  // The recipient, connecting only to node B, gets the message that
+  // originally reached the store via node A.
+  const nodeBOutFromRecipient = new Destination(rnsRecipient, nodeBIdentity, Destination.OUT, Destination.SINGLE, 'lxmf', 'propagation');
+  const recipientLink = new Link(rnsRecipient, nodeBOutFromRecipient);
+  await new Promise((resolve) => recipientLink.once('established', resolve));
+
+  const messages = await propagation.syncLXMF(recipientLink, recipientSelf);
+  assert.equal(messages.length, 1);
+  assert.equal(messages[0].valid, true);
+  assert.equal(new TextDecoder().decode(messages[0].content), 'hello via node A then node B');
+  assert.equal(crypto.bytesToHex(messages[0].source_hash), crypto.bytesToHex(senderSelf.hash));
+
+  recipientLink.close();
+});
+
+test('a propagation node rejects an /offer whose peering key does not meet its required peeringCost', async () => {
+  const rnsNodeA = new Reticulum();
+  const rnsNodeB = new Reticulum();
+  makeBridgedPair(rnsNodeA, rnsNodeB);
+
+  const nodeAIdentity = Identity.create();
+  const nodeA = new propagation.PropagationNode(rnsNodeA, nodeAIdentity, { peeringCost: 8 });
+  const nodeBIdentity = Identity.create();
+  const nodeB = new propagation.PropagationNode(rnsNodeB, nodeBIdentity, { peeringCost: 20 }); // requires a much higher cost than A will generate
+
+  const nodeBOutFromA = new Destination(rnsNodeA, nodeBIdentity, Destination.OUT, Destination.SINGLE, 'lxmf', 'propagation');
+  const peerLink = new Link(rnsNodeA, nodeBOutFromA);
+  await new Promise((resolve) => peerLink.once('established', resolve));
+
+  peerLink.identify(nodeA.identity);
+  const { stamp: lowCostKey } = stamp.generate_peering_key(nodeBIdentity.hash, nodeAIdentity.hash, 8);
+  const response = await peerLink.request('/offer', [lowCostKey, []]);
+  assert.equal(response, 0xf3);
+
+  peerLink.close();
+});
