@@ -16,6 +16,7 @@ export const CONTEXT_NONE = 0x00;
 export const CONTEXT_RESOURCE = 0x01;
 export const CONTEXT_RESOURCE_ADV = 0x02;
 export const CONTEXT_RESOURCE_REQ = 0x03;
+export const CONTEXT_RESOURCE_HMU = 0x04;
 export const CONTEXT_RESOURCE_PRF = 0x05;
 export const CONTEXT_REQUEST = 0x09;
 export const CONTEXT_RESPONSE = 0x0a;
@@ -634,6 +635,11 @@ export function lxmf_parse(decrypted, destination_hash, sender_pub) {
 export const LINK_MDU = Math.floor((500 - 1 - 19 - 48) / 16) * 16 - 1;
 export const RESOURCE_MAPHASH_LEN = 4;
 export const RESOURCE_RANDOM_HASH_LEN = 4;
+// Matches RNS.ResourceAdvertisement.HASHMAP_MAX_LEN: how many map hashes fit
+// in one advertisement packet, bounded by the link MDU. A transfer with more
+// parts than this needs HMU (hashmap update) packets to deliver the rest of
+// the hashmap incrementally — see Link._onResourceAdvertisement/_onHashmapUpdate.
+export const RESOURCE_HASHMAP_MAX_LEN = Math.floor((LINK_MDU - 134) / RESOURCE_MAPHASH_LEN);
 // Bytes per Resource part packet. Matches RNS.Resource.sdu exactly (with
 // RNS's default Reticulum.MTU=500 and no IFAC): `self.link.mtu -
 // HEADER_MAXSIZE - IFAC_MIN_SIZE` — notably *not* AES-block-rounded, unlike
@@ -644,15 +650,18 @@ export const RESOURCE_RANDOM_HASH_LEN = 4;
 // SDU makes the two sides disagree on how many parts there are, and RNS
 // silently drops the whole transfer as corrupt.
 export const RESOURCE_SDU = 500 - 35 - 1;
-// Caps a single *segment* to what fits in one advertisement's hashmap (a
-// real RNS receiver expects the whole hashmap in the initial advertisement
-// packet; RNS.Resource's own HMU context, for hashmaps too big to fit in one
-// packet, isn't implemented here). Real RNS instead segments once transfer
-// size exceeds MAX_EFFICIENT_SIZE (1MiB-1) — this project segments much
-// smaller and more often, at this per-segment part-count limit, so it never
-// needs an HMU packet for any segment it sends. See resource_prepare()'s
-// segmenting comment below for what this means for interop in each
-// direction.
+// Caps a single *segment* on the send side: this project's own sender always
+// includes the whole hashmap in the initial advertisement packet rather than
+// truncating it to RESOURCE_HASHMAP_MAX_LEN and sending the rest via HMU
+// packets on request (both a real receiver and this project's own receiver
+// tolerate an advertisement's hashmap being larger than what real RNS itself
+// would ever send in one packet — the size limit is a real-RNS sender-side
+// packing choice, not a receiver-side validation rule). Real RNS instead
+// segments once transfer size exceeds MAX_EFFICIENT_SIZE (1MiB-1) — this
+// project segments much smaller and more often, at this per-segment
+// part-count limit. Receiving a segment larger than this from a *real* RNS
+// sender (which does truncate its hashmap and expects HMU requests) is
+// supported — see Link._onResourceAdvertisement/_onHashmapUpdate.
 export const RESOURCE_MAX_PARTS = 128;
 // The largest raw (pre-encryption) plaintext chunk that's guaranteed to fit
 // within RESOURCE_MAX_PARTS parts after the random-hash prefix, PKCS7
@@ -766,22 +775,43 @@ export function parse_resource_advertisement(data) {
 }
 
 // Matches Resource.request_next()'s request_data layout: a hashmap-exhausted
-// flag byte (always "not exhausted" here, since this implementation always
-// requests every part in one shot — see the module comment above) + the
-// resource hash + the requested map hashes concatenated.
-export function build_resource_request(resource_hash, requested_hashes) {
-    return crypto.concat(new Uint8Array([0x00]), resource_hash, requested_hashes);
+// flag byte (0xff + the last known map hash, when this receiver has used up
+// every hashmap entry it's been sent and needs more via HMU; 0x00 otherwise)
+// + the resource hash + the requested map hashes concatenated.
+export function build_resource_request(resource_hash, requested_hashes, { lastMapHash = null } = {}) {
+    const prefix = lastMapHash ? crypto.concat(new Uint8Array([0xff]), lastMapHash) : new Uint8Array([0x00]);
+    return crypto.concat(prefix, resource_hash, requested_hashes);
 }
 
 export function parse_resource_request(data) {
-    const hashmapExhausted = data[0];
-    const resourceHash = data.slice(1, 33);
-    const requestedHashesRaw = data.slice(33);
+    const hashmapExhausted = data[0] === 0xff;
+    let offset = 1;
+    let lastMapHash = null;
+    if (hashmapExhausted) {
+        lastMapHash = data.slice(1, 1 + RESOURCE_MAPHASH_LEN);
+        offset = 1 + RESOURCE_MAPHASH_LEN;
+    }
+    const resourceHash = data.slice(offset, offset + 32);
+    const requestedHashesRaw = data.slice(offset + 32);
     const requestedHashes = [];
     for (let i = 0; i < requestedHashesRaw.length; i += RESOURCE_MAPHASH_LEN) {
         requestedHashes.push(requestedHashesRaw.slice(i, i + RESOURCE_MAPHASH_LEN));
     }
-    return { hashmapExhausted, resourceHash, requestedHashes };
+    return { hashmapExhausted, lastMapHash, resourceHash, requestedHashes };
+}
+
+// Matches RNS.Resource's hashmap-update (HMU) packet: resource_hash (32
+// bytes) + msgpack([segment_index, hashmap_chunk_bytes]) — sent by a sender
+// in response to a request whose hashmap-exhausted flag is set, carrying the
+// next chunk of a hashmap too large to fit in the initial advertisement.
+export function build_resource_hmu(resource_hash, segment, hashmap_chunk) {
+    return crypto.concat(resource_hash, lxmfMsgpack.pack([segment, hashmap_chunk]));
+}
+
+export function parse_resource_hmu(data) {
+    const resourceHash = data.slice(0, 32);
+    const [segment, hashmap] = lxmfMsgpack.unpack(data.slice(32));
+    return { resourceHash, segment, hashmap };
 }
 
 // Resource part packets carry a raw ciphertext slice, unencrypted at the

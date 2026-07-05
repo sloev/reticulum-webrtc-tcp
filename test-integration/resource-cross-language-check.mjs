@@ -161,6 +161,20 @@ py.stdin.write(JSON.stringify({ cmd: 'send_resource', hex: pyToJsCompressibleHex
 const jsCompressedResourceData = await jsGotCompressedResource;
 assertEqual(Buffer.from(jsCompressedResourceData).toString('utf-8'), pyToJsCompressiblePayload, 'JS correctly decompressed and reassembled a bz2-compressed resource sent by real Python RNS.Resource');
 
+// --- Python -> JS: a single segment large enough (>74 parts, i.e. bigger
+// than RESOURCE_HASHMAP_MAX_LEN entries) that a real RNS.Resource sender
+// truncates its advertisement's hashmap and expects an HMU (hashmap update)
+// exchange to deliver the rest — exercises this stack's receive-side HMU
+// support (shared/rns/index.js's _onHashmapUpdate) against the real
+// reference implementation, not just against itself. High-entropy so it
+// stays uncompressed, keeping the part count purely a function of size. ---
+const pyToJsHmuPayload = crypto.randomBytes(40000);
+const pyToJsHmuHex = crypto.bytesToHex(pyToJsHmuPayload);
+const jsGotHmuResource = new Promise((resolve) => link.once('resource', resolve));
+py.stdin.write(JSON.stringify({ cmd: 'send_resource', hex: pyToJsHmuHex }) + '\n');
+const jsHmuResourceData = await jsGotHmuResource;
+assertEqual(crypto.bytesToHex(jsHmuResourceData), pyToJsHmuHex, 'JS correctly reassembled a large single-segment resource from real Python RNS.Resource, requiring an HMU exchange');
+
 link.close();
 py.kill();
 gateway.server.close();

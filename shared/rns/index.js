@@ -653,6 +653,8 @@ export class Link extends EventEmitter {
             this._onResourceAdvertisement(plaintext);
         } else if (packet.context === protocol.CONTEXT_RESOURCE_REQ) {
             this._onResourceRequest(plaintext);
+        } else if (packet.context === protocol.CONTEXT_RESOURCE_HMU) {
+            this._onHashmapUpdate(plaintext);
         } else if (packet.context === protocol.CONTEXT_NONE) {
             this.emit('packet', plaintext);
         } else if (packet.context === protocol.CONTEXT_CHANNEL) {
@@ -772,7 +774,11 @@ export class Link extends EventEmitter {
 
     // Receiver side: a peer advertised a Resource transfer. Always accepts
     // (no accept/reject callback, unlike real RNS) and starts requesting
-    // parts in fixed-size windows (see _requestNextResourceParts below).
+    // parts in fixed-size windows (see _requestNextResourceParts below). The
+    // advertisement's hashmap may be shorter than totalParts (a real sender
+    // truncates it to RESOURCE_HASHMAP_MAX_LEN entries per packet) — the
+    // rest arrives via HMU packets, requested as needed (see
+    // _onHashmapUpdate below).
     _onResourceAdvertisement(plaintext) {
         let adv;
         try {
@@ -783,8 +789,9 @@ export class Link extends EventEmitter {
         if (adv.hasMetadata) return; // not implemented — see protocol.js
         if (!adv.totalParts || adv.totalParts > protocol.RESOURCE_MAX_PARTS) return;
 
+        const knownEntries = Math.min(adv.totalParts, Math.floor(adv.hashmap.length / protocol.RESOURCE_MAPHASH_LEN));
         const hashmapEntries = [];
-        for (let i = 0; i < adv.totalParts; i++) {
+        for (let i = 0; i < knownEntries; i++) {
             hashmapEntries.push(adv.hashmap.slice(i * protocol.RESOURCE_MAPHASH_LEN, (i + 1) * protocol.RESOURCE_MAPHASH_LEN));
         }
 
@@ -793,7 +800,7 @@ export class Link extends EventEmitter {
             randomHash: adv.randomHash, resourceHash: adv.resourceHash, compressed: adv.compressed,
             segmentIndex: adv.segmentIndex, totalSegments: adv.totalSegments, originalHash: adv.originalHash,
             hashmapEntries, parts: new Array(adv.totalParts).fill(null),
-            receivedCount: 0, consecutiveCompletedHeight: -1, outstandingParts: 0,
+            receivedCount: 0, consecutiveCompletedHeight: -1, outstandingParts: 0, waitingForHmu: false,
             // Rate-adaptive request window — matches RNS.Resource's own
             // starting values (see protocol.js's RESOURCE_WINDOW* constants).
             window: protocol.RESOURCE_WINDOW,
@@ -809,29 +816,54 @@ export class Link extends EventEmitter {
         this._requestNextResourceParts(resourceHashHex);
     }
 
+    // A sender's response to a hashmap-exhausted request: the next chunk of
+    // map hashes for a transfer whose hashmap didn't fit in one
+    // advertisement. Matches RNS.Resource.hashmap_update() — appends the new
+    // entries and resumes requesting parts.
+    _onHashmapUpdate(plaintext) {
+        const { resourceHash, hashmap } = protocol.parse_resource_hmu(plaintext);
+        const resourceHashHex = crypto.bytesToHex(resourceHash);
+        const incoming = this._incomingResources.get(resourceHashHex);
+        if (!incoming) return;
+
+        for (let i = 0; i < hashmap.length; i += protocol.RESOURCE_MAPHASH_LEN) {
+            incoming.hashmapEntries.push(hashmap.slice(i, i + protocol.RESOURCE_MAPHASH_LEN));
+        }
+        incoming.waitingForHmu = false;
+        this._requestNextResourceParts(resourceHashHex);
+    }
+
     // Requests the next window's worth of not-yet-received parts, starting
     // right after the longest known consecutive run of received parts —
     // matches RNS.Resource.request_next(), including its rate-adaptive
     // window size (see _onResourcePart() below for how the window grows/its
-    // ceiling is promoted).
+    // ceiling is promoted) and requesting more hashmap via HMU once the
+    // known entries run out short of the transfer's real total_parts.
     _requestNextResourceParts(resourceHashHex) {
         const incoming = this._incomingResources.get(resourceHashHex);
-        if (!incoming) return;
+        if (!incoming || incoming.waitingForHmu) return;
 
         const requested = [];
         incoming.outstandingParts = 0;
-        for (let i = incoming.consecutiveCompletedHeight + 1; i < incoming.hashmapEntries.length && requested.length < incoming.window; i++) {
+        let exhausted = false;
+        for (let i = incoming.consecutiveCompletedHeight + 1; requested.length < incoming.window && i < incoming.parts.length; i++) {
+            if (i >= incoming.hashmapEntries.length) {
+                exhausted = true;
+                break;
+            }
             if (incoming.parts[i] === null) {
                 requested.push(incoming.hashmapEntries[i]);
                 incoming.outstandingParts++;
             }
         }
-        if (requested.length === 0) return;
+        if (requested.length === 0 && !exhausted) return;
 
         incoming.reqSentAt = Date.now();
         incoming.rttRxdBytesAtPartReq = incoming.rttRxdBytes;
+        incoming.waitingForHmu = exhausted;
 
-        const requestPayload = protocol.build_resource_request(incoming.resourceHash, crypto.concat(...requested));
+        const lastMapHash = exhausted ? incoming.hashmapEntries[incoming.hashmapEntries.length - 1] : null;
+        const requestPayload = protocol.build_resource_request(incoming.resourceHash, crypto.concat(...requested), { lastMapHash });
         const requestPacket = protocol.build_link_packet(this.linkId, this.derivedKey, requestPayload, protocol.CONTEXT_RESOURCE_REQ);
         this.rns.sendData(requestPacket);
     }
@@ -886,7 +918,7 @@ export class Link extends EventEmitter {
                 cp++;
             }
 
-            if (incoming.receivedCount === incoming.hashmapEntries.length) {
+            if (incoming.receivedCount === incoming.parts.length) {
                 this._assembleResource(resourceHashHex, incoming);
             } else if (incoming.outstandingParts <= 0) {
                 this._growResourceWindow(incoming);

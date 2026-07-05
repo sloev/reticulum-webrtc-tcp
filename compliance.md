@@ -85,7 +85,7 @@ reason).
 | Incoming bz2 decompression | `RNS/Resource.py` assemble | `shared/rns/compression.js` `bz2_decompress` | DONE | live (real compressed data) |
 | Rate-adaptive request window | `RNS/Resource.py:58–99` (`WINDOW=4, WINDOW_MIN=2, WINDOW_MAX_SLOW=10, WINDOW_MAX_FAST=75, WINDOW_FLEXIBILITY=4, RATE_FAST=(50*1000)/8, RATE_VERY_SLOW=(2*1000)/8`), ramp at `:900–924` | `shared/rns/index.js` `Link._growResourceWindow/_requestNextResourceParts` | PARTIAL — growth + fast/very-slow-rate window_max promotion/demotion implemented; retry-driven shrinking not (no per-part retry/timeout mechanism exists) | unit test (window grows over multiple rounds, monotonic) + live (`test:integration:resource` re-verified, incl. a real `RNS.Resource` sender's ~180KB multi-segment transfer) |
 | Outgoing bz2 compression | `RNS/Resource.py` (compress-if-beneficial policy, :384-421, `AUTO_COMPRESS_MAX_SIZE=64MiB` :124,364) | `shared/rns/compression.js` `bz2_compress/bz2_compress_if_beneficial`, wired into `Link._sendResourceSegment` (Resource) and `buffer.js`'s `RawChannelWriter.write` (Buffer, per-chunk) | DONE | byte-exact (matches real `bz2.compress()` output exactly) + live (`test:integration:resource`/`:channel`: real `RNS.Resource`/`RNS.Buffer` explicitly report `compressed=True`) + real headless-Chromium production-build test |
-| HMU (hashmap update) receive path, large single segments | `RNS/Resource.py:483–499` `hashmap_update_packet`, `HASHMAP_IS_EXHAUSTED=0xFF` (:140), `:953–960` | — | MISSING — can't receive a real segment > `RESOURCE_SEGMENT_MAX_SIZE` | **Phase 2.3** |
+| HMU (hashmap update) receive path, large single segments | `RNS/Resource.py:483–499` `hashmap_update_packet`, `HASHMAP_IS_EXHAUSTED=0xFF` (:140), `:953–960` | `shared/rns/index.js` `Link._onHashmapUpdate/_requestNextResourceParts`, `shared/rns/protocol.js` `build/parse_resource_hmu`, `RESOURCE_HASHMAP_MAX_LEN` | DONE — receive side only (this project's own sender still never truncates its hashmap, so it never needs to *send* HMU) | unit tests (wire round-trip + a hand-built truncated-advertisement transfer) + live (`test:integration:resource`: a real 40000-byte/~87-part `RNS.Resource` transfer, which a real sender truncates past `RESOURCE_HASHMAP_MAX_LEN`=74 entries, completes correctly via a genuine HMU exchange) |
 | Channel (envelope, proofs, RTT-adaptive send window) | `RNS/Channel.py` | `shared/rns/channel.js` | DONE | byte-exact + live both directions |
 | Buffer (stream reader/writer, compressed chunks) | `RNS/Buffer.py` | `shared/rns/buffer.js` | DONE | live both directions |
 
@@ -268,14 +268,35 @@ high-entropy one) and `test:integration:channel` (real `RNS.Buffer` correctly re
 compressed JS-sent stream); a real headless-Chromium session running the actual
 `vite build` production bundle.
 
-**2.3 HMU receive path + larger segments.** Read `Resource.py` hashmap flow: the
-advertisement carries only the first hashmap slice; the receiver requests parts and,
-when its hashmap is exhausted (`HASHMAP_IS_EXHAUSTED=0xFF` marker in the part request,
-:953–960), the sender answers with `CONTEXT_RESOURCE_HMU` packets
-(`hashmap_update_packet`, :483–499, msgpack `[segment, hashmap_bytes]`). Implement both
-directions; then raise send-side segmentation from `RESOURCE_SEGMENT_MAX_SIZE` (~58 KB)
-toward `MAX_EFFICIENT_SIZE = 1 MiB − 1`. Live: Python sends a single ≥ 200 KB segment
-(forces HMU on our receiver); JS sends ≥ 200 KB in one segment to a real receiver.
+**2.3 HMU receive path. ✅ Done (receive side).**
+
+Implemented in `shared/rns/protocol.js` (`CONTEXT_RESOURCE_HMU=0x04`, `RESOURCE_HASHMAP_MAX_LEN
+= floor((LINK_MDU-134)/RESOURCE_MAPHASH_LEN)` = 74 at the default MTU, matching
+`ResourceAdvertisement.HASHMAP_MAX_LEN` exactly; `build/parse_resource_request` extended for
+the exhausted-flag-plus-last-map-hash form; `build/parse_resource_hmu` for the HMU packet
+itself) and `shared/rns/index.js` (`Link._onResourceAdvertisement` now only fills in as many
+`hashmapEntries` as the advertisement actually included, rather than assuming it always covers
+every part; `_requestNextResourceParts` detects running out of known entries mid-window and
+sends an exhausted-flagged request instead of just stopping; `_onHashmapUpdate` appends the
+next chunk and resumes; `_onResourcePart`'s completion check now compares against the true
+`parts.length` rather than the possibly-still-partial `hashmapEntries.length`).
+
+**Send side intentionally not implemented**: this project's own sender still always includes
+the whole hashmap in one advertisement regardless of size (see 2.1's `RESOURCE_SEGMENT_MAX_SIZE`
+note) — both a real RNS receiver and this project's own receiver already tolerate that (the
+`HASHMAP_MAX_LEN` limit is a real-RNS *sender's* own packet-fitting choice, not a receiver-side
+rule), so there was nothing broken to fix, and truncating our sender's own advertisements would
+mean also implementing genuine send-side HMU-response generation — a distinct, separable
+addition with no interop benefit today, left for later. Raising send-side segmentation toward
+`MAX_EFFICIENT_SIZE` (1 MiB−1) is bundled with that same later step, for the same reason.
+
+Verified: unit tests (`test/rns-compliance.test.js`) — wire-format round-trip for both new
+message shapes, and a full transfer built by hand with an advertisement hashmap deliberately
+truncated to 3 of 7 entries, confirming the request-exhausted → HMU → resume flow completes
+correctly end to end. Live: `test:integration:resource` — a real `RNS.Resource` sender given a
+40000-byte (~87-part, safely over the 74-entry threshold) payload correctly truncates its own
+advertisement and this project's receiver correctly requests, receives, and applies the HMU
+packet to reassemble it (re-run twice for stability).
 
 ### Phase 3 — Request/Response Resource fallback
 
@@ -382,3 +403,4 @@ its "verified by" filled in; remove stale caveats elsewhere (module comments cit
 | 2026-07-05 | Phase 1 | Link's RTT-adaptive keepalive/stale/timeout state machine implemented, plus a real bug fix (made `stamp.generate_stamp()`/`generate_peering_key()` non-blocking — see Phase 1 writeup). 51/51 unit tests pass; live `resource`/`channel`/`lxmf-propagation`/`lxmf-peer-sync` checks re-verified. |
 | 2026-07-05 | Phase 2.1 | Resource's rate-adaptive request window (growth + fast/very-slow-rate `window_max` promotion/demotion) implemented; retry-driven shrinking scoped out (no per-part retry mechanism exists). 52/52 unit tests pass; live `test:integration:resource` re-verified in both directions. |
 | 2026-07-05 | Phase 2.2 | Outgoing bz2 compression implemented for Resource and Buffer via `bzip2-wasm` (a WASM build of the real reference `libbzip2`, chosen over the GPL-licensed `compressjs`). Byte-exact vs real `bz2.compress()`; live checks confirm real `RNS.Resource`/`RNS.Buffer` explicitly recognize JS-compressed transfers; verified working in the actual production browser build via real headless Chromium (a dev-server-only WASM pre-bundling quirk was found and mitigated, doesn't affect the deployed demo). 54/54 unit tests pass. |
+| 2026-07-05 | Phase 2.3 | Resource HMU (hashmap update) receive path implemented — this project's receiver can now complete a transfer whose advertisement doesn't include the whole hashmap upfront, matching real RNS's `HASHMAP_MAX_LEN`-based truncation exactly. Send-side truncation/HMU-response scoped out (nothing currently needs it). 57/57 unit tests pass; live `test:integration:resource` confirms a genuine HMU exchange with a real ~87-part `RNS.Resource` sender (re-verified twice). Phase 2 (Resource parity) is now complete. |

@@ -588,6 +588,115 @@ test('resource_prepare() throws if a single segment alone would still need more 
   assert.throws(() => protocol.resource_prepare(tooBig, (pt) => pt));
 });
 
+test('build_resource_request()/parse_resource_request() round-trip both the plain and hashmap-exhausted forms, matching RNS.Resource.request_next()\'s layout', () => {
+  const resourceHash = crypto.randomBytes(32);
+  const requestedHashes = crypto.concat(crypto.randomBytes(4), crypto.randomBytes(4));
+
+  const plain = protocol.build_resource_request(resourceHash, requestedHashes);
+  assert.equal(plain[0], 0x00);
+  const parsedPlain = protocol.parse_resource_request(plain);
+  assert.equal(parsedPlain.hashmapExhausted, false);
+  assert.equal(parsedPlain.lastMapHash, null);
+  assert.equal(crypto.bytesToHex(parsedPlain.resourceHash), crypto.bytesToHex(resourceHash));
+  assert.equal(parsedPlain.requestedHashes.length, 2);
+
+  const lastMapHash = crypto.randomBytes(4);
+  const exhausted = protocol.build_resource_request(resourceHash, requestedHashes, { lastMapHash });
+  assert.equal(exhausted[0], 0xff);
+  const parsedExhausted = protocol.parse_resource_request(exhausted);
+  assert.equal(parsedExhausted.hashmapExhausted, true);
+  assert.equal(crypto.bytesToHex(parsedExhausted.lastMapHash), crypto.bytesToHex(lastMapHash));
+  assert.equal(crypto.bytesToHex(parsedExhausted.resourceHash), crypto.bytesToHex(resourceHash));
+  assert.equal(parsedExhausted.requestedHashes.length, 2);
+});
+
+test('build_resource_hmu()/parse_resource_hmu() round-trip, matching RNS.Resource\'s hashmap-update packet layout', () => {
+  const resourceHash = crypto.randomBytes(32);
+  const hashmapChunk = crypto.concat(crypto.randomBytes(4), crypto.randomBytes(4), crypto.randomBytes(4));
+
+  const packed = protocol.build_resource_hmu(resourceHash, 1, hashmapChunk);
+  const parsed = protocol.parse_resource_hmu(packed);
+  assert.equal(crypto.bytesToHex(parsed.resourceHash), crypto.bytesToHex(resourceHash));
+  assert.equal(parsed.segment, 1);
+  assert.equal(crypto.bytesToHex(parsed.hashmap), crypto.bytesToHex(hashmapChunk));
+});
+
+test('a Resource transfer whose advertisement carries a truncated hashmap (fewer entries than totalParts) is completed via an HMU packet, matching how a real RNS sender with a large single segment behaves', async () => {
+  const rnsA = new Reticulum();
+  const rnsB = new Reticulum();
+  class Bridge extends Interface {
+    connect() {}
+    sendData(data) { setTimeout(() => this.other.rns.onPacketReceived(data, this.other), 0); }
+  }
+  const ifaceA = new Bridge('A');
+  const ifaceB = new Bridge('B');
+  ifaceA.other = ifaceB;
+  ifaceB.other = ifaceA;
+  rnsA.addInterface(ifaceA);
+  rnsB.addInterface(ifaceB);
+
+  const identityB = Identity.create();
+  const destB = new Destination(rnsB, identityB, Destination.IN, Destination.SINGLE, 'test', 'hmu');
+  const responderLinkPromise = new Promise((resolve) => destB.on('link', resolve));
+  const outDest = new Destination(rnsA, identityB, Destination.OUT, Destination.SINGLE, 'test', 'hmu');
+  outDest.hash = destB.hash;
+  const initiatorLink = new Link(rnsA, outDest);
+  await new Promise((resolve) => initiatorLink.once('established', resolve));
+  const responderLink = await responderLinkPromise;
+  await new Promise((resolve) => (responderLink.status === Link.ACTIVE ? resolve() : responderLink.once('established', resolve)));
+
+  // Build a resource "by hand" with a hashmap deliberately truncated to
+  // fewer entries than totalParts, simulating a real RNS sender whose
+  // segment needs more parts than fit in one advertisement — then confirm
+  // this stack's own receiver correctly requests and applies an HMU packet
+  // to complete it, exactly like it would with a real Python sender.
+  const payload = crypto.randomBytes(protocol.RESOURCE_SDU * 6);
+  const prepared = protocol.resource_prepare(payload, (pt) => protocol.link_encrypt(initiatorLink.derivedKey, pt));
+  const truncateTo = 3;
+  assert.ok(prepared.totalParts > truncateTo, 'test payload must need more parts than the simulated truncation point');
+
+  const advPayload = protocol.build_resource_advertisement({
+    transferSize: prepared.transferSize, dataSize: prepared.dataSize, totalParts: prepared.totalParts,
+    resourceHash: prepared.resourceHash, randomHash: prepared.randomHash,
+    hashmap: prepared.hashmap.slice(0, truncateTo * protocol.RESOURCE_MAPHASH_LEN),
+  });
+  const advPacket = protocol.build_link_packet(initiatorLink.linkId, initiatorLink.derivedKey, advPayload, protocol.CONTEXT_RESOURCE_ADV);
+
+  const responderGotResource = new Promise((resolve) => responderLink.once('resource', resolve));
+
+  // Manually stand in for the sender: serve part requests, and — since our
+  // hand-built advertisement only advertised `truncateTo` entries — answer
+  // the hashmap-exhausted request with the rest of the real hashmap via HMU.
+  // REQUEST packets flow responder (B) -> initiator (A), so they're
+  // intercepted on ifaceB's outgoing side; replies are sent via rnsA.sendData
+  // (A's own broadcast path, same as the advertisement above), which the
+  // Bridge delivers to B, exactly like a real sender's traffic would.
+  const originalBridgeSendData = Bridge.prototype.sendData;
+  ifaceB.sendData = function (data) {
+    const unpacked = protocol.packet_unpack(data);
+    if (unpacked && unpacked.context === protocol.CONTEXT_RESOURCE_REQ) {
+      const plaintext = protocol.link_decrypt(initiatorLink.derivedKey, unpacked.data);
+      const req = protocol.parse_resource_request(plaintext);
+      for (const wantedHash of req.requestedHashes) {
+        const idx = prepared.hashmapEntries.findIndex((h) => crypto.bytesToHex(h) === crypto.bytesToHex(wantedHash));
+        if (idx !== -1) rnsA.sendData(protocol.build_resource_part_packet(initiatorLink.linkId, prepared.parts[idx]));
+      }
+      if (req.hashmapExhausted) {
+        const hmuPayload = protocol.build_resource_hmu(prepared.resourceHash, 1, prepared.hashmap.slice(truncateTo * protocol.RESOURCE_MAPHASH_LEN));
+        rnsA.sendData(protocol.build_link_packet(initiatorLink.linkId, initiatorLink.derivedKey, hmuPayload, protocol.CONTEXT_RESOURCE_HMU));
+      }
+      return;
+    }
+    originalBridgeSendData.call(this, data);
+  };
+
+  rnsA.sendData(advPacket);
+  const received = await responderGotResource;
+  assert.equal(crypto.bytesToHex(received), crypto.bytesToHex(payload));
+
+  initiatorLink.close();
+});
+
 // --- RNS.Transport: path requests/responses ---
 
 test('path request destination hash and packet match RNS byte-for-byte', () => {
