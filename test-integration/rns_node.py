@@ -12,7 +12,7 @@ Commands (stdin, one JSON object per line):
   {"cmd": "send_lxmf", "dest_hash": "<hex>", "title": "...", "content": "..."}
   {"cmd": "send_resource", "text": "..."}
   {"cmd": "channel_send", "hex": "..."} — sends over a real RNS.Channel (get_channel())
-  {"cmd": "buffer_send", "hex": "..."} — sends over a real RNS.Buffer (stream id 1), then eof
+  {"cmd": "buffer_send", "hex": "...", "stream_id": 1} — sends over a real RNS.Buffer, then eof (stream_id defaults to 1)
 
 Events (stdout, one JSON object per line):
   {"event": "ready", "dest_hash": "<hex>", "identity_hash": "<hex>", "public_key": "<hex>", "lxmf_dest_hash": "<hex>"}
@@ -251,7 +251,7 @@ loglevel = 3
                 emit("send_failed", reason="no channel")
                 return
             payload = bytes.fromhex(cmd["hex"])
-            writer = RNS.RawChannelWriter(1, state["channel"])
+            writer = RNS.RawChannelWriter(cmd.get("stream_id", 1), state["channel"])
             offset = 0
             while offset < len(payload):
                 while not state["channel"].is_ready_to_send():

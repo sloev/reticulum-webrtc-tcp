@@ -136,7 +136,9 @@ await writer.close();
 const pyBufferEvent = await pyGotBuffer;
 assertEqual(pyBufferEvent.hex, crypto.bytesToHex(jsToPyStreamPayload), 'Python (real RNS.Buffer) correctly reassembled a stream written by this project\'s Buffer writer');
 
-// --- Python -> JS: a real RNS.Buffer stream, sent by the reference implementation ---
+// --- Python -> JS: a real RNS.Buffer stream, sent by the reference
+// implementation, using high-entropy random bytes bz2 can't usefully
+// compress (exercises the uncompressed path) ---
 const pyToJsStreamPayload = crypto.randomBytes(3000);
 const reader = RnsBuffer.createReader(1, channel);
 const jsChunks = [];
@@ -146,6 +148,20 @@ py.stdin.write(JSON.stringify({ cmd: 'buffer_send', hex: crypto.bytesToHex(pyToJ
 await jsStreamEnded;
 const reassembled = crypto.concat(...jsChunks);
 assertEqual(crypto.bytesToHex(reassembled), crypto.bytesToHex(pyToJsStreamPayload), 'JS correctly reassembled a stream sent by a real RNS.Buffer writer');
+
+// --- Python -> JS: a real RNS.Buffer stream real RNS actually bz2-compresses
+// per-chunk (highly repetitive data), exercising this project's stream
+// decompression support rather than avoiding it ---
+const pyToJsCompressibleText = 'compressible buffer stream chunk from real Python RNS.Buffer! '.repeat(30);
+const pyToJsCompressiblePayload = new TextEncoder().encode(pyToJsCompressibleText);
+const compressibleReader = RnsBuffer.createReader(2, channel);
+const jsCompressibleChunks = [];
+compressibleReader.on('data', (chunk) => jsCompressibleChunks.push(chunk));
+const jsCompressibleStreamEnded = new Promise((resolve) => compressibleReader.once('end', resolve));
+py.stdin.write(JSON.stringify({ cmd: 'buffer_send', stream_id: 2, hex: crypto.bytesToHex(pyToJsCompressiblePayload) }) + '\n');
+await jsCompressibleStreamEnded;
+const compressibleReassembled = crypto.concat(...jsCompressibleChunks);
+assertEqual(new TextDecoder().decode(compressibleReassembled), pyToJsCompressibleText, 'JS correctly decompressed and reassembled a bz2-compressed stream sent by real Python RNS.Buffer');
 
 link.close();
 py.kill();

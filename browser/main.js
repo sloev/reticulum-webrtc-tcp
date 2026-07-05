@@ -1,3 +1,11 @@
+import { Buffer } from 'buffer';
+// Some dependencies (e.g. seek-bzip, used by shared/rns/compression.js) and
+// a couple of this project's own modules assume a global `Buffer`, as in
+// Node — the `buffer` package (already a dependency, aliased in
+// vite.config.js) provides a browser-compatible implementation, it's just
+// not exposed as a global by default.
+if (typeof globalThis.Buffer === 'undefined') globalThis.Buffer = Buffer;
+
 import { Reticulum, Destination, Identity } from '../shared/rns/index.js';
 import { WebRTCBrowser } from './webrtc-browser.js';
 import * as crypto from '../shared/rns/crypto.js';

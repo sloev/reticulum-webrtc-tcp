@@ -63,10 +63,19 @@ function waitFor(predicate, timeoutMs = 10000) {
     waiters.push({ predicate, resolve, timer });
   });
 }
+// A large event (e.g. a multi-segment resource's hex-encoded payload) can
+// arrive split across multiple stdout 'data' chunks, so a complete line
+// isn't guaranteed per chunk — buffer partial output across chunks and only
+// process text up to the last newline seen so far.
+let stdoutBuffer = '';
 py.stdout.on('data', (d) => {
-  for (const line of d.toString().split('\n')) {
+  stdoutBuffer += d.toString();
+  const lines = stdoutBuffer.split('\n');
+  stdoutBuffer = lines.pop(); // last element: text after the final newline so far, possibly incomplete
+
+  for (const line of lines) {
     if (!line.trim()) continue;
-    console.log('[py]', line);
+    console.log('[py]', line.length > 500 ? `${line.slice(0, 500)}... (${line.length} chars)` : line);
     let msg;
     try {
       msg = JSON.parse(line);
@@ -105,18 +114,36 @@ await link.sendResource(new TextEncoder().encode(pyPayloadText));
 const pyResourceEvent = await pyGotResource;
 assertEqual(Buffer.from(pyResourceEvent.data_hex, 'hex').toString('utf-8'), pyPayloadText, 'Python (real RNS.Resource) correctly reassembled the JS-sent resource');
 
-// --- Python -> JS: a real RNS.Resource transfer, sent by the reference implementation ---
-// Real RNS.Resource bz2-compresses by default when it shrinks the payload —
-// which this project's Resource doesn't implement decompression for (see
-// protocol.js's "RNS.Resource" section) — so this uses high-entropy random
-// bytes, which bz2 can't usefully compress, matching how a real sender
-// would behave for already-compressed or encrypted data.
+// --- JS -> Python: a real RNS.Resource transfer spanning multiple segments
+// (this project segments past protocol.RESOURCE_SEGMENT_MAX_SIZE, ~55KB —
+// real RNS only segments past 1MiB-1, but a real receiver just processes
+// whatever segment size the sender advertises) ---
+const pyMultiSegmentPayload = crypto.concat(crypto.randomBytes(60000), crypto.randomBytes(30000));
+const pyGotMultiSegmentResource = waitFor((m) => m.event === 'resource_received' && m.data_hex.length === pyMultiSegmentPayload.length * 2, 20000);
+await link.sendResource(pyMultiSegmentPayload);
+const pyMultiSegmentEvent = await pyGotMultiSegmentResource;
+assertEqual(pyMultiSegmentEvent.data_hex, crypto.bytesToHex(pyMultiSegmentPayload), 'Python (real RNS.Resource) correctly reassembled a JS-sent, multi-segment resource');
+
+// --- Python -> JS: a real RNS.Resource transfer, sent by the reference
+// implementation, using high-entropy random bytes that bz2 can't usefully
+// compress (matching how a real sender behaves for already-compressed or
+// encrypted data — this exercises the uncompressed path) ---
 const pyToJsPayload = crypto.randomBytes(2200);
 const pyToJsPayloadHex = crypto.bytesToHex(pyToJsPayload);
 const jsGotResource = new Promise((resolve) => link.once('resource', resolve));
 py.stdin.write(JSON.stringify({ cmd: 'send_resource', hex: pyToJsPayloadHex }) + '\n');
 const jsResourceData = await jsGotResource;
 assertEqual(crypto.bytesToHex(jsResourceData), pyToJsPayloadHex, 'JS correctly reassembled a resource sent by real Python RNS.Resource');
+
+// --- Python -> JS: a real RNS.Resource transfer that real RNS actually
+// bz2-compresses (highly repetitive data), exercising this project's
+// decompression support (shared/rns/compression.js) rather than avoiding it ---
+const pyToJsCompressiblePayload = 'compressible resource payload from real Python RNS: '.repeat(80);
+const pyToJsCompressibleHex = Buffer.from(pyToJsCompressiblePayload, 'utf-8').toString('hex');
+const jsGotCompressedResource = new Promise((resolve) => link.once('resource', resolve));
+py.stdin.write(JSON.stringify({ cmd: 'send_resource', hex: pyToJsCompressibleHex }) + '\n');
+const jsCompressedResourceData = await jsGotCompressedResource;
+assertEqual(Buffer.from(jsCompressedResourceData).toString('utf-8'), pyToJsCompressiblePayload, 'JS correctly decompressed and reassembled a bz2-compressed resource sent by real Python RNS.Resource');
 
 link.close();
 py.kill();
