@@ -57,10 +57,10 @@ export function propagated_transient_id(envelope) {
 // each uploaded message must carry a trailing 32-byte stamp valid for at
 // least this many leading zero bits, computed over its own transient_id.
 // The default of 0 accepts any stamp (including an all-zero one), i.e. no
-// real anti-spam requirement — real LXMF propagation nodes announce their
-// required cost so senders know what to compute; that announce-parsing
-// isn't implemented here, so a sender must be told the required cost out of
-// band (see propagateLXMF's stampCost parameter).
+// real anti-spam requirement. Matches real LXMF: this cost is announced
+// (see announce()/get_propagation_node_app_data() below) so a sender can
+// read it automatically instead of needing it out of band — see
+// propagateLXMF()'s stampCost parameter, which defaults to exactly that.
 //
 // peeringCost sets the proof-of-work required of another propagation node
 // before it's allowed to sync messages to this one (see syncToPeer() below

@@ -430,9 +430,10 @@ export class Destination extends EventEmitter {
     // destination is the *recipient's* identity (used to encrypt to them),
     // not yours. Matches LXMF's OPPORTUNISTIC delivery method: a single
     // packet, opportunistically encrypted exactly like a normal DATA packet
-    // (see protocol.js's "LXMF" section for the wire format and README's
-    // Compliance section for what's not implemented, e.g. propagation nodes
-    // and Resource-based transfer for oversized messages).
+    // (see protocol.js's "LXMF" section for the wire format). For DIRECT
+    // delivery over an established Link — needed for messages too large for
+    // a single packet — see Link.sendLXMF() below; for store-and-forward via
+    // a propagation node, see shared/rns/propagation.js.
     sendLXMF(source, title, content, fields = {}) {
         if (this.direction !== Destination.OUT) {
             throw new Error("Can only send LXMF to OUT destinations.");
@@ -882,8 +883,9 @@ export class Link extends EventEmitter {
 
     // Receiver side: a peer advertised a Resource transfer. Always accepts
     // (no accept/reject callback, unlike real RNS) and starts requesting
-    // parts in fixed-size windows (see _requestNextResourceParts below). The
-    // advertisement's hashmap may be shorter than totalParts (a real sender
+    // parts in a rate-adaptive window (see _growResourceWindow/
+    // _requestNextResourceParts below). The advertisement's hashmap may be
+    // shorter than totalParts (a real sender
     // truncates it to RESOURCE_HASHMAP_MAX_LEN entries per packet) — the
     // rest arrives via HMU packets, requested as needed (see
     // _onHashmapUpdate below).

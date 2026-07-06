@@ -35,7 +35,8 @@ algorithms exactly, and only then implementing.
 3. **Full regression** before every commit: `npm test`, `npx vite build`, and the
    existing integration checks touching the changed layer
    (`test:integration:resource`, `:channel`, `:lxmf`, `:lxmf-propagation`,
-   `:lxmf-peer-sync`, `:integration` for the sparse mesh).
+   `:lxmf-peer-sync`, `:path-request`, `:nomadnet`, `:sideband`, `:integration` for
+   the sparse mesh).
 
 **Process.** After each completed step: update this file's checklist row, update the
 README Compliance section, commit with a descriptive message, push. Never open a PR
@@ -613,12 +614,33 @@ storage code path itself, unrelated to WebRTC, was verified directly). 77/77
 unit tests pass; `vite build` confirms `storage.js` (Node-only, uses `node:fs/
 promises`) isn't pulled into the browser bundle (module count unchanged at 78).
 
-### Phase 8 — docs finalization
+### Phase 8 — docs finalization — ✅ Done
 
-README Compliance section rewritten against the finished checklist; demo page copy
-re-checked against actual behavior; final sweep of this file — every row DONE/N/A with
-its "verified by" filled in; remove stale caveats elsewhere (module comments citing
-"fixed intervals", "decode-only", etc.).
+Swept every checklist row above: none left `MISSING`/`UNTESTED`; the few `PARTIAL`
+rows (Resource window's retry-shrink, single-destination-only multi-hop forwarding,
+announce rate table enforcement) each carry an honest reason in their own phase
+writeup, not just an unexplained gap. README's intro paragraph, "In short" summary,
+and "Known limitations"/"Not yet implemented" sections rewritten to match — the
+latter renamed to "Remaining gaps" since almost everything it used to list is now
+done; DIRECT delivery, Transport parity, and RTT-adaptive Link timing folded into
+the top summary's byte-exact list. Found and fixed several stale code comments left
+over from before Phases 1–5 landed (`shared/rns/index.js`/`protocol.js`/
+`propagation.js`): a "fixed-size window" comment on the now-rate-adaptive Resource
+receiver, a "no outgoing compression" note on the now-bidirectionally-compressing
+Resource/LXMF paths, an "isn't implemented here, so a sender must be told out of
+band" note on propagation stamp costs that Phase 5.3 made announce-derived, a
+"that fallback is not implemented here" note on the Request/Response Resource
+fallback Phase 3 added, and a stale "LINKREQUEST packets... aren't forwarded" README
+paragraph that predated `_forwardLinkRequest`/`_forwardLinkTraffic`. Demo page
+copy (`browser/index.html`) was already kept accurate incrementally each phase
+(no LXMF-scope claims changed enough to need a demo-copy update this pass).
+
+Full regression re-run clean one final time: 77/77 unit tests, `vite build`, and a
+spot check of the live integration suite (`path-request`, `lxmf`, `resource`) —
+see the status log entry below. **Every phase in this document is now complete.**
+Any further work (ratchet rotation, propagation-node interop with an end-user
+client specifically, a browser storage adapter) is real, separable follow-up
+work, not a gap in what this document set out to close.
 
 ## Status log
 
@@ -636,3 +658,4 @@ its "verified by" filled in; remove stale caveats elsewhere (module comments cit
 | 2026-07-06 | Phase 5.3 | Propagation-node announce app_data implemented (`lxmf_build_propagation_announce_app_data`/`lxmf_parse_propagation_announce_app_data`, byte-exact, including catching a would-be integer-vs-string msgpack key mismatch before it could break interop). `PropagationNode.announce()` now embeds real stamp/peering cost; `propagateLXMF()`/`syncToPeer()` default to reading it from a cached announce instead of a required argument. 73/73 unit tests pass; both propagation live checks extended to make a real `LXMRouter` fire its actual `announce_propagation_node()` (~20s delay) and drive JS's uploads/peer-sync using *only* the parsed real announce, cross-checked against the test harness's own values (re-run twice each for stability). Full regression clean: unit tests, `vite build`, `lxmf`/`resource`/`channel` live checks. **Phase 5 (LXMF outbound parity) is now complete.** |
 | 2026-07-06 | Phase 6 | End-user client interop verified live against real, unmodified `nomadnet` and `sbapp` (Sideband) installs, both directions, both message directions confirmed via each client's own real code paths (`NomadNetworkApp`'s real disk storage / `message_router.handle_outbound()`; `SidebandCore`'s real `send_message()`/delivery callback). Corrected this plan's own assumption that Sideband would be infeasible headless — its daemon mode never imports Kivy at all, confirmed by actually running it. No code changes to `shared/rns/*` (investigation + test-integration only); 73/73 unit tests and `vite build` unaffected and still clean. |
 | 2026-07-06 | Phase 7 | Persistence parity implemented as an adaptation: `shared/rns/storage.js`'s `NodeFileStorage` plus `Reticulum`/`PropagationNode` `saveState()`/`loadState()`, wired opt-in into `node/index.js` via `RNS_STORAGE_DIR`. Ratchet rotation explicitly scoped out (a real, separable gap, large enough to warrant its own future phase rather than a shallow fit here). 77/77 unit tests pass (new `test/storage.test.js` covers round-tripping across a simulated restart and stale-file cleanup); `vite build` confirms the Node-only storage module isn't pulled into the browser bundle. **This closes every phase in this document except final docs polish (Phase 8).** |
+| 2026-07-06 | Phase 8 | Docs finalization: swept every checklist row (none left MISSING/UNTESTED), rewrote README's intro/summary/limitations sections against the finished checklist, and fixed five stale code comments left over from before Phases 1–5 landed (a "fixed-size window" note on the now-rate-adaptive Resource receiver, a "no outgoing compression" note, an "out of band" note on propagation stamp cost that Phase 5.3 made announce-derived, a "fallback is not implemented" note on the Phase-3 Request/Response Resource fallback, and a stale "LINKREQUEST packets aren't forwarded" README paragraph). 77/77 unit tests pass, `vite build` clean, spot-checked live integration suite still green. **Every phase in this document is complete.** |

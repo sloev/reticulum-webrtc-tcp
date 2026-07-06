@@ -444,13 +444,14 @@ export function build_link_packet(link_id, derived_key, data, context = CONTEXT_
     });
 }
 
-// --- RNS.Link Request/Response (small-payload form only) ---
+// --- RNS.Link Request/Response ---
 // Verified byte-for-byte against the real `rns` package: the request/
 // response msgpack envelopes, and that request_id (packet_truncated_hash of
 // the packed REQUEST packet) matches on both the sending and receiving side.
-// Only the direct-packet form is implemented — RNS falls back to a Resource
-// transfer when a request or response doesn't fit in a single packet (over
-// the link MDU); that fallback is not implemented here (see README).
+// A request or response too large for a single packet falls back to a
+// Resource transfer, matching RNS.Link's own fallback exactly (including its
+// distinct request_id hash for the Resource form — see
+// resource_request_id() below and index.js's Link.request()/_handleRequest()).
 
 export function request_path_hash(path) {
     return crypto.sha256(new TextEncoder().encode(path)).slice(0, 16);
@@ -559,10 +560,15 @@ export function parse_path_request(packet) {
 // exact bytes LXMF's Python msgpack (umsgpack) would produce, and the message
 // hash/signature are computed over those exact bytes — hashed as
 // full_hash(destination_hash + source_hash + msgpack_payload), signed as
-// (that hash concatenated onto the hashed part). What's not implemented:
-// propagation-node stamps/tickets (LXMF's optional anti-spam proof-of-work),
-// the PROPAGATED/PAPER delivery methods, and Resource-based transfer for
-// messages too large for a single packet/link MDU — see README.
+// (that hash concatenated onto the hashed part). Covers OPPORTUNISTIC
+// (lxmf_build/lxmf_parse below) and DIRECT (lxmf_build_direct/
+// lxmf_parse_direct, further down — sent as a packet or Resource over a
+// Link, see index.js's Link.sendLXMF()) delivery, plus admission stamps
+// (shared/rns/stamp.js) for this project's own propagation-node store-and-
+// forward (shared/rns/propagation.js). Not implemented: the PAPER delivery
+// method (QR-encoded messages — no meaningful use over WebRTC/TCP) and
+// real LXMF's own PROPAGATED wire format (this project's propagation nodes
+// use their own protocol on top of the same envelope — see README).
 function lxmf_sign(content, source_priv, destination_hash, source_hash, timestamp, title, fields) {
     timestamp = timestamp || Date.now() / 1000;
     title = title || new Uint8Array(0);
@@ -766,28 +772,25 @@ export function lxmf_parse_propagation_announce_app_data(app_data) {
 // as real RNS.Resource's segmenting, just at a much smaller per-segment size
 // (see RESOURCE_MAX_PARTS's comment for why). Sending a large payload this
 // way to a real RNS peer works (it just processes whatever segment size we
-// advertise); *receiving* one from a real peer only works up to one segment
-// still, since a real sender only segments past 1MiB-1 and a segment that
-// large needs RNS's HMU packets (splitting a hashmap across more than one
-// packet) to receive, which isn't implemented. No *outgoing* compression
-// either (real RNS bz2-compresses by default when it shrinks the payload;
-// this project's sender never does, since it has no need to — see
-// shared/rns/compression.js for why decoding a real peer's compressed
-// transfer is still supported).
-// The receiver requests parts in a fixed-size window (see
-// index.js's Link._requestNextResourceParts()) rather than RNS.Resource's
-// adaptive window (which grows from a small starting size up toward a much
-// larger one on a fast, well-behaved link, tuned for lossy shared-bandwidth
-// radio links) — a real RNS sender doesn't care how a receiver paces its
-// requests (it just resends whatever's asked for from its own already-built
-// part list, unconditionally), so this fixed window is enough for genuine
-// interop with a real RNS peer in either direction, just without RNS's
-// throughput ramp-up on fast links. Also not implemented: retrying a request
-// after a timeout with no response, since this project's transports (WebRTC
-// data channels, TCP) are already reliable and ordered, unlike the lossy
-// radio links that timeout/retry logic is for. The wire primitives —
-// advertisement, request, part, and proof packets, and the hashing scheme
-// that ties them together — match RNS.Resource/ResourceAdvertisement's
+// advertise); receiving one from a real peer whose own advertisement
+// truncates its hashmap (past ~74 entries at default MTU) is supported via
+// the HMU (hashmap update) receive path — see CONTEXT_RESOURCE_HMU/
+// build_resource_hmu/parse_resource_hmu below and index.js's
+// Link._onHashmapUpdate(). This project's own sender never truncates its own
+// advertisements the same way, so it never needs to *send* an HMU packet —
+// only receive one.
+// Outgoing data is bz2-compressed whenever that's smaller (matching real
+// RNS's own compress-if-beneficial policy exactly), via a WebAssembly build
+// of the real reference libbzip2 — see shared/rns/compression.js.
+// The receiver requests parts in a rate-adaptive window (see index.js's
+// Link._growResourceWindow()/_requestNextResourceParts()), matching
+// RNS.Resource's own window/window_max growth and fast/very-slow-rate
+// promotion logic — not implemented: retry-driven window *shrinking*, since
+// there's no per-part retry/timeout mechanism (this project's transports,
+// WebRTC data channels and TCP, are already reliable and ordered, unlike the
+// lossy radio links that retry/timeout logic is for). The wire primitives —
+// advertisement, request, part, proof, and HMU packets, and the hashing
+// scheme that ties them together — match RNS.Resource/ResourceAdvertisement's
 // format and context bytes exactly. See README's Compliance section.
 // Bytes available per Link packet in general (Channel, Request/Response) —
 // matches RNS.Link's own `self.mdu` instance attribute exactly (with RNS's
