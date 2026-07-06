@@ -86,6 +86,12 @@ Start a Node.js mesh peer with the TCP gateway (listens on `127.0.0.1:4242`):
 npm run gateway
 ```
 
+Set `RNS_STORAGE_DIR=<path>` to persist the identity cache and path table to disk across restarts (see [Compliance](#compliance)) — otherwise state is in-memory only:
+
+```bash
+RNS_STORAGE_DIR=./rns-storage npm run gateway
+```
+
 Serve the browser peer with Vite's dev server, then open it in multiple tabs or devices to form additional mesh peers:
 
 ```bash
@@ -204,7 +210,7 @@ In short: a peer running this codebase now produces and validates announces, sin
 
 - Both single-destination messages and `Link`s (including everything sent over one, like Request/Response) can now be discovered and relayed across multiple hops through an intermediate peer that owns neither endpoint — see [Compliance](#compliance). A `Link` can now also send a payload too large for a single packet (even much too large — automatically split across multiple segments) via `sendResource()`, or reliably exchange smaller messages/streams via `getChannel()`/`shared/rns/buffer.js`, and all of this genuinely interoperates with a real `RNS.Resource`/`RNS.Channel`/`RNS.Buffer` peer (confirmed live, in both directions, including a real peer's compressed data). `Link.request()`/`registerRequestHandler()` now fall back to sending an oversized request or response as a Resource instead of a single packet, matching `RNS.Link`'s own fallback exactly — confirmed live against a real `LXMF.LXMRouter`'s own oversized `/get` response.
 - An LXMF message can now be stored on a propagation node (`shared/rns/propagation.js`) for later pickup when the recipient isn't directly reachable, with a real proof-of-work admission stamp (`shared/rns/stamp.js`) that a live `LXMF.LXMRouter` accepts — both uploading to, and downloading from (via `Link.identify()`), a real propagation node work, and this project's own node can also sync a stored message onward to another node (real or its own) as a peer, via `LXMPeer`'s "/offer" protocol and a peering-key proof-of-work — see [Compliance](#compliance).
-- Identities, the announce/identity cache, links, and propagation node storage are in-memory only and are lost on restart.
+- Identities, the announce/identity cache, links, and propagation node storage are in-memory only by default and are lost on restart — except in Node, where setting `RNS_STORAGE_DIR` persists the identity cache, path table, and `PropagationNode`'s message store to disk (`shared/rns/storage.js`, loaded on startup and saved periodically/on shutdown; own format, not RNS's on-disk one — see [Compliance](#compliance)). Links themselves are never persisted (they're inherently transient), and there's no browser-side equivalent beyond the demo's existing per-session identity caching. Ratchets are still never rotated (a single one is generated per identity at creation and kept forever), unlike real RNS's periodic rotation with a retained-ratchet grace period.
 - Signaling depends on public Nostr relays; relay operators can observe connection metadata (who is signaling whom, and when) even though offer/answer payloads are NIP-04 encrypted, and any of them may still rate-limit a busy key.
 - `node-datachannel` (used for `RTCPeerConnection` in Node) ships prebuilt native binaries per platform; if none is available for your platform/Node version, `npm install` needs to build it from source.
 - The browser UI in `browser/` is a minimal demo for exercising the stack, not a finished chat client.

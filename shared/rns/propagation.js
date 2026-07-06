@@ -95,6 +95,34 @@ export class PropagationNode {
         this.destination.announce({ appData });
     }
 
+    // Persists the message store to `storage` (see shared/rns/storage.js),
+    // one file per transient_id — mirroring LXMRouter's own storagepath
+    // layout in spirit (not byte format; this is an adaptation for
+    // surviving restarts, not a wire-format compliance concern). Each
+    // message's original admission stamp is included, since it needs to be
+    // re-attached on a later peer sync exactly like a fresh upload's (see
+    // syncToPeer()).
+    async saveState(storage) {
+        for (const [hex, message] of this.messages) {
+            await storage.save(`propagation/${hex}`, message);
+        }
+        // Removes on-disk files for messages purged since the last save
+        // (e.g. downloaded and removed via _onGetRequest()'s "erase" pass)
+        // so the store doesn't accumulate stale files forever.
+        for (const hex of await storage.listKeys('propagation')) {
+            if (!this.messages.has(hex)) await storage.delete(`propagation/${hex}`);
+        }
+    }
+
+    // Loads previously-saved messages back into the store — call right
+    // after construction.
+    async loadState(storage) {
+        for (const hex of await storage.listKeys('propagation')) {
+            const message = await storage.load(`propagation/${hex}`);
+            if (message) this.messages.set(hex, message);
+        }
+    }
+
     _onUpload(resourceData) {
         let unpacked;
         try {

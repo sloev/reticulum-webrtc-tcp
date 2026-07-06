@@ -122,9 +122,9 @@ reason).
 | Feature | Python reference | JS location | Status | Verified by |
 |---|---|---|---|---|
 | Browser demo identity persistence | n/a (environment adaptation) | `browser/main.js` `loadOrCreateIdentity` (sessionStorage) | DONE | Playwright (reload keeps RID, new tab differs) |
-| Known-destinations / identity-cache persistence | `RNS/Identity.py:101–260` `remember/recall/save_known_destinations` | — (in-memory `Reticulum.identities`) | MISSING | **Phase 7** |
-| Ratchet rotation & persistence | `RNS/Destination.py:210–243` `rotate_ratchets` | — (single static ratchet) | MISSING | **Phase 7** |
-| Propagation store persistence | `LXMF/LXMRouter.py` storagepath handling | — (in-memory `PropagationNode.messages`) | MISSING | **Phase 7** |
+| Known-destinations / identity-cache / path-table persistence | `RNS/Identity.py:101–260` `remember/recall/save_known_destinations` | `shared/rns/storage.js`, `Reticulum.saveState/loadState` | DONE (adaptation — own format, not RNS's on-disk one) | unit |
+| Ratchet rotation & persistence | `RNS/Destination.py:210–243` `rotate_ratchets` | — (single static ratchet) | SCOPED OUT | see Phase 7 writeup |
+| Propagation store persistence | `LXMF/LXMRouter.py` storagepath handling | `PropagationNode.saveState/loadState` | DONE (adaptation — own format, one file per transient_id in spirit) | unit |
 | IFAC (interface access codes) | `RNS/Interfaces/Interface.py` | — | N/A — private-network access control for shared physical media; revisit on request | — |
 | Radio/serial interfaces (RNode, LoRa, I2P, …) | `RNS/Interfaces/*` | `shared/webrtc-rns-interface.js`, `node/tcp-gateway.js` | N/A — this project's transports are WebRTC + TCP by design | — |
 
@@ -567,18 +567,51 @@ against the reference implementation; a client-specific propagation test would
 mostly re-exercise the same code path through a heavier dependency, for limited
 additional confidence.
 
-### Phase 7 — persistence parity
+### Phase 7 — persistence parity — ✅ Done (adaptation scope)
 
-1. Storage adapter interface (Node: filesystem under a configdir like RNS's
-   `~/.reticulum`; browser: localStorage/IndexedDB — identity already session-cached).
-2. Persist + reload: identity cache/known destinations (`Identity.remember/recall`,
-   `save_known_destinations` msgpack format), path table, `PropagationNode.messages`
-   (mirror `LXMRouter`'s `storagepath` layout: one file per transient_id, stamp
-   attached).
-3. Ratchet rotation per `Destination.rotate_ratchets` (interval + retained count),
-   persisted.
-   Marked *adaptation* in the checklist — formats need only round-trip with ourselves,
-   but follow RNS's on-disk formats where practical.
+Implemented `shared/rns/storage.js`'s `NodeFileStorage` — a Node-only, one-file-
+per-key filesystem adapter (`save`/`load`/`listKeys`/`delete`, msgpack-encoded) —
+plus explicit `async saveState(storage)`/`async loadState(storage)` methods on
+`Reticulum` (identity cache + path table) and `PropagationNode` (message store,
+one file per transient_id in spirit, matching `LXMRouter`'s storagepath layout —
+not its exact on-disk byte format, since nothing else ever reads this off disk).
+Wired as opt-in in `node/index.js` via `RNS_STORAGE_DIR`: loads on startup, saves
+every 5 minutes and on `SIGINT`/`SIGTERM`; unset, behavior is unchanged
+(in-memory only, as before). No browser adapter — the browser demo's existing
+sessionStorage-based identity caching already covers the one thing worth
+persisting in a page that's otherwise fully reset on close; a longer-lived
+browser peer wanting the same persistence would implement an IndexedDB adapter
+against the same `save`/`load`/`listKeys` interface.
+
+A reloaded path table entry can still answer a path request from its cached
+announce packet, but not serve as a `_forward()` next-hop (the interface/peer
+object references it was learned from aren't serializable, and are dropped on
+reload) until a live announce refreshes it — a real, documented limitation of
+treating this as a plain adaptation rather than reimplementing RNS's full
+per-interface reconnection model.
+
+**Scoped out: ratchet rotation** (`RNS.Destination.rotate_ratchets`, `Destination.
+py:210–243`). This project's `Identity` currently generates one static ratchet at
+creation and never rotates it — a real, separate gap from persistence itself (it
+exists with or without a storage layer), and a large enough behavioral change
+(retained-ratchet history, a rotation interval, decrypt-fallback trying each
+retained ratchet within its grace period) that folding it into this phase would
+mean either a shallow implementation or expanding this phase well past what
+"persistence adaptation" scoped for. Left as a genuine, separable follow-up
+rather than force-fit here.
+
+Verified: unit tests (`test/storage.test.js`) — `NodeFileStorage` round-tripping
+arbitrary values (including `Uint8Array` fields) and managing a one-file-per-key
+directory, `Reticulum.saveState()`/`loadState()` surviving a simulated restart
+(a fresh `Reticulum` instance reloading a previous one's saved identities/path
+table), and `PropagationNode.saveState()`/`loadState()` round-tripping the
+message store and cleaning up on-disk files for since-purged messages. A manual
+smoke test confirmed `node/index.js`'s wiring loads/saves correctly end to end
+(the gateway itself couldn't be run as a full process in this sandbox — see
+README's Known limitations re: `node-datachannel`'s native build — but the
+storage code path itself, unrelated to WebRTC, was verified directly). 77/77
+unit tests pass; `vite build` confirms `storage.js` (Node-only, uses `node:fs/
+promises`) isn't pulled into the browser bundle (module count unchanged at 78).
 
 ### Phase 8 — docs finalization
 
@@ -602,3 +635,4 @@ its "verified by" filled in; remove stale caveats elsewhere (module comments cit
 | 2026-07-06 | Phase 5.2 | LXMF delivery announce app_data (`lxmf_build_announce_app_data`/`lxmf_stamp_cost_from_app_data`/`lxmf_compression_supported`, byte-exact) and compression negotiation implemented — `Link.sendLXMF()` skips compression for a Resource-sized message when the recipient's cached announce explicitly declares no `SF_COMPRESSION` support. 69/69 unit tests pass; live `lxmf-cross-language-check.mjs` extended so a real, unmodified `rns`/`lxmf` process re-announces declaring no compression support, and JS's next oversized DIRECT send is confirmed (via the real `RNS.Resource`'s own `compressed` attribute on the Python side) to have genuinely honored it (re-run 3× for stability). Full regression clean: unit tests, `vite build`. |
 | 2026-07-06 | Phase 5.3 | Propagation-node announce app_data implemented (`lxmf_build_propagation_announce_app_data`/`lxmf_parse_propagation_announce_app_data`, byte-exact, including catching a would-be integer-vs-string msgpack key mismatch before it could break interop). `PropagationNode.announce()` now embeds real stamp/peering cost; `propagateLXMF()`/`syncToPeer()` default to reading it from a cached announce instead of a required argument. 73/73 unit tests pass; both propagation live checks extended to make a real `LXMRouter` fire its actual `announce_propagation_node()` (~20s delay) and drive JS's uploads/peer-sync using *only* the parsed real announce, cross-checked against the test harness's own values (re-run twice each for stability). Full regression clean: unit tests, `vite build`, `lxmf`/`resource`/`channel` live checks. **Phase 5 (LXMF outbound parity) is now complete.** |
 | 2026-07-06 | Phase 6 | End-user client interop verified live against real, unmodified `nomadnet` and `sbapp` (Sideband) installs, both directions, both message directions confirmed via each client's own real code paths (`NomadNetworkApp`'s real disk storage / `message_router.handle_outbound()`; `SidebandCore`'s real `send_message()`/delivery callback). Corrected this plan's own assumption that Sideband would be infeasible headless — its daemon mode never imports Kivy at all, confirmed by actually running it. No code changes to `shared/rns/*` (investigation + test-integration only); 73/73 unit tests and `vite build` unaffected and still clean. |
+| 2026-07-06 | Phase 7 | Persistence parity implemented as an adaptation: `shared/rns/storage.js`'s `NodeFileStorage` plus `Reticulum`/`PropagationNode` `saveState()`/`loadState()`, wired opt-in into `node/index.js` via `RNS_STORAGE_DIR`. Ratchet rotation explicitly scoped out (a real, separable gap, large enough to warrant its own future phase rather than a shallow fit here). 77/77 unit tests pass (new `test/storage.test.js` covers round-tripping across a simulated restart and stale-file cleanup); `vite build` confirms the Node-only storage module isn't pulled into the browser bundle. **This closes every phase in this document except final docs polish (Phase 8).** |

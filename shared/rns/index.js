@@ -289,6 +289,32 @@ export class Reticulum extends EventEmitter {
         this.pathRequestTimestamps.set(destHex, Date.now());
         this.sendData(protocol.build_path_request(destination_hash, tag, this.transportIdentity.hash));
     }
+
+    // Persists the identity cache and path table to `storage` (see
+    // shared/rns/storage.js) — an adaptation for surviving restarts, not a
+    // wire-format compliance concern (nothing else ever reads this data off
+    // disk). Interface/peer references in path table entries aren't
+    // serializable and aren't persisted — a reloaded entry can still answer
+    // a path request with its cached announce packet, but can't be used for
+    // _forward()'s next-hop routing until a live announce refreshes it.
+    async saveState(storage) {
+        await storage.save('identities', Array.from(this.identities.entries()));
+        await storage.save('path_table', Array.from(this.pathTable.entries()).map(
+            ([hex, entry]) => [hex, { hops: entry.hops, packet: entry.packet, timestamp: entry.timestamp }]
+        ));
+    }
+
+    // Loads previously-saved state back in — call before addInterface()/
+    // announcing, typically right after construction.
+    async loadState(storage) {
+        const identities = await storage.load('identities');
+        if (identities) for (const [hex, value] of identities) this.identities.set(hex, value);
+
+        const pathTable = await storage.load('path_table');
+        if (pathTable) for (const [hex, entry] of pathTable) {
+            this.pathTable.set(hex, { ...entry, receivingInterface: null, fromPeerId: null });
+        }
+    }
 }
 
 export class Identity {
