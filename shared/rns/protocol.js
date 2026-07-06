@@ -694,6 +694,69 @@ export function lxmf_compression_supported(app_data) {
     }
 }
 
+// LXMRouter's propagation-node metadata keys (LXMF.py:132-138) — only NAME is
+// used here; the others (sync stratum/throttle, auth band, utilization
+// pressure, custom) have no equivalent concept in this project's
+// PropagationNode.
+export const PN_META_NAME = 0x01;
+
+// Matches LXMRouter.get_propagation_node_app_data(): a propagation node's
+// announce app_data is a 7-element msgpack list — [false (legacy PN support
+// flag, always false), timebase, node_state, per_transfer_limit_kb,
+// per_sync_limit, [stamp_cost, stamp_cost_flexibility, peering_cost],
+// metadata (a map keyed by the PN_META_* integer codes above, not a plain
+// object — real LXMF's msgpack keys are integers, so a JS object's
+// always-string keys would encode wrong; a Map is used instead)]. Byte-exact
+// against a real get_propagation_node_app_data()-shaped capture.
+export function lxmf_build_propagation_announce_app_data({
+    stampCost = 0, stampCostFlexibility = 0, peeringCost = 0,
+    nodeState = true, perTransferLimitKb = 0, perSyncLimit = 0, name = null,
+} = {}) {
+    const metadata = new Map();
+    if (name) metadata.set(PN_META_NAME, typeof name === 'string' ? new TextEncoder().encode(name) : name);
+
+    return lxmfMsgpack.pack([
+        false, Math.floor(Date.now() / 1000), nodeState,
+        perTransferLimitKb, perSyncLimit,
+        [stampCost, stampCostFlexibility, peeringCost],
+        metadata,
+    ]);
+}
+
+// Matches LXMF.pn_announce_data_is_valid()'s validation rules (LXMF.py:224):
+// a 7-element list with a decodable timebase, a strictly-boolean node_state,
+// integer transfer/sync limits, a 3-element integer stamp-cost list, and a
+// dict-typed metadata field. Returns null (matching pn_stamp_cost_from_app_
+// data()'s "else return None" for invalid data) rather than throwing, so
+// callers can safely fall back to an out-of-band-provided cost.
+export function lxmf_parse_propagation_announce_app_data(app_data) {
+    if (!app_data || app_data.length === 0) return null;
+    try {
+        const data = lxmfMsgpack.unpack(app_data);
+        if (!Array.isArray(data) || data.length < 7) return null;
+        if (typeof data[2] !== 'boolean') return null;
+        if (!Number.isInteger(data[3]) || !Number.isInteger(data[4])) return null;
+        if (!Array.isArray(data[5]) || data[5].length < 3) return null;
+        const [stampCost, stampCostFlexibility, peeringCost] = data[5];
+        if (![stampCost, stampCostFlexibility, peeringCost].every(Number.isInteger)) return null;
+        const metadata = data[6];
+        // msgpack.js's decoder returns maps as plain objects (integer keys
+        // coerced to string property names, per JS object semantics) rather
+        // than a Map — see readMap() in shared/rns/msgpack.js.
+        if (typeof metadata !== 'object' || metadata === null || Array.isArray(metadata)) return null;
+
+        const nameBytes = metadata[PN_META_NAME];
+        return {
+            timebase: data[1], nodeState: data[2],
+            perTransferLimitKb: data[3], perSyncLimit: data[4],
+            stampCost, stampCostFlexibility, peeringCost,
+            name: nameBytes ? new TextDecoder().decode(nameBytes) : null,
+        };
+    } catch {
+        return null;
+    }
+}
+
 // --- RNS.Resource (chunked large-transfer protocol over a Link) ---
 // Transfers larger than one segment's worth (RESOURCE_SEGMENT_MAX_SIZE) are
 // split into multiple segments — each with its own independent advertise/

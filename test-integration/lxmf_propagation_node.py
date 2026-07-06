@@ -64,6 +64,9 @@ loglevel = 3
     identity = RNS.Identity()
     router = LXMF.LXMRouter(identity=identity, storagepath=args.configdir)
     router.enable_propagation()
+    # Real get_propagation_node_app_data()-carrying announce (Phase 5.3) —
+    # fires after LXMRouter.NODE_ANNOUNCE_DELAY (20s), same as any real node.
+    router.announce_propagation_node()
 
     emit(
         "ready",

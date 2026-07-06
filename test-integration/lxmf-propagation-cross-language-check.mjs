@@ -19,6 +19,7 @@ import { Reticulum, Identity, Destination, Link } from '../shared/rns/index.js';
 import { createTCPGateway } from '../node/tcp-gateway.js';
 import * as crypto from '../shared/rns/crypto.js';
 import * as propagation from '../shared/rns/propagation.js';
+import * as protocol from '../shared/rns/protocol.js';
 
 const PYLIBS = process.env.PYLIBS;
 if (!PYLIBS) {
@@ -88,8 +89,15 @@ py.stdout.on('data', (d) => {
 const ready = await waitFor((m) => m.event === 'ready', 15000);
 console.log('real LXMRouter propagation node ready:', ready);
 
-const requiredCost = Math.max(0, ready.propagation_stamp_cost - ready.propagation_stamp_cost_flexibility);
-console.log(`computing a stamp at the node's minimum accepted cost (${requiredCost}) — this can take several seconds...`);
+// The real LXMRouter fires its own get_propagation_node_app_data()-carrying
+// announce ~20s after enable_propagation() (NODE_ANNOUNCE_DELAY) — start
+// waiting for it immediately, in parallel with the rest of setup below, so
+// this test doesn't serialize an extra 20s wait on top of everything else.
+const nodeAnnouncePromise = new Promise((resolve) => {
+  rns.on('announce', function handler(a) {
+    if (crypto.bytesToHex(a.destination_hash) === ready.dest_hash) { rns.off('announce', handler); resolve(a); }
+  });
+});
 
 // A local, made-up "recipient" identity — the propagation node never learns
 // or needs to know it; it only stores the opaque encrypted envelope, keyed
@@ -114,8 +122,20 @@ const link = new Link(rns, propNodeDest);
 await new Promise((resolve) => link.once('established', resolve));
 console.log('real Link established to the reference LXMRouter propagation node');
 
+console.log("waiting for the real LXMRouter's own propagation-node announce (compliance.md Phase 5.3, ~20s)...");
+const nodeAnnounce = await nodeAnnouncePromise;
+const parsedNodeAppData = protocol.lxmf_parse_propagation_announce_app_data(nodeAnnounce.app_data);
+assertTrue(!!parsedNodeAppData, "JS successfully parsed the real LXMRouter's own get_propagation_node_app_data()-shaped announce");
+assertEqual(parsedNodeAppData?.stampCost, ready.propagation_stamp_cost, "the announce's stamp_cost matches what the node itself reported out of band (cross-checking, not relying on the side channel)");
+assertEqual(parsedNodeAppData?.stampCostFlexibility, ready.propagation_stamp_cost_flexibility, "the announce's stamp_cost_flexibility matches");
+assertEqual(parsedNodeAppData?.peeringCost, ready.peering_cost, "the announce's peering_cost matches");
+
+console.log(`computing a stamp at the announce-derived minimum accepted cost — this can take several seconds...`);
 const t0 = Date.now();
-await propagation.propagateLXMF(link, destOut, senderSelf, 'real interop', 'hello real LXMRouter', {}, requiredCost);
+// No stampCost argument — propagateLXMF() reads it from the real announce
+// just parsed above (cached in rns.identities by the announce handler),
+// instead of the out-of-band `ready.propagation_stamp_cost` used previously.
+await propagation.propagateLXMF(link, destOut, senderSelf, 'real interop', 'hello real LXMRouter', {});
 console.log(`stamp computed and resource uploaded in ${Date.now() - t0}ms`);
 
 await new Promise((r) => setTimeout(r, 500));
@@ -132,7 +152,7 @@ const bulkContent = 'padding to make this message large enough to force a multi-
 for (let i = 0; i < 3; i++) {
   const bulkLink = new Link(rns, propNodeDest);
   await new Promise((resolve) => bulkLink.once('established', resolve));
-  await propagation.propagateLXMF(bulkLink, destOut, senderSelf, `bulk ${i}`, bulkContent, {}, requiredCost);
+  await propagation.propagateLXMF(bulkLink, destOut, senderSelf, `bulk ${i}`, bulkContent, {});
   bulkLink.close();
 }
 console.log('uploaded 3 additional bulk messages');

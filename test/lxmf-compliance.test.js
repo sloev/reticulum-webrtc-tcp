@@ -552,6 +552,83 @@ test('a propagation node configured with a stampCost rejects an unproven upload 
   assert.equal(propNode.messages.size, 1);
 });
 
+// --- Propagation-node announce app_data (Phase 5.3) ---
+
+test('lxmf_build_propagation_announce_app_data matches LXMRouter.get_propagation_node_app_data() byte-for-byte', () => {
+  // Captured from a real `RNS.vendor.umsgpack.packb([False, 1700000000, True,
+  // 1000, 10, [16, 3, 18], {LXMF.PN_META_NAME: b"testnode"}])` — the exact
+  // structure get_propagation_node_app_data() builds (with a fixed timebase
+  // in place of real time.time()).
+  const built = protocol.lxmf_build_propagation_announce_app_data({
+    stampCost: 16, stampCostFlexibility: 3, peeringCost: 18,
+    perTransferLimitKb: 1000, perSyncLimit: 10, name: 'testnode',
+  });
+  // Re-parse and compare fields rather than raw bytes, since the builder
+  // uses the current time as its timebase (matching real
+  // get_propagation_node_app_data()'s int(time.time())) rather than a fixed
+  // one — the fixed-timebase byte vector is checked directly below instead.
+  const parsed = protocol.lxmf_parse_propagation_announce_app_data(built);
+  assert.equal(parsed.stampCost, 16);
+  assert.equal(parsed.stampCostFlexibility, 3);
+  assert.equal(parsed.peeringCost, 18);
+  assert.equal(parsed.perTransferLimitKb, 1000);
+  assert.equal(parsed.perSyncLimit, 10);
+  assert.equal(parsed.nodeState, true);
+  assert.equal(parsed.name, 'testnode');
+
+  const fixedTimebaseCapture = crypto.hexToBytes('97c2ce6553f100c3cd03e80a931003128101c408746573746e6f6465');
+  const parsedFixed = protocol.lxmf_parse_propagation_announce_app_data(fixedTimebaseCapture);
+  assert.equal(parsedFixed.timebase, 1700000000);
+  assert.equal(parsedFixed.stampCost, 16);
+  assert.equal(parsedFixed.stampCostFlexibility, 3);
+  assert.equal(parsedFixed.peeringCost, 18);
+  assert.equal(parsedFixed.name, 'testnode');
+});
+
+test('lxmf_parse_propagation_announce_app_data returns null for invalid/absent data, matching pn_announce_data_is_valid rules', () => {
+  assert.equal(protocol.lxmf_parse_propagation_announce_app_data(null), null);
+  assert.equal(protocol.lxmf_parse_propagation_announce_app_data(new Uint8Array(0)), null);
+  // A 3-element list (the lxmf.delivery announce shape, not propagation's 7-element one).
+  assert.equal(protocol.lxmf_parse_propagation_announce_app_data(protocol.lxmf_build_announce_app_data('Alice', 12)), null);
+});
+
+test("PropagationNode.announce() embeds real stamp/peering cost app_data, and propagateLXMF()/syncToPeer() auto-detect it instead of needing the cost supplied out of band", async () => {
+  const rnsSender = new Reticulum();
+  const rnsPropNode = new Reticulum();
+  makeBridgedPair(rnsSender, rnsPropNode);
+
+  const propNodeIdentity = Identity.create();
+  const propNode = new propagation.PropagationNode(rnsPropNode, propNodeIdentity, { stampCost: 8, peeringCost: 12 });
+
+  const senderIdentity = Identity.create();
+  const senderSelf = new Destination(rnsSender, senderIdentity, Destination.IN, Destination.SINGLE, 'lxmf', 'delivery');
+
+  const recipientIdentity = Identity.create();
+  const recipientSelfHash = protocol.get_identity_destination_hash(recipientIdentity.public, 'lxmf.delivery');
+  rnsSender.identities.set(crypto.bytesToHex(recipientSelfHash), { public_key: recipientIdentity.public, ratchet: recipientIdentity.ratchetPublic });
+
+  const senderKnowsPropNode = new Promise((resolve) => rnsSender.once('announce', resolve));
+  propNode.announce();
+  const nodeAnnounce = await senderKnowsPropNode;
+
+  // Confirm the announce itself really carries the node's configured cost —
+  // not just that propagateLXMF() happens to work below.
+  const parsedNodeAppData = protocol.lxmf_parse_propagation_announce_app_data(nodeAnnounce.app_data);
+  assert.equal(parsedNodeAppData.stampCost, 8);
+  assert.equal(parsedNodeAppData.peeringCost, 12);
+
+  const destOut = new Destination(rnsSender, recipientIdentity, Destination.OUT, Destination.SINGLE, 'lxmf', 'delivery');
+  const propNodeOutFromSender = new Destination(rnsSender, propNodeIdentity, Destination.OUT, Destination.SINGLE, 'lxmf', 'propagation');
+
+  // No stampCost argument at all — must be read from the node's own announce.
+  const link = new Link(rnsSender, propNodeOutFromSender);
+  await new Promise((resolve) => link.once('established', resolve));
+  await propagation.propagateLXMF(link, destOut, senderSelf, 'auto-detected cost', 'no out-of-band stamp cost needed', {});
+  link.close();
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(propNode.messages.size, 1, 'the upload, stamped at the auto-detected cost of 8, was accepted');
+});
+
 // --- Node-to-node peer sync ("/offer" protocol, peering-key stamps) ---
 
 test('validate_peering_key matches LXStamper.validate_peering_key\'s workblock (WORKBLOCK_EXPAND_ROUNDS_PEERING) byte-for-byte', () => {
@@ -638,6 +715,55 @@ test('syncToPeer() offers a stored message to another propagation node, which ac
   assert.equal(crypto.bytesToHex(messages[0].source_hash), crypto.bytesToHex(senderSelf.hash));
 
   recipientLink.close();
+});
+
+test('syncToPeer() auto-detects the peer\'s required peeringCost from its announce, instead of needing it supplied out of band', async () => {
+  const rnsSender = new Reticulum();
+  const rnsNodeA = new Reticulum();
+  const rnsNodeB = new Reticulum();
+  makeBridgedPair(rnsSender, rnsNodeA);
+  makeBridgedPair(rnsNodeA, rnsNodeB);
+
+  const nodeAIdentity = Identity.create();
+  const nodeA = new propagation.PropagationNode(rnsNodeA, nodeAIdentity, { peeringCost: 8 });
+  const nodeBIdentity = Identity.create();
+  const nodeB = new propagation.PropagationNode(rnsNodeB, nodeBIdentity, { peeringCost: 8 });
+
+  const senderIdentity = Identity.create();
+  const senderSelf = new Destination(rnsSender, senderIdentity, Destination.IN, Destination.SINGLE, 'lxmf', 'delivery');
+  const recipientIdentity = Identity.create();
+  const recipientSelfHash = protocol.get_identity_destination_hash(recipientIdentity.public, 'lxmf.delivery');
+  rnsSender.identities.set(crypto.bytesToHex(recipientSelfHash), { public_key: recipientIdentity.public, ratchet: recipientIdentity.ratchetPublic });
+
+  const senderKnowsNodeA = new Promise((resolve) => rnsSender.once('announce', resolve));
+  nodeA.announce();
+  await senderKnowsNodeA;
+
+  const destOut = new Destination(rnsSender, recipientIdentity, Destination.OUT, Destination.SINGLE, 'lxmf', 'delivery');
+  const nodeAOutFromSender = new Destination(rnsSender, nodeAIdentity, Destination.OUT, Destination.SINGLE, 'lxmf', 'propagation');
+  const senderLink = new Link(rnsSender, nodeAOutFromSender);
+  await new Promise((resolve) => senderLink.once('established', resolve));
+  await propagation.propagateLXMF(senderLink, destOut, senderSelf, 'auto-peering', 'no out-of-band peering cost needed', {});
+  senderLink.close();
+  assert.equal(nodeA.messages.size, 1);
+
+  // Node A must have actually heard node B's announce for the auto-detect
+  // path to have anything to read.
+  const nodeAKnowsNodeB = new Promise((resolve) => rnsNodeA.once('announce', resolve));
+  nodeB.announce();
+  await nodeAKnowsNodeB;
+
+  const nodeBOutFromA = new Destination(rnsNodeA, nodeBIdentity, Destination.OUT, Destination.SINGLE, 'lxmf', 'propagation');
+  const peerLink = new Link(rnsNodeA, nodeBOutFromA);
+  await new Promise((resolve) => peerLink.once('established', resolve));
+
+  // No peeringCost argument at all — must be read from node B's own announce.
+  const result = await propagation.syncToPeer(nodeA, peerLink, nodeB.identity);
+  assert.equal(result.offered, 1);
+  assert.equal(result.synced, 1, 'the peering key, generated at the auto-detected cost of 8, was accepted by node B');
+  assert.equal(nodeB.messages.size, 1);
+
+  peerLink.close();
 });
 
 test('a propagation node rejects an /offer whose peering key does not meet its required peeringCost', async () => {

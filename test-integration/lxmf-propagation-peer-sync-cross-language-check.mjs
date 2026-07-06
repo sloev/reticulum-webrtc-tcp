@@ -17,6 +17,7 @@ import { Reticulum, Identity, Destination, Link, Interface } from '../shared/rns
 import { createTCPGateway } from '../node/tcp-gateway.js';
 import * as crypto from '../shared/rns/crypto.js';
 import * as propagation from '../shared/rns/propagation.js';
+import * as protocol from '../shared/rns/protocol.js';
 
 const PYLIBS = process.env.PYLIBS;
 if (!PYLIBS) {
@@ -102,6 +103,16 @@ py.stdout.on('data', (d) => {
 const ready = await waitFor((m) => m.event === 'ready', 15000);
 console.log('real LXMRouter propagation node ready:', ready);
 
+// The real LXMRouter fires its own get_propagation_node_app_data()-carrying
+// announce ~20s after enable_propagation() (NODE_ANNOUNCE_DELAY) — start
+// waiting for it immediately (compliance.md Phase 5.3), in parallel with the
+// rest of setup below.
+const realNodeAnnouncePromise = new Promise((resolve) => {
+  rns.on('announce', function handler(a) {
+    if (crypto.bytesToHex(a.destination_hash) === ready.dest_hash) { rns.off('announce', handler); resolve(a); }
+  });
+});
+
 // Our own PropagationNode, holding a message uploaded by a local "sender"
 // (nothing to do with the real node yet).
 const nodeIdentity = Identity.create();
@@ -126,10 +137,24 @@ const destOut = new Destination(rnsSender, recipientIdentity, Destination.OUT, D
 const nodeOutFromSender = new Destination(rnsSender, nodeIdentity, Destination.OUT, Destination.SINGLE, 'lxmf', 'propagation');
 const senderLink = new Link(rnsSender, nodeOutFromSender);
 await new Promise((resolve) => senderLink.once('established', resolve));
+
+console.log("waiting for the real LXMRouter's own propagation-node announce (compliance.md Phase 5.3, ~20s)...");
+const realNodeAnnounce = await realNodeAnnouncePromise;
+const parsedRealNodeAppData = protocol.lxmf_parse_propagation_announce_app_data(realNodeAnnounce.app_data);
+assertTrue(!!parsedRealNodeAppData, "JS successfully parsed the real LXMRouter's own get_propagation_node_app_data()-shaped announce");
+assertEqual(parsedRealNodeAppData?.stampCost, ready.propagation_stamp_cost, "the announce's stamp_cost matches what the node itself reported out of band (cross-checking, not relying on the side channel)");
+assertEqual(parsedRealNodeAppData?.peeringCost, ready.peering_cost, "the announce's peering_cost matches");
+
 // Stamp the message at the cost the REAL node will require once it's synced
 // there as a peer — peer sync forwards the original stamp unchanged, and the
-// real node re-validates it against its own required cost on receipt.
-const requiredStampCost = Math.max(0, ready.propagation_stamp_cost - ready.propagation_stamp_cost_flexibility);
+// real node re-validates it against its own required cost on receipt. Read
+// from the real announce just parsed above, not the out-of-band `ready.*`
+// fields (an explicit override, since this upload's own destination — our
+// local `node` — isn't the same as the real node whose future cost matters
+// here; propagateLXMF()'s own auto-detection reads its immediate link's
+// destination's announce, which would be the wrong one in this cross-node
+// scenario).
+const requiredStampCost = Math.max(0, parsedRealNodeAppData.stampCost - parsedRealNodeAppData.stampCostFlexibility);
 await propagation.propagateLXMF(senderLink, destOut, senderSelf, 'peer sync interop', 'hello via a real LXMRouter peer', {}, requiredStampCost);
 senderLink.close();
 assertTrue(node.messages.size === 1, `this stack's own PropagationNode is holding the uploaded message (count=${node.messages.size})`);
@@ -143,9 +168,11 @@ const peerLink = new Link(rns, realNodeDest);
 await new Promise((resolve) => peerLink.once('established', resolve));
 console.log('real Link established to the reference LXMRouter propagation node, for peer sync');
 
-console.log(`computing a peering key at the node's required cost (${ready.peering_cost}) — this can take several seconds...`);
+console.log(`computing a peering key at the announce-derived required cost — this can take several seconds...`);
 const t0 = Date.now();
-const result = await propagation.syncToPeer(node, peerLink, realNodeIdentity, { peeringCost: ready.peering_cost });
+// No peeringCost argument — syncToPeer() reads it from the real node's own
+// announce (peerLink's destination), already cached above.
+const result = await propagation.syncToPeer(node, peerLink, realNodeIdentity);
 console.log(`peering key computed and sync completed in ${Date.now() - t0}ms:`, result);
 
 assertTrue(result.offered === 1, `syncToPeer() offered exactly 1 message (offered=${result.offered})`);

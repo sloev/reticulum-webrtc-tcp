@@ -113,7 +113,7 @@ reason).
 | DIRECT delivery (over a Link; packet or Resource) | `LXMF/LXMessage.py:30–34` (methods), `:355–460` (`pack`), `:626–654` (`__as_packet`/`__as_resource`) | `shared/rns/protocol.js` `lxmf_build_direct/lxmf_parse_direct`, `shared/rns/index.js` `Link.sendLXMF` | DONE | byte-exact + live `test:integration:lxmf` (both directions, both representations) |
 | Delivery announce app_data (`[display_name, stamp_cost, [SF_COMPRESSION]]`) | `LXMF/LXMRouter.py:985–1000` `get_announce_app_data`, `LXMF/LXMF.py:174` `stamp_cost_from_app_data` | `shared/rns/protocol.js` `lxmf_build_announce_app_data/lxmf_stamp_cost_from_app_data` | DONE | byte-exact |
 | Compression negotiation (`SF_COMPRESSION` → `auto_compress`) | `LXMF/LXMessage.py:510–517` `determine_compression_support` | `shared/rns/protocol.js` `lxmf_compression_supported`, `shared/rns/index.js` `Link.sendLXMF` | DONE | unit + live `test:integration:lxmf` |
-| Propagation-node announce app_data (7-element list) | `LXMF/LXMRouter.py:300–318` `get_propagation_node_app_data`, `LXMF/LXMF.py:224` `pn_announce_data_is_valid` | — (stamp cost must be known out of band) | MISSING | **Phase 5.3** |
+| Propagation-node announce app_data (7-element list) | `LXMF/LXMRouter.py:300–318` `get_propagation_node_app_data`, `LXMF/LXMF.py:224` `pn_announce_data_is_valid` | `shared/rns/protocol.js` `lxmf_build_propagation_announce_app_data/lxmf_parse_propagation_announce_app_data` | DONE | byte-exact + live (`propagateLXMF`/`syncToPeer` auto-detect from a real `LXMRouter`'s own announce) |
 | Interop with end-user clients (NomadNet, Sideband) | n/a | — | UNTESTED | **Phase 6** |
 | PAPER delivery method (QR-encoded messages) | `LXMF/LXMessage.py:33,446–456` | — | N/A — no meaningful use over WebRTC/TCP; revisit on request | — |
 
@@ -471,14 +471,49 @@ Python side — that JS's next oversized DIRECT send genuinely skipped compressi
 response to that real announce (re-run 3× for stability). Full regression re-run
 clean: 69/69 unit tests, `vite build`.
 
-**5.3 Propagation-node announce app_data.** Implement
-`[False, timebase, node_state, per_transfer_limit_kb, per_sync_limit, [stamp_cost,
-flexibility, peering_cost], metadata]` on `PropagationNode.announce()`; validate inbound
-with `pn_announce_data_is_valid` rules (LXMF.py:224). Senders (`propagateLXMF`,
-`syncToPeer`) read the required stamp/peering cost from the announce instead of taking
-it as an argument (keep the argument as an override). Live: JS uploads to a real node
-using *only* its announce to learn the stamp cost; JS node's announce parses cleanly
-with real `pn_announce_data_is_valid` and a real router lists it as a candidate node.
+**5.3 Propagation-node announce app_data — ✅ Done.** Read `LXMRouter.
+get_propagation_node_app_data()` (LXMRouter.py:300–318) and `LXMF.pn_announce_data_
+is_valid()`/`pn_stamp_cost_from_app_data()` (LXMF.py:174–246).
+
+Implemented in `shared/rns/protocol.js`: `lxmf_build_propagation_announce_app_data()`
+builds the 7-element `[false, timebase, node_state, per_transfer_limit_kb,
+per_sync_limit, [stamp_cost, stamp_cost_flexibility, peering_cost], metadata]` list
+— byte-exact against a real `get_propagation_node_app_data()`-equivalent capture,
+including the metadata dict's integer-keyed `PN_META_NAME` entry (needed a `Map`
+rather than a plain JS object, since a plain object's keys are always coerced to
+strings — `Object.entries({1: x})` would have msgpacked the key `1` as the *string*
+`"1"`, not the integer real LXMF expects, a mismatch that would have silently broken
+interop). `lxmf_parse_propagation_announce_app_data()` validates and parses it back,
+matching `pn_announce_data_is_valid()`'s exact rules (7 elements, decodable
+timebase, strictly-boolean node_state, integer transfer/sync limits, a 3-element
+integer stamp-cost list, dict-typed metadata) — returning `null` for anything that
+fails, mirroring `pn_stamp_cost_from_app_data()`'s own `None` fallback rather than
+throwing.
+
+`PropagationNode.announce()` now embeds this using the node's own configured
+`stampCost`/`peeringCost` (previously always empty). `propagateLXMF()`/`syncToPeer()`
+both changed their `stampCost`/`peeringCost` parameter default from a fixed number to
+`null`, meaning "read it from the destination's most recently cached announce
+app_data" (already stored per-destination on every announce, same cache Phase 5.2
+reads for compression support) — computing `stamp_cost - stamp_cost_flexibility` as
+the safe target, same as a real LXMF client would; an explicit number still works as
+an override for cases where the announce isn't available yet, or (as in the peer-sync
+live test below) where the relevant announce belongs to a different destination than
+the one being called through.
+
+Verified: unit tests (`test/lxmf-compliance.test.js`) — the app_data byte-exact
+match (cross-checked against a real fixed-timebase capture) and validation-rejection
+rules, plus two full JS-to-JS tests confirming `propagateLXMF()`/`syncToPeer()`
+genuinely read the cost from a `PropagationNode.announce()` rather than needing it
+passed. Live: both `lxmf-propagation-cross-language-check.mjs` and
+`lxmf-propagation-peer-sync-cross-language-check.mjs` extended to make
+`lxmf_propagation_node.py` call the real `LXMRouter.announce_propagation_node()`
+(firing ~20s later, `NODE_ANNOUNCE_DELAY`) and have JS wait for and parse that real
+announce, cross-checking every field against the test harness's own out-of-band
+values before using *only* the parsed announce to drive `propagateLXMF()`/
+`syncToPeer()`'s cost (re-run twice each for stability, given the added real-world
+timing dependency). Full regression re-run clean: 73/73 unit tests, `vite build`,
+and the `lxmf`/`resource`/`channel` live checks.
 
 ### Phase 6 — end-user client interop
 
@@ -525,3 +560,4 @@ its "verified by" filled in; remove stale caveats elsewhere (module comments cit
 | 2026-07-06 | Phase 4 | Transport parity implemented: `requestPath()` throttling (`PATH_REQUEST_MI`), a persistent per-instance transport identity powering the 3-field path request form (previously 2-field only), path table expiry (`DESTINATION_TIMEOUT`), and an announce rate table mechanism (unenforced, matching RNS's own default-off `announce_rate_target`). Path-request rebroadcast grace and `LOCAL_REBROADCASTS_MAX` scoped out (LAN-collision-avoidance optimizations tied to RNS's announce-table retry machinery, not needed for correctness or interop). 62/62 unit tests pass; new live `test:integration:path-request` confirms a real, unmodified `rns` process's `path_request_handler()` correctly parses and answers the new 3-field form, and that repeat requests are suppressed (re-run 3× for stability). Full regression clean: unit tests, `vite build`, sparse-mesh live check. |
 | 2026-07-06 | Phase 5.1 | LXMF DIRECT delivery implemented (`Link.sendLXMF()`, packet or Resource, matching `LXMessage.pack()`'s own representation choice) — corrected a mistake in this plan's own original wording along the way (DIRECT keeps the destination-hash prefix; OPPORTUNISTIC is the one that omits it, confirmed by reading `LXMessage.__as_packet()` and capturing a real `.pack()` byte vector). 66/66 unit tests pass; live `lxmf-cross-language-check.mjs` extended to exchange DIRECT messages with a real, unmodified `lxmf`/`rns` process in both directions and both packet/Resource representations (re-run 3× for stability). Full regression clean: unit tests, `vite build`, `resource`/`lxmf-propagation`/`lxmf-peer-sync` live checks. |
 | 2026-07-06 | Phase 5.2 | LXMF delivery announce app_data (`lxmf_build_announce_app_data`/`lxmf_stamp_cost_from_app_data`/`lxmf_compression_supported`, byte-exact) and compression negotiation implemented — `Link.sendLXMF()` skips compression for a Resource-sized message when the recipient's cached announce explicitly declares no `SF_COMPRESSION` support. 69/69 unit tests pass; live `lxmf-cross-language-check.mjs` extended so a real, unmodified `rns`/`lxmf` process re-announces declaring no compression support, and JS's next oversized DIRECT send is confirmed (via the real `RNS.Resource`'s own `compressed` attribute on the Python side) to have genuinely honored it (re-run 3× for stability). Full regression clean: unit tests, `vite build`. |
+| 2026-07-06 | Phase 5.3 | Propagation-node announce app_data implemented (`lxmf_build_propagation_announce_app_data`/`lxmf_parse_propagation_announce_app_data`, byte-exact, including catching a would-be integer-vs-string msgpack key mismatch before it could break interop). `PropagationNode.announce()` now embeds real stamp/peering cost; `propagateLXMF()`/`syncToPeer()` default to reading it from a cached announce instead of a required argument. 73/73 unit tests pass; both propagation live checks extended to make a real `LXMRouter` fire its actual `announce_propagation_node()` (~20s delay) and drive JS's uploads/peer-sync using *only* the parsed real announce, cross-checked against the test harness's own values (re-run twice each for stability). Full regression clean: unit tests, `vite build`, `lxmf`/`resource`/`channel` live checks. **Phase 5 (LXMF outbound parity) is now complete.** |

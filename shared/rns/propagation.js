@@ -83,8 +83,16 @@ export class PropagationNode {
         });
     }
 
-    announce() {
-        this.destination.announce();
+    // Matches LXMRouter.announce()/get_propagation_node_app_data(): the
+    // announce carries this node's real stamp/peering cost (and an optional
+    // display name) so a sender no longer needs to be told the required cost
+    // out of band — see propagateLXMF()/syncToPeer()'s stampCost/peeringCost
+    // auto-detection below.
+    announce({ name = null } = {}) {
+        const appData = protocol.lxmf_build_propagation_announce_app_data({
+            stampCost: this.stampCost, peeringCost: this.peeringCost, name,
+        });
+        this.destination.announce({ appData });
     }
 
     _onUpload(resourceData) {
@@ -210,12 +218,19 @@ export class PropagationNode {
 // Sends an LXMF message via store-and-forward instead of directly: builds
 // the same LXMF envelope Destination.sendLXMF() would (signed by `source`,
 // your own IN destination), encrypts it to `destination`'s identity,
-// computes an admission stamp (see stamp.js — target `stampCost` must match
-// what the destination propagation node requires, since this implementation
-// doesn't parse a node's announced cost automatically), and uploads it over
-// an already-established Link. Returns the Link.sendResource() promise
+// computes an admission stamp (see stamp.js), and uploads it over an
+// already-established Link. Returns the Link.sendResource() promise
 // (resolves once the node acknowledges receipt of the transfer).
-export async function propagateLXMF(propagationLink, destination, source, title, content, fields = {}, stampCost = 0) {
+//
+// `stampCost` defaults to null, meaning: read the target cost from the
+// propagation node's own most recently cached announce (`propagationLink.
+// destination`'s app_data, parsed via protocol.lxmf_parse_propagation_
+// announce_app_data() — matches LXMRouter.get_propagation_node_app_data()),
+// using stamp_cost - stamp_cost_flexibility as the safe target, same as a
+// real LXMF client would. Falls back to 0 if no announce has been seen.
+// Pass an explicit number to override this (e.g. if the node's announce
+// isn't available yet, or for testing rejection of an under-cost stamp).
+export async function propagateLXMF(propagationLink, destination, source, title, content, fields = {}, stampCost = null) {
     if (destination.direction !== Destination.OUT) {
         throw new Error("Can only propagate LXMF to OUT destinations.");
     }
@@ -226,6 +241,12 @@ export async function propagateLXMF(propagationLink, destination, source, title,
     const knownIdentity = destination.rns.identities.get(crypto.bytesToHex(destination.hash));
     if (!knownIdentity) {
         throw new Error("Cannot propagate LXMF: destination identity not known.");
+    }
+
+    if (stampCost === null) {
+        const nodeIdentity = propagationLink.rns.identities.get(crypto.bytesToHex(propagationLink.destination.hash));
+        const nodeAnnounceData = protocol.lxmf_parse_propagation_announce_app_data(nodeIdentity?.app_data);
+        stampCost = nodeAnnounceData ? Math.max(0, nodeAnnounceData.stampCost - nodeAnnounceData.stampCostFlexibility) : 0;
     }
 
     const wirePayload = protocol.lxmf_build(content, source.identity.private, destination.hash, source.hash, null, title, fields);
@@ -345,14 +366,23 @@ export async function syncFromRealPropagationNode(propagationLink, source) {
 // retry backoff, or transfer-rate tracking: this is one explicit sync
 // attempt, not a standing peer relationship that syncs itself over time.
 //
-// peeringCost must match what the peer actually requires (its own
-// LXMRouter.peering_cost/PropagationNode.peeringCost) — like propagateLXMF's
-// stampCost, this isn't learned automatically from an announce, so it has
-// to be supplied by the caller. The peering key is generated once per
-// `node` (cached on first sync) and on real LXMF, at the default cost of
-// 18, expect this to take several seconds — see stamp.js's module comment
-// on why there's no parallel search to speed it up.
-export async function syncToPeer(node, peerLink, peerIdentity, { peeringCost = 18 } = {}) {
+// peeringCost defaults to null, meaning: read it from the peer's own most
+// recently cached announce (peerLink.destination's app_data, same parsing as
+// propagateLXMF's stampCost auto-detection above) — matching what the peer
+// actually requires (its own LXMRouter.peering_cost/PropagationNode.
+// peeringCost) without needing it supplied out of band. Falls back to 18
+// (real LXMF's own default) if no announce has been seen. Pass an explicit
+// number to override. The peering key is generated once per `node` (cached
+// on first sync) and, at a cost of 18, expect this to take several seconds
+// — see stamp.js's module comment on why there's no parallel search to
+// speed it up.
+export async function syncToPeer(node, peerLink, peerIdentity, { peeringCost = null } = {}) {
+    if (peeringCost === null) {
+        const peerNodeIdentity = peerLink.rns.identities.get(crypto.bytesToHex(peerLink.destination.hash));
+        const peerAnnounceData = protocol.lxmf_parse_propagation_announce_app_data(peerNodeIdentity?.app_data);
+        peeringCost = peerAnnounceData ? peerAnnounceData.peeringCost : 18;
+    }
+
     peerLink.identify(node.identity);
 
     const peerHashHex = crypto.bytesToHex(peerIdentity.hash);
