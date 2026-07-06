@@ -646,6 +646,54 @@ export function lxmf_parse_direct(decrypted, sender_pub) {
     }
 }
 
+// LXMF's supported-functionality signaling codes (LXMF.py:142) — currently
+// only compression negotiation exists.
+export const SF_COMPRESSION = 0x00;
+
+// Matches LXMRouter.get_announce_app_data(): an `lxmf.delivery` destination's
+// announce app_data is [display_name|null, stamp_cost|null,
+// supported_functionality_list], msgpacked. Byte-exact against a real
+// `get_announce_app_data()` capture for both an empty and a fully-populated
+// case (see test/lxmf-compliance.test.js).
+export function lxmf_build_announce_app_data(display_name = null, stamp_cost = null) {
+    const nameBytes = display_name ? (typeof display_name === 'string' ? new TextEncoder().encode(display_name) : display_name) : null;
+    const cost = (typeof stamp_cost === 'number' && stamp_cost > 0 && stamp_cost < 255) ? stamp_cost : null;
+    return lxmfMsgpack.pack([nameBytes, cost, [SF_COMPRESSION]]);
+}
+
+// Matches LXMF.stamp_cost_from_app_data(): a recipient's required stamp cost
+// for unsolicited (OPPORTUNISTIC/DIRECT) delivery, read from their own
+// announce instead of needing to be known out of band. Returns null if
+// absent (no cost required) or the app_data isn't the list-shaped format.
+export function lxmf_stamp_cost_from_app_data(app_data) {
+    if (!app_data || app_data.length === 0) return null;
+    try {
+        const peer_data = lxmfMsgpack.unpack(app_data);
+        if (!Array.isArray(peer_data) || peer_data.length < 2) return null;
+        return peer_data[1] ?? null;
+    } catch {
+        return null;
+    }
+}
+
+// Matches LXMF.compression_support_from_app_data(), folded together with
+// LXMessage.determine_compression_support()'s no-app_data default: no
+// announce seen yet (or one with no functionality-signaling field at all) is
+// assumed to support compression, matching RNS's own default of True — only
+// an explicit, present-but-empty (or non-matching) functionality list turns
+// this false.
+export function lxmf_compression_supported(app_data) {
+    if (!app_data || app_data.length === 0) return true;
+    try {
+        const peer_data = lxmfMsgpack.unpack(app_data);
+        if (!Array.isArray(peer_data) || peer_data.length < 3) return true;
+        if (!Array.isArray(peer_data[2])) return true;
+        return peer_data[2].includes(SF_COMPRESSION);
+    } catch {
+        return true;
+    }
+}
+
 // --- RNS.Resource (chunked large-transfer protocol over a Link) ---
 // Transfers larger than one segment's worth (RESOURCE_SEGMENT_MAX_SIZE) are
 // split into multiple segments — each with its own independent advertise/

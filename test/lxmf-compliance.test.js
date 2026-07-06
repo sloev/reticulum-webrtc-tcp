@@ -240,6 +240,96 @@ test('Link.sendLXMF() falls back to a Resource for a DIRECT LXMF message too lar
   initiatorLink.close();
 });
 
+// --- Delivery announce app_data + compression negotiation (Phase 5.2) ---
+
+test('lxmf_build_announce_app_data matches LXMRouter.get_announce_app_data() byte-for-byte, for both an empty and a fully-populated case', () => {
+  // Captured from real `RNS.vendor.umsgpack.packb([display_name, stamp_cost,
+  // [LXMF.SF_COMPRESSION]])` — the exact structure get_announce_app_data() builds.
+  assert.equal(crypto.bytesToHex(protocol.lxmf_build_announce_app_data()), '93c0c09100');
+  assert.equal(crypto.bytesToHex(protocol.lxmf_build_announce_app_data('Alice', 12)), '93c405416c6963650c9100');
+});
+
+test('lxmf_stamp_cost_from_app_data and lxmf_compression_supported match LXMF.stamp_cost_from_app_data/compression_support_from_app_data', () => {
+  assert.equal(protocol.lxmf_stamp_cost_from_app_data(null), null);
+  assert.equal(protocol.lxmf_compression_supported(null), true, 'no announce seen yet defaults to compression supported');
+
+  const withCost = protocol.lxmf_build_announce_app_data('Alice', 12);
+  assert.equal(protocol.lxmf_stamp_cost_from_app_data(withCost), 12);
+  assert.equal(protocol.lxmf_compression_supported(withCost), true);
+
+  // An app_data whose functionality list doesn't include SF_COMPRESSION (an
+  // empty list, matching a real peer that declared it doesn't support
+  // compression) — real LXMF.compression_support_from_app_data() returns
+  // False here, not a permissive default, since the list is present.
+  const noCompressionAppData = msgpack.pack([null, null, []]);
+  assert.equal(protocol.lxmf_compression_supported(noCompressionAppData), false);
+});
+
+test('Link.sendLXMF() skips compression for an oversized message when the recipient\'s announced app_data says they don\'t support it', async () => {
+  const rnsA = new Reticulum();
+  const rnsB = new Reticulum();
+
+  class Bridge extends Interface {
+    connect() {}
+    sendData(data) { setTimeout(() => this.other.rns.onPacketReceived(data, this.other), 0); }
+  }
+  const ifaceA = new Bridge('A');
+  const ifaceB = new Bridge('B');
+  ifaceA.other = ifaceB;
+  ifaceB.other = ifaceA;
+  rnsA.addInterface(ifaceA);
+  rnsB.addInterface(ifaceB);
+
+  const identityA = Identity.create();
+  const identityB = Identity.create();
+  const selfA = new Destination(rnsA, identityA, Destination.IN, Destination.SINGLE, 'lxmf', 'delivery');
+  const selfB = new Destination(rnsB, identityB, Destination.IN, Destination.SINGLE, 'lxmf', 'delivery');
+  const bFromA = new Destination(rnsA, identityB, Destination.OUT, Destination.SINGLE, 'lxmf', 'delivery');
+
+  // B announces with an app_data that explicitly declares no compression
+  // support (an empty functionality list) — A must honor that.
+  const aGotAnnounce = new Promise((resolve) => rnsA.once('announce', resolve));
+  const noCompressionAppData = msgpack.pack([null, null, []]);
+  selfB.announce({ appData: noCompressionAppData });
+  await aGotAnnounce;
+
+  const bGotAnnounce = new Promise((resolve) => rnsB.once('announce', resolve));
+  selfA.announce();
+  await bGotAnnounce;
+
+  const responderLinkPromise = new Promise((resolve) => selfB.on('link', resolve));
+  const initiatorLink = new Link(rnsA, bFromA);
+  await new Promise((resolve) => initiatorLink.once('established', resolve));
+  const responderLink = await responderLinkPromise;
+  await new Promise((resolve) => (responderLink.status === Link.ACTIVE ? resolve() : responderLink.once('established', resolve)));
+
+  // Intercept the outgoing advertisement's own `compressed` flag directly —
+  // real proof that compression wasn't even attempted, not just that the
+  // final decompressed content happens to match either way.
+  let advCompressed = null;
+  const originalSendData = ifaceA.sendData.bind(ifaceA);
+  ifaceA.sendData = (data) => {
+    const packet = protocol.packet_unpack(data);
+    if (packet && packet.context === protocol.CONTEXT_RESOURCE_ADV) {
+      const plaintext = protocol.link_decrypt(initiatorLink.derivedKey, packet.data);
+      const adv = protocol.parse_resource_advertisement(plaintext);
+      if (adv) advCompressed = adv.compressed;
+    }
+    originalSendData(data);
+  };
+
+  const gotLxmf = new Promise((resolve) => responderLink.on('lxmf', resolve));
+  const bigContent = 'a'.repeat(protocol.LINK_MDU * 2); // highly compressible, to make the effect obvious if compression WERE attempted
+  await initiatorLink.sendLXMF(selfA, 'no compress', bigContent, {});
+  const received = await gotLxmf;
+
+  assert.equal(advCompressed, false, "the Resource advertisement's own compressed flag is false — compression was not attempted at all, matching the recipient's declared lack of support");
+  assert.equal(received.valid, true);
+  assert.equal(new TextDecoder().decode(received.content), bigContent);
+
+  initiatorLink.close();
+});
+
 test('Destination.sendLXMF() delivers an LXMF message end to end between two independent Reticulum peers', async () => {
   const rnsA = new Reticulum();
   const rnsB = new Reticulum();

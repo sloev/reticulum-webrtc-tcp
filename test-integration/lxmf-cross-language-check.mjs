@@ -158,6 +158,29 @@ const jsDirect2 = await new Promise((resolve) => jsDirectLink2.on('lxmf', resolv
 assertTrue(jsDirect2.valid, 'JS validated the Python-signed DIRECT LXMF message (Resource fallback)');
 assertEqual(new TextDecoder().decode(jsDirect2.content), bigContent, 'JS received the correct DIRECT (Resource) content, forced over the size of a single link packet, from real lxmf');
 
+// --- Compression negotiation (compliance.md Phase 5.2): Python re-announces
+// its lxmf.delivery destination with a real get_announce_app_data()-shaped
+// app_data explicitly declaring no SF_COMPRESSION support; JS must honor
+// that on its next oversized DIRECT send, skipping compression entirely —
+// confirmed from Python's own side via the resource's `compressed` flag. ---
+const jsSawNoCompressionAnnounce = new Promise((resolve) => {
+  rns.on('announce', function handler(a) {
+    if (crypto.bytesToHex(a.destination_hash) === ready.lxmf_dest_hash) { rns.off('announce', handler); resolve(); }
+  });
+});
+py.stdin.write(JSON.stringify({ cmd: 'announce_lxmf_no_compression' }) + '\n');
+await jsSawNoCompressionAnnounce;
+
+const pyGotDirectLxmf3 = waitFor((m) => m.event === 'lxmf_received' && m.title === 'direct js no compress', 10000);
+const jsToPyLink3 = new Link(rns, jsToPyDest);
+await new Promise((resolve) => jsToPyLink3.once('established', resolve));
+await jsToPyLink3.sendLXMF(self, 'direct js no compress', bigContent, {});
+const pyDirect3 = await pyGotDirectLxmf3;
+assertTrue(pyDirect3.valid, 'Python validated the JS-signed DIRECT LXMF message sent after negotiating no compression');
+assertEqual(pyDirect3.content, bigContent, 'Python received the correct content with compression negotiated off');
+assertEqual(pyDirect3.compressed, false, "the real RNS.Resource Python received reports compressed=False — JS genuinely read Python's real announce app_data and skipped compression, not just decoded it correctly either way");
+jsToPyLink3.close();
+
 py.kill();
 gateway.server.close();
 

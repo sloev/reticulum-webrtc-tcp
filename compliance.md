@@ -111,8 +111,8 @@ reason).
 | Propagation node store & client sync (`/get`) | `LXMF/LXMRouter.py` `message_get_request` | `shared/rns/propagation.js` `PropagationNode`, `syncFromRealPropagationNode` | DONE | live (upload + download vs real node) |
 | Node-to-node peer sync (`/offer`) | `LXMF/LXMPeer.py`, `LXMRouter.offer_request` | `shared/rns/propagation.js` `syncToPeer/_onOfferRequest` | DONE | live (real node accepts + stores) |
 | DIRECT delivery (over a Link; packet or Resource) | `LXMF/LXMessage.py:30–34` (methods), `:355–460` (`pack`), `:626–654` (`__as_packet`/`__as_resource`) | `shared/rns/protocol.js` `lxmf_build_direct/lxmf_parse_direct`, `shared/rns/index.js` `Link.sendLXMF` | DONE | byte-exact + live `test:integration:lxmf` (both directions, both representations) |
-| Delivery announce app_data (`[display_name, stamp_cost, [SF_COMPRESSION]]`) | `LXMF/LXMRouter.py:985–1000` `get_announce_app_data`, `LXMF/LXMF.py:174` `stamp_cost_from_app_data` | — | MISSING | **Phase 5.2** |
-| Compression negotiation (`SF_COMPRESSION` → `auto_compress`) | `LXMF/LXMessage.py:510–517` `determine_compression_support` | — | MISSING (needs Phase 2.2) | **Phase 5.2** |
+| Delivery announce app_data (`[display_name, stamp_cost, [SF_COMPRESSION]]`) | `LXMF/LXMRouter.py:985–1000` `get_announce_app_data`, `LXMF/LXMF.py:174` `stamp_cost_from_app_data` | `shared/rns/protocol.js` `lxmf_build_announce_app_data/lxmf_stamp_cost_from_app_data` | DONE | byte-exact |
+| Compression negotiation (`SF_COMPRESSION` → `auto_compress`) | `LXMF/LXMessage.py:510–517` `determine_compression_support` | `shared/rns/protocol.js` `lxmf_compression_supported`, `shared/rns/index.js` `Link.sendLXMF` | DONE | unit + live `test:integration:lxmf` |
 | Propagation-node announce app_data (7-element list) | `LXMF/LXMRouter.py:300–318` `get_propagation_node_app_data`, `LXMF/LXMF.py:224` `pn_announce_data_is_valid` | — (stamp cost must be known out of band) | MISSING | **Phase 5.3** |
 | Interop with end-user clients (NomadNet, Sideband) | n/a | — | UNTESTED | **Phase 6** |
 | PAPER delivery method (QR-encoded messages) | `LXMF/LXMessage.py:33,446–456` | — | N/A — no meaningful use over WebRTC/TCP; revisit on request | — |
@@ -437,13 +437,39 @@ DIRECT messages in both directions, both packet-sized and Resource-sized (re-run
 for stability). Full regression re-run clean: 66/66 unit tests, `vite build`, and the
 `resource`/`lxmf-propagation`/`lxmf-peer-sync` live checks (unaffected, still passing).
 
-**5.2 Delivery announce app_data + compression negotiation.** Implement
-`[display_name|null, stamp_cost|null, [SF_COMPRESSION]]` (msgpack) as the demo/LXMF
-destinations' announce app_data; parse inbound ones (`stamp_cost_from_app_data`
-semantics: only list-typed app_data, index 1). Honor a peer's advertised
-`SF_COMPRESSION` when choosing `auto_compress` for DIRECT Resources
-(`determine_compression_support`). Depends on 2.2. Byte-exact: capture real
-`get_announce_app_data` output for a fixed name/cost and match.
+**5.2 Delivery announce app_data + compression negotiation — ✅ Done.** Read
+`LXMRouter.get_announce_app_data()` (LXMRouter.py:985–1000), `LXMF.stamp_cost_from_
+app_data()`/`compression_support_from_app_data()` (LXMF.py:174–200), and
+`LXMessage.determine_compression_support()` (LXMessage.py:510–517).
+
+Implemented in `shared/rns/protocol.js`: `lxmf_build_announce_app_data(display_name,
+stamp_cost)` builds the `[display_name|null, stamp_cost|null, [SF_COMPRESSION]]`
+msgpack structure (byte-exact against a real `get_announce_app_data()`-equivalent
+capture, both empty and populated); `lxmf_stamp_cost_from_app_data()` and
+`lxmf_compression_supported()` parse it back out, matching the real functions'
+exact semantics — including the non-obvious case where an app_data *is* present but
+its functionality list doesn't include `SF_COMPRESSION` (returns `false`, not a
+permissive default; only *no app_data at all* defaults to `true`, folding in
+`determine_compression_support()`'s own no-app_data fallback). `Destination.announce()`
+gained an `appData` option (previously always empty) so a caller can attach this.
+`Link.sendLXMF()` now looks up the recipient's most recently cached announce
+app_data (already stored per-destination on every announce) and passes
+`autoCompress` through to `sendResource()`/`_sendResourceSegment()` (both gained the
+same option, default `true`) — skipping the compression attempt entirely rather than
+compressing and discarding the result, when the recipient has explicitly signaled no
+support.
+
+Verified: unit tests (`test/lxmf-compliance.test.js`) — the app_data byte-exact
+round-trip, the "present but no SF_COMPRESSION" parsing case, and a full JS-to-JS
+Link test confirming the *sent advertisement's own compressed flag* is `false` (not
+just that decompression still works either way) when the recipient announced no
+support. Live: `lxmf-cross-language-check.mjs` extended so a real, unmodified `rns`/
+`lxmf` process re-announces its `lxmf.delivery` destination with a real
+`get_announce_app_data()`-shaped app_data declaring no compression support, and
+confirms — from the real `RNS.Resource`'s own `compressed` attribute on the
+Python side — that JS's next oversized DIRECT send genuinely skipped compression in
+response to that real announce (re-run 3× for stability). Full regression re-run
+clean: 69/69 unit tests, `vite build`.
 
 **5.3 Propagation-node announce app_data.** Implement
 `[False, timebase, node_state, per_transfer_limit_kb, per_sync_limit, [stamp_cost,
@@ -498,3 +524,4 @@ its "verified by" filled in; remove stale caveats elsewhere (module comments cit
 | 2026-07-05 | Phase 3 | Request/Response Resource fallback implemented for oversized payloads in both directions, matching `RNS.Link.request()`'s own fallback exactly (including its distinct `request_id` hash for the Resource form). 59/59 unit tests pass; live `test:integration:lxmf-propagation` extended to force a real, unmodified `LXMRouter`'s own `/get` response over `LINK_MDU` (4 uploaded messages) and confirms it downloads correctly via the new fallback (re-run 3× for stability). Full regression clean: unit tests, `vite build`, `resource`/`channel` live checks. |
 | 2026-07-06 | Phase 4 | Transport parity implemented: `requestPath()` throttling (`PATH_REQUEST_MI`), a persistent per-instance transport identity powering the 3-field path request form (previously 2-field only), path table expiry (`DESTINATION_TIMEOUT`), and an announce rate table mechanism (unenforced, matching RNS's own default-off `announce_rate_target`). Path-request rebroadcast grace and `LOCAL_REBROADCASTS_MAX` scoped out (LAN-collision-avoidance optimizations tied to RNS's announce-table retry machinery, not needed for correctness or interop). 62/62 unit tests pass; new live `test:integration:path-request` confirms a real, unmodified `rns` process's `path_request_handler()` correctly parses and answers the new 3-field form, and that repeat requests are suppressed (re-run 3× for stability). Full regression clean: unit tests, `vite build`, sparse-mesh live check. |
 | 2026-07-06 | Phase 5.1 | LXMF DIRECT delivery implemented (`Link.sendLXMF()`, packet or Resource, matching `LXMessage.pack()`'s own representation choice) — corrected a mistake in this plan's own original wording along the way (DIRECT keeps the destination-hash prefix; OPPORTUNISTIC is the one that omits it, confirmed by reading `LXMessage.__as_packet()` and capturing a real `.pack()` byte vector). 66/66 unit tests pass; live `lxmf-cross-language-check.mjs` extended to exchange DIRECT messages with a real, unmodified `lxmf`/`rns` process in both directions and both packet/Resource representations (re-run 3× for stability). Full regression clean: unit tests, `vite build`, `resource`/`lxmf-propagation`/`lxmf-peer-sync` live checks. |
+| 2026-07-06 | Phase 5.2 | LXMF delivery announce app_data (`lxmf_build_announce_app_data`/`lxmf_stamp_cost_from_app_data`/`lxmf_compression_supported`, byte-exact) and compression negotiation implemented — `Link.sendLXMF()` skips compression for a Resource-sized message when the recipient's cached announce explicitly declares no `SF_COMPRESSION` support. 69/69 unit tests pass; live `lxmf-cross-language-check.mjs` extended so a real, unmodified `rns`/`lxmf` process re-announces declaring no compression support, and JS's next oversized DIRECT send is confirmed (via the real `RNS.Resource`'s own `compressed` attribute on the Python side) to have genuinely honored it (re-run 3× for stability). Full regression clean: unit tests, `vite build`. |

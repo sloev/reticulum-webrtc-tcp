@@ -472,13 +472,13 @@ export class Destination extends EventEmitter {
         this.emit('proof', packet);
     }
 
-    announce({ pathResponse = false } = {}) {
+    announce({ pathResponse = false, appData = new Uint8Array(0) } = {}) {
         if (this.identity) {
             const context = pathResponse ? protocol.CONTEXT_PATH_RESPONSE : protocol.CONTEXT_NONE;
             const packet = protocol.build_announce(
                 this.identity.private, this.identity.public, this.hash,
                 this.identity.ratchetPrivate, this.identity.ratchetPublic, this.fullName,
-                new Uint8Array(0), context
+                appData, context
             );
             this.rns.sendData(packet);
         }
@@ -784,7 +784,7 @@ export class Link extends EventEmitter {
     // but *receiving* one bigger than a single segment from a real peer
     // still doesn't, since that needs HMU packets this project doesn't
     // implement. See compliance.md for the full parity checklist.
-    sendResource(data, { timeout = 30000, requestId = null, isRequest = false, isResponse = false } = {}) {
+    sendResource(data, { timeout = 30000, requestId = null, isRequest = false, isResponse = false, autoCompress = true } = {}) {
         if (this.status !== Link.ACTIVE) return Promise.reject(new Error('Link is not active'));
 
         const segments = [];
@@ -796,7 +796,7 @@ export class Link extends EventEmitter {
 
         return segments.reduce(
             (chain, chunk, i) => chain.then((originalHash) =>
-                this._sendResourceSegment(chunk, i + 1, totalSegments, originalHash, timeout, { requestId, isRequest, isResponse })
+                this._sendResourceSegment(chunk, i + 1, totalSegments, originalHash, timeout, { requestId, isRequest, isResponse, autoCompress })
                     .then((resourceHash) => originalHash || resourceHash)),
             Promise.resolve(null),
         );
@@ -809,11 +809,18 @@ export class Link extends EventEmitter {
     // `requestId`/`isRequest`/`isResponse` tag this Resource as carrying an
     // oversized Link.request()/response payload (see Link.request()/
     // _handleRequest() below) rather than a plain application transfer.
-    async _sendResourceSegment(plaintext, segmentIndex, totalSegments, originalHash, timeout, { requestId = null, isRequest = false, isResponse = false } = {}) {
+    // `autoCompress` matches LXMessage's own flag of the same name (set false
+    // by Link.sendLXMF() when the recipient's announce says they don't
+    // support compression — see protocol.lxmf_compression_supported()).
+    async _sendResourceSegment(plaintext, segmentIndex, totalSegments, originalHash, timeout, { requestId = null, isRequest = false, isResponse = false, autoCompress = true } = {}) {
         // Matches RNS.Resource's own policy exactly: always try compressing
         // first, only actually send the compressed bytes if they came out
-        // smaller (see compression.js's bz2_compress_if_beneficial()).
-        const { data: sendData, compressed } = await compression.bz2_compress_if_beneficial(plaintext);
+        // smaller (see compression.js's bz2_compress_if_beneficial()) —
+        // unless the caller has already determined compression isn't worth
+        // attempting (autoCompress: false).
+        const { data: sendData, compressed } = autoCompress
+            ? await compression.bz2_compress_if_beneficial(plaintext)
+            : { data: plaintext, compressed: false };
 
         let prepared;
         try {
@@ -1205,13 +1212,16 @@ export class Link extends EventEmitter {
     // Sends an LXMF message over this established Link, matching LXMF's
     // DIRECT delivery method (LXMessage.py's method=DIRECT, representation
     // chosen the same way: a plain application-data packet if it fits within
-    // LINK_MDU, otherwise a Resource — auto-compressed, same as any other
-    // Resource here). `this.destination.hash` is the LXMF delivery
-    // destination on both ends of the link (the initiator's own outbound
-    // destination, or the responder's own inbound one) — see the Link
-    // constructor/fromRequest(). The receiving side's onPacket()/
+    // LINK_MDU, otherwise a Resource. `this.destination.hash` is the LXMF
+    // delivery destination on both ends of the link (the initiator's own
+    // outbound destination, or the responder's own inbound one) — see the
+    // Link constructor/fromRequest(). The receiving side's onPacket()/
     // _assembleResource() auto-detect a DIRECT LXMF payload and emit an
-    // 'lxmf' event instead of a plain 'packet'/'resource' one.
+    // 'lxmf' event instead of a plain 'packet'/'resource' one. Matches
+    // LXMessage.determine_compression_support(): a Resource-sized message
+    // is compressed unless the recipient's own most recent announce app_data
+    // explicitly says they don't support it (protocol.lxmf_compression_
+    // supported()) — no announce seen yet defaults to true, same as RNS.
     sendLXMF(source, title, content, fields = {}) {
         if (!source || source.direction !== Destination.IN) {
             throw new Error('LXMF source must be your own IN destination.');
@@ -1221,7 +1231,9 @@ export class Link extends EventEmitter {
             this.send(payload);
             return Promise.resolve();
         }
-        return this.sendResource(payload);
+        const knownRecipient = this.rns.identities.get(crypto.bytesToHex(this.destination.hash));
+        const autoCompress = protocol.lxmf_compression_supported(knownRecipient?.app_data);
+        return this.sendResource(payload, { autoCompress });
     }
 
     // Proves `identity` to the peer on the other end of this link — an

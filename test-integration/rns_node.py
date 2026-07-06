@@ -7,6 +7,7 @@ orchestrate a real Reticulum instance as one node in a larger topology.
 
 Commands (stdin, one JSON object per line):
   {"cmd": "announce"}
+  {"cmd": "announce_lxmf_no_compression"} — re-announces lxmf_destination declaring no SF_COMPRESSION support
   {"cmd": "request_path", "dest_hash": "<hex>"}
   {"cmd": "send", "dest_hash": "<hex>", "text": "..."}
   {"cmd": "send_lxmf", "dest_hash": "<hex>", "title": "...", "content": "..."} — OPPORTUNISTIC (single packet, no link)
@@ -36,6 +37,7 @@ import argparse
 import threading
 
 import RNS
+import RNS.vendor.umsgpack as msgpack
 import LXMF
 
 
@@ -203,7 +205,7 @@ loglevel = 3
                 try:
                     data = resource.data.read()
                     msg = LXMF.LXMessage.unpack_from_bytes(data)
-                    emit("lxmf_received", source_hash=msg.source_hash.hex(), title=msg.title_as_string(), content=msg.content_as_string(), valid=msg.signature_validated)
+                    emit("lxmf_received", source_hash=msg.source_hash.hex(), title=msg.title_as_string(), content=msg.content_as_string(), valid=msg.signature_validated, compressed=resource.compressed)
                 except Exception as e:
                     emit("lxmf_error", error=str(e))
             else:
@@ -239,6 +241,13 @@ loglevel = 3
         if cmd.get("cmd") == "announce":
             destination.announce()
             lxmf_destination.announce()
+        elif cmd.get("cmd") == "announce_lxmf_no_compression":
+            # Re-announces lxmf_destination with a real get_announce_app_data()
+            # -shaped app_data whose functionality list is explicitly empty —
+            # matching a real LXMRouter-managed destination that declared no
+            # compression support, without needing a full LXMRouter here.
+            app_data = msgpack.packb([None, None, []])
+            lxmf_destination.announce(app_data=app_data)
         elif cmd.get("cmd") == "request_path":
             dest_hash = bytes.fromhex(cmd["dest_hash"])
             RNS.Transport.request_path(dest_hash)
