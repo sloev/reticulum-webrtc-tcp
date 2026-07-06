@@ -790,12 +790,80 @@ test('path request destination hash and packet match RNS byte-for-byte', () => {
   assert.equal(crypto.bytesToHex(parsed.requesting_transport_id), crypto.bytesToHex(transportId));
   assert.equal(crypto.bytesToHex(parsed.tag), crypto.bytesToHex(tag));
 
-  // build_path_request() uses the simpler 2-field form (no transport ID).
+  // build_path_request() defaults to the simpler 2-field form (no transport ID).
   const simplePacket = protocol.build_path_request(destHash, tag);
   const simpleParsed = protocol.parse_path_request(protocol.packet_unpack(simplePacket));
   assert.equal(crypto.bytesToHex(simpleParsed.destination_hash), crypto.bytesToHex(destHash));
   assert.equal(simpleParsed.requesting_transport_id, null);
   assert.equal(crypto.bytesToHex(simpleParsed.tag), crypto.bytesToHex(tag));
+
+  // build_path_request() also supports the 3-field (transport-enabled) form,
+  // matching the byte-exact packet built by hand above.
+  const transportPacket = protocol.build_path_request(destHash, tag, transportId);
+  assert.equal(crypto.bytesToHex(transportPacket), crypto.bytesToHex(packet));
+});
+
+test("Reticulum.requestPath() sends the 3-field form using its own transportIdentity, and throttles repeat requests within PATH_REQUEST_MI", () => {
+  const rns = new Reticulum();
+  const sent = [];
+  rns.addInterface(new (class extends Interface { connect() {} sendData(data) { sent.push(data); } })('noop'));
+
+  const destHash = new Uint8Array(16).fill(0x11);
+  rns.requestPath(destHash);
+  assert.equal(sent.length, 1, 'first requestPath() call sends a packet');
+
+  const parsed = protocol.parse_path_request(protocol.packet_unpack(sent[0]));
+  assert.equal(crypto.bytesToHex(parsed.destination_hash), crypto.bytesToHex(destHash));
+  assert.equal(
+    crypto.bytesToHex(parsed.requesting_transport_id),
+    crypto.bytesToHex(rns.transportIdentity.hash),
+    "requestPath()'s 3-field form carries this Reticulum instance's own transportIdentity hash"
+  );
+
+  // A second call for the same destination immediately afterward is
+  // suppressed, matching RNS.Transport's PATH_REQUEST_MI throttle.
+  rns.requestPath(destHash);
+  assert.equal(sent.length, 1, 'a repeat requestPath() call within PATH_REQUEST_MI is suppressed');
+
+  // Back-dating the recorded timestamp past the throttle window allows the
+  // next call through, without needing to actually wait 20s.
+  const destHex = crypto.bytesToHex(destHash);
+  rns.pathRequestTimestamps.set(destHex, Date.now() - protocol.PATH_REQUEST_MI_MS - 1);
+  rns.requestPath(destHash);
+  assert.equal(sent.length, 2, 'a requestPath() call after PATH_REQUEST_MI has elapsed is not suppressed');
+
+  // A different destination is never throttled by another one's timer.
+  rns.requestPath(new Uint8Array(16).fill(0x22));
+  assert.equal(sent.length, 3, 'requestPath() for a different destination is unaffected by another destination\'s throttle');
+});
+
+test('Reticulum._cleanupPathTable() drops path table entries older than DESTINATION_TIMEOUT, matching RNS.Transport.DESTINATION_TIMEOUT', () => {
+  const rns = new Reticulum();
+  const staleHex = crypto.bytesToHex(new Uint8Array(16).fill(0x33));
+  const freshHex = crypto.bytesToHex(new Uint8Array(16).fill(0x44));
+  rns.pathTable.set(staleHex, { hops: 1, timestamp: Date.now() - protocol.DESTINATION_TIMEOUT_MS - 1 });
+  rns.pathTable.set(freshHex, { hops: 1, timestamp: Date.now() });
+
+  rns._cleanupPathTable();
+
+  assert.equal(rns.pathTable.has(staleHex), false, 'an entry older than DESTINATION_TIMEOUT is dropped');
+  assert.equal(rns.pathTable.has(freshHex), true, 'a recently-refreshed entry is kept');
+});
+
+test('an announce records a timestamp in the announce rate table, capped at MAX_RATE_TIMESTAMPS entries, matching RNS.Transport', async () => {
+  const rns = new Reticulum();
+  rns.addInterface(new (class extends Interface { connect() {} sendData() {} })('noop'));
+  const identity = Identity.create();
+  const dest = new Destination(rns, identity, Destination.IN, Destination.SINGLE, 'test', 'rate');
+
+  for (let i = 0; i < protocol.MAX_RATE_TIMESTAMPS + 5; i++) {
+    const packet = protocol.build_announce(identity.private, identity.public, dest.hash, null, new Uint8Array(0), 'test.rate', new Uint8Array(0), protocol.CONTEXT_NONE);
+    rns.onPacketReceived(packet, rns.interfaces[0]);
+  }
+
+  const rateEntry = rns.announceRateTable.get(crypto.bytesToHex(dest.hash));
+  assert.ok(rateEntry);
+  assert.equal(rateEntry.length, protocol.MAX_RATE_TIMESTAMPS, "the rate table never keeps more than MAX_RATE_TIMESTAMPS entries per destination");
 });
 
 test('path-response announce uses context=PATH_RESPONSE and matches RNS byte-for-byte', () => {

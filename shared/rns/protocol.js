@@ -500,16 +500,34 @@ export function parse_response_payload(plaintext) {
 // answer path requests.
 export const PATH_REQUEST_DEST_HASH = plain_destination_hash('rnstransport.path.request');
 
-// Matches the non-transport-enabled form of RNS.Transport.request_path():
-// destination_hash + a random tag, with no transport instance ID (this
-// project has no persistent "transport identity" concept — see above).
-export function build_path_request(destination_hash, tag) {
-    const data = crypto.concat(destination_hash, tag);
+// Matches RNS.Transport.request_path(): destination_hash + a random tag, or
+// (when a persistent transport instance identity is passed) destination_hash
+// + transport_id + tag — the 3-field form a transport-enabled real Reticulum
+// node sends (Transport.py:2811). Every Reticulum instance in this project
+// always forwards packets for destinations it doesn't own (see _forward()/
+// _forwardLinkRequest()), i.e. it's always acting as a transport node, so it
+// always uses the 3-field form (see Reticulum's `transportIdentity`) rather
+// than gating it behind an explicit transport-enabled toggle real RNS has and
+// this project doesn't.
+export function build_path_request(destination_hash, tag, transport_id = null) {
+    const data = transport_id ? crypto.concat(destination_hash, transport_id, tag) : crypto.concat(destination_hash, tag);
     return packet_pack({
         header_type: 0, context_flag: 0, transport_type: TRANSPORT_BROADCAST, destination_type: DEST_PLAIN,
         packet_type: PACKET_DATA, hops: 0, destination_hash: PATH_REQUEST_DEST_HASH, context: CONTEXT_NONE, data,
     });
 }
+
+// RNS.Transport.PATH_REQUEST_MI: minimum interval between automated path
+// requests for the same destination (Transport.py:83).
+export const PATH_REQUEST_MI_MS = 20 * 1000;
+
+// RNS.Transport.DESTINATION_TIMEOUT: path table entries are dropped if
+// unused for this long (Transport.py:91).
+export const DESTINATION_TIMEOUT_MS = 60 * 60 * 24 * 7 * 1000;
+
+// RNS.Transport.MAX_RATE_TIMESTAMPS: cap on how many announce timestamps are
+// kept per destination for announce-rate-limiting purposes (Transport.py:96).
+export const MAX_RATE_TIMESTAMPS = 16;
 
 // Matches RNS.Transport.path_request_handler(): the first 16 bytes are
 // always the destination hash being looked up; if more bytes follow, RNS

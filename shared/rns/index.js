@@ -35,6 +35,41 @@ export class Reticulum extends EventEmitter {
         // first 16 bytes of the original packet's full hash — see
         // protocol.js's "RNS.Packet delivery proofs" section).
         this.pendingProofs = new Map(); // hash hex -> { packetFullHash, destinationIdentityPub, resolve, timer }
+
+        // A persistent per-instance identity, matching RNS.Transport.identity
+        // — its hash is sent in outgoing path requests (see requestPath()).
+        // In-memory only, like the rest of this project's state (see
+        // README's Compliance / Known limitations sections).
+        this.transportIdentity = Identity.create();
+
+        // Last time (Date.now()) a path request was sent for a destination,
+        // matching RNS.Transport.path_requests — used to throttle repeated
+        // requestPath() calls per RNS.Transport.PATH_REQUEST_MI.
+        this.pathRequestTimestamps = new Map(); // hash hex -> timestamp
+
+        // Per-destination announce timestamps, matching RNS.Transport's
+        // announce rate table (capped at MAX_RATE_TIMESTAMPS entries per
+        // destination). Recorded on every announce for parity, but nothing
+        // currently enforces a rate limit from it — real RNS only rejects
+        // announces once a per-interface `announce_rate_target` is
+        // configured, which defaults to off, same as here.
+        this.announceRateTable = new Map(); // hash hex -> timestamp[]
+
+        // Matches RNS.Transport.DESTINATION_TIMEOUT: periodically drops path
+        // table entries that haven't been refreshed in a week, so a long-
+        // running peer's path table doesn't grow unbounded with stale routes.
+        this._pathCleanupTimer = setInterval(() => this._cleanupPathTable(), 60 * 60 * 1000);
+        if (typeof this._pathCleanupTimer.unref === 'function') this._pathCleanupTimer.unref();
+    }
+
+    // Drops path table entries not refreshed within DESTINATION_TIMEOUT_MS —
+    // split out from the constructor's setInterval so a test can call it
+    // directly instead of waiting a week.
+    _cleanupPathTable() {
+        const cutoff = Date.now() - protocol.DESTINATION_TIMEOUT_MS;
+        for (const [hex, entry] of this.pathTable) {
+            if (entry.timestamp < cutoff) this.pathTable.delete(hex);
+        }
     }
 
     addInterface(iface) {
@@ -85,6 +120,11 @@ export class Reticulum extends EventEmitter {
                     if (!existing || packet.hops <= existing.hops) {
                         this.pathTable.set(destHex, { hops: packet.hops, receivingInterface, fromPeerId, packet: forwarded, timestamp: Date.now() });
                     }
+
+                    const rateEntry = this.announceRateTable.get(destHex) || [];
+                    rateEntry.push(Date.now());
+                    while (rateEntry.length > protocol.MAX_RATE_TIMESTAMPS) rateEntry.shift();
+                    this.announceRateTable.set(destHex, rateEntry);
 
                     this.emit('announce', { ...announce, destination_hash: packet.destination_hash });
                     // Rebroadcast to every other neighbor (whether on this
@@ -238,11 +278,16 @@ export class Reticulum extends EventEmitter {
         if (known) this.sendData(known.packet);
     }
 
-    // Broadcasts a path request for a destination hash, matching the
-    // non-transport-enabled form of RNS.Transport.request_path() (this
-    // project has no persistent "transport identity" concept).
+    // Broadcasts a path request for a destination hash, matching
+    // RNS.Transport.request_path()'s 3-field (transport-enabled) form and
+    // its PATH_REQUEST_MI throttle: a repeat request for the same
+    // destination within PATH_REQUEST_MI_MS of the last one is suppressed.
     requestPath(destination_hash, tag = crypto.randomBytes(16)) {
-        this.sendData(protocol.build_path_request(destination_hash, tag));
+        const destHex = crypto.bytesToHex(destination_hash);
+        const last = this.pathRequestTimestamps.get(destHex) || 0;
+        if (Date.now() - last < protocol.PATH_REQUEST_MI_MS) return;
+        this.pathRequestTimestamps.set(destHex, Date.now());
+        this.sendData(protocol.build_path_request(destination_hash, tag, this.transportIdentity.hash));
     }
 }
 

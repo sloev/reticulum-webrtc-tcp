@@ -96,9 +96,10 @@ reason).
 | Path requests/responses (wire format) | `RNS/Transport.py` `request_path/path_request_handler` (:2799–2939) | `shared/rns/index.js` `requestPath/_handlePathRequest` | DONE | byte-exact + live |
 | Multi-hop DATA/PROOF forwarding | `RNS/Transport.py` inbound/outbound | `shared/rns/index.js` `_forward` | PARTIAL — simplified single-destination analog | functional 3-peer test |
 | Multi-hop Link relaying (link table) | `RNS/Transport.py` link_table | `shared/rns/index.js` `_forwardLinkRequest/_forwardLinkTraffic` | DONE (functional) | 3-peer relay test |
-| Path-request rate limiting & grace | `RNS/Transport.py:77–96` (`PATH_REQUEST_MI=20, PATH_REQUEST_GRACE=0.4, PATH_REQUEST_RG=1.5, LOCAL_REBROADCASTS_MAX=2, DESTINATION_TIMEOUT=7d, MAX_RATE_TIMESTAMPS=16`), `:3012–3028` | — | MISSING | **Phase 4** |
-| Transport instance identity + 3-field path requests | `RNS/Transport.py:2811` (`dest+transport_identity.hash+tag`) | — (2-field form only) | MISSING | **Phase 4** |
-| Announce rate table enforcement | `RNS/Transport.py:1890–1911` | — | MISSING | **Phase 4** |
+| Path-request throttling (`PATH_REQUEST_MI`) & table expiry (`DESTINATION_TIMEOUT`) | `RNS/Transport.py:83,91,2839` | `shared/rns/index.js` `Reticulum.requestPath/_cleanupPathTable` | DONE | unit + live `test:integration:path-request` |
+| Transport instance identity + 3-field path requests | `RNS/Transport.py:2811` (`dest+transport_identity.hash+tag`) | `shared/rns/index.js` `Reticulum.transportIdentity`, `protocol.js` `build_path_request` | DONE | byte-exact + live `test:integration:path-request` |
+| Announce rate table (timestamps, `MAX_RATE_TIMESTAMPS`) | `RNS/Transport.py:96,1890–1911` | `shared/rns/index.js` `Reticulum.announceRateTable` | PARTIAL — mechanism ported, enforcement not (matches RNS's own default-off `announce_rate_target`) | unit |
+| Path-request rebroadcast grace (`PATH_REQUEST_GRACE/RG`) & `LOCAL_REBROADCASTS_MAX` | `RNS/Transport.py:77,81–82,3012–3028` | — | SCOPED OUT | see Phase 4 writeup |
 
 ### LXMF
 
@@ -330,27 +331,69 @@ messages downloaded and verified byte-for-byte (re-run 3× for stability). Full
 regression also re-run clean: 59/59 unit tests, `vite build`, and the resource/channel
 live checks.
 
-### Phase 4 — Transport parity
+### Phase 4 — Transport parity — ✅ Done
 
-Read `RNS/Transport.py` jobs loop (:540–800) and announce handling (:1770–1915), path
-request handling (:2894–3030). Implement in `shared/rns/index.js` `Reticulum`:
+Read `RNS/Transport.py`'s `request_path()`/`path_request_handler()` (:2799–2939) and
+the announce rate table (:1890–1911). Implemented in `shared/rns/index.js`'s
+`Reticulum`:
 
-1. Path-request throttling: per-destination minimum interval `PATH_REQUEST_MI=20 s`;
-   response grace `PATH_REQUEST_GRACE=0.4 s` (+`PATH_REQUEST_RG` on roaming-class
-   interfaces — map WebRTC to non-roaming defaults); local announce rebroadcast cap
-   `LOCAL_REBROADCASTS_MAX=2`; path-table entry expiry `DESTINATION_TIMEOUT` (7 d) with
-   a periodic cleanup job.
-2. Announce rate table: per-destination timestamps (cap `MAX_RATE_TIMESTAMPS=16`),
-   violations counted against a per-interface `announce_rate_target` (default off,
-   matching RNS interface defaults — implement the mechanism, keep defaults null).
-3. Transport instance identity: a persistent per-`Reticulum` identity whose hash goes
-   into the 3-field path request form (`dest + transport_identity.hash + tag`,
-   :2811) when transport is enabled; parse both forms on receive (already tolerant —
-   verify against `path_request_handler`, :2894).
+1. **Path-request throttling.** `requestPath()` now records the last request time per
+   destination (`pathRequestTimestamps`, matching `Transport.path_requests`) and
+   suppresses a repeat call for the same destination within `PATH_REQUEST_MI_MS`
+   (20s, `Transport.py:83`). Real RNS only applies this constant to its own
+   *automatic* retry logic (failed-link rediscovery); this project has no such
+   background retry system, so the throttle is applied directly at the public
+   `requestPath()` call site instead — a more general application of the same
+   constant, and the more useful place for it in a project without RNS's internal
+   job loop.
+2. **Transport instance identity + 3-field path requests.** Every `Reticulum`
+   instance now creates a persistent `transportIdentity` (`Identity.create()`,
+   in-memory only — see Phase 7) whose hash is sent in every outgoing path request,
+   matching the 3-field form (`dest + transport_id + tag`) real RNS only sends when
+   `transport_enabled()` (`Transport.py:2811`). This project's mesh nodes always
+   forward packets for destinations they don't own (see `_forward`/
+   `_forwardLinkRequest`) — i.e. they're always acting as a transport node — so the
+   3-field form is used unconditionally rather than gated behind an explicit
+   transport-enabled toggle real RNS has and this project doesn't model.
+   `build_path_request()`/`parse_path_request()` already round-tripped both forms
+   (the 2-field form is now the explicit non-transport case, still used when no
+   transport identity is passed).
+3. **Path table expiry.** A periodic job (`_cleanupPathTable()`, hourly) drops path
+   table entries untouched for longer than `DESTINATION_TIMEOUT_MS` (7 days,
+   `Transport.py:91`), so a long-running peer's path table doesn't grow unbounded
+   with stale routes — real RNS's own destination-timeout mechanism, minus its
+   `held_announces`/announce-table retry bookkeeping (see below).
+4. **Announce rate table.** Each announce now records a timestamp in
+   `announceRateTable`, capped at `MAX_RATE_TIMESTAMPS` (16, `Transport.py:96`) per
+   destination — the mechanism real RNS uses to *count* announce rate. Left
+   unenforced, matching real RNS's own default: an interface's
+   `announce_rate_target` is `None` unless explicitly configured, so out of the box
+   a real RNS node doesn't reject fast announces either. Porting the mechanism
+   without inventing a default this project has no basis for keeps parity with
+   RNS's actual out-of-box behavior rather than adding a restriction real RNS
+   itself doesn't apply by default.
 
-Live: sparse-mesh check re-run; add a check that a real `rns` transport node accepts and
-answers our 3-field path request, and that repeated `requestPath` calls inside 20 s are
-suppressed.
+**Scoped out:** `PATH_REQUEST_GRACE`/`PATH_REQUEST_RG` (a short delay before
+rebroadcasting a *cached* path-request answer, to let a more directly-reachable peer
+answer first) and `LOCAL_REBROADCASTS_MAX` (capping how many times a non-owned
+announce is locally rebroadcast) are both LAN-collision-avoidance optimizations tied
+to `RNS.Transport`'s `announce_table`/retry/dedup state machine and roaming-mode
+interface concept — neither of which this project's simpler flood-based mesh
+architecture has a natural home for, and neither affects correctness or genuine
+interop: a real peer's path request is answered correctly whether we take 0ms or
+400ms to do it. Same category of gap as Phase 2's resource-shrink scoping — a real
+mechanism intentionally not ported because nothing here depends on it.
+
+Verified: unit tests (`test/rns-compliance.test.js`) — `requestPath()`'s 3-field form
+and throttling (including a different destination's timer being unaffected),
+`_cleanupPathTable()` dropping only stale entries, and the announce rate table's
+16-entry cap. Live: new `test:integration:path-request` — a real, unmodified `rns`
+process's own `path_request_handler()` correctly parses this stack's 3-field path
+request (not the previous 2-field-only form) and answers with a valid announce for
+a destination it owns, and a repeat `requestPath()` call is confirmed suppressed
+rather than resent (re-run 3× for stability). Full regression re-run clean: 62/62
+unit tests, `vite build`, and the sparse-mesh live check (unaffected by these
+changes, still passing).
 
 ### Phase 5 — LXMF outbound parity
 
@@ -424,3 +467,4 @@ its "verified by" filled in; remove stale caveats elsewhere (module comments cit
 | 2026-07-05 | Phase 2.2 | Outgoing bz2 compression implemented for Resource and Buffer via `bzip2-wasm` (a WASM build of the real reference `libbzip2`, chosen over the GPL-licensed `compressjs`). Byte-exact vs real `bz2.compress()`; live checks confirm real `RNS.Resource`/`RNS.Buffer` explicitly recognize JS-compressed transfers; verified working in the actual production browser build via real headless Chromium (a dev-server-only WASM pre-bundling quirk was found and mitigated, doesn't affect the deployed demo). 54/54 unit tests pass. |
 | 2026-07-05 | Phase 2.3 | Resource HMU (hashmap update) receive path implemented — this project's receiver can now complete a transfer whose advertisement doesn't include the whole hashmap upfront, matching real RNS's `HASHMAP_MAX_LEN`-based truncation exactly. Send-side truncation/HMU-response scoped out (nothing currently needs it). 57/57 unit tests pass; live `test:integration:resource` confirms a genuine HMU exchange with a real ~87-part `RNS.Resource` sender (re-verified twice). Phase 2 (Resource parity) is now complete. |
 | 2026-07-05 | Phase 3 | Request/Response Resource fallback implemented for oversized payloads in both directions, matching `RNS.Link.request()`'s own fallback exactly (including its distinct `request_id` hash for the Resource form). 59/59 unit tests pass; live `test:integration:lxmf-propagation` extended to force a real, unmodified `LXMRouter`'s own `/get` response over `LINK_MDU` (4 uploaded messages) and confirms it downloads correctly via the new fallback (re-run 3× for stability). Full regression clean: unit tests, `vite build`, `resource`/`channel` live checks. |
+| 2026-07-06 | Phase 4 | Transport parity implemented: `requestPath()` throttling (`PATH_REQUEST_MI`), a persistent per-instance transport identity powering the 3-field path request form (previously 2-field only), path table expiry (`DESTINATION_TIMEOUT`), and an announce rate table mechanism (unenforced, matching RNS's own default-off `announce_rate_target`). Path-request rebroadcast grace and `LOCAL_REBROADCASTS_MAX` scoped out (LAN-collision-avoidance optimizations tied to RNS's announce-table retry machinery, not needed for correctness or interop). 62/62 unit tests pass; new live `test:integration:path-request` confirms a real, unmodified `rns` process's `path_request_handler()` correctly parses and answers the new 3-field form, and that repeat requests are suppressed (re-run 3× for stability). Full regression clean: unit tests, `vite build`, sparse-mesh live check. |
