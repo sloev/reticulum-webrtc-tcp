@@ -563,7 +563,7 @@ export function parse_path_request(packet) {
 // propagation-node stamps/tickets (LXMF's optional anti-spam proof-of-work),
 // the PROPAGATED/PAPER delivery methods, and Resource-based transfer for
 // messages too large for a single packet/link MDU — see README.
-export function lxmf_build(content, source_priv, destination_hash, source_hash, timestamp, title, fields = {}) {
+function lxmf_sign(content, source_priv, destination_hash, source_hash, timestamp, title, fields) {
     timestamp = timestamp || Date.now() / 1000;
     title = title || new Uint8Array(0);
     if (typeof title === 'string') title = new TextEncoder().encode(title);
@@ -578,9 +578,15 @@ export function lxmf_build(content, source_priv, destination_hash, source_hash, 
     const signed_data = crypto.concat(hashed_part, message_id);
     const signature = crypto.ed25519_sign(source_priv.slice(32), signed_data);
 
-    // This is the OPPORTUNISTIC wire form: destination_hash is omitted since
-    // it's implied by the packet's own (already-encrypted-to) destination.
-    return crypto.concat(source_hash, signature, msgpack_raw);
+    return { source_hash, signature, msgpack_raw };
+}
+
+// The OPPORTUNISTIC wire form (LXMessage.__as_packet(), method=OPPORTUNISTIC):
+// destination_hash is omitted from the packed bytes since it's implied by the
+// packet's own (already-encrypted-to) destination.
+export function lxmf_build(content, source_priv, destination_hash, source_hash, timestamp, title, fields = {}) {
+    const signed = lxmf_sign(content, source_priv, destination_hash, source_hash, timestamp, title, fields);
+    return crypto.concat(signed.source_hash, signed.signature, signed.msgpack_raw);
 }
 
 export function lxmf_parse(decrypted, destination_hash, sender_pub) {
@@ -599,6 +605,42 @@ export function lxmf_parse(decrypted, destination_hash, sender_pub) {
         const valid = crypto.ed25519_validate(signature, signed_data, sender_pub.slice(32));
 
         return { source_hash, signature, message_id, timestamp: data[0], title: data[1], content: data[2], fields: data[3], valid };
+    } catch {
+        return false;
+    }
+}
+
+// The DIRECT wire form (LXMessage.__as_packet()/__as_resource(), method=DIRECT):
+// the full destination_hash + source_hash + signature + msgpack_payload, sent
+// as-is over an established Link's application-data packet or Resource. Unlike
+// OPPORTUNISTIC's single packet (addressed directly to the LXMF destination,
+// so its own header already implies the destination), a Link's outer packet
+// is addressed to the link_id, not the LXMF destination — so DIRECT keeps the
+// destination hash inside the payload itself (LXMessage.py's
+// LINK_PACKET_MAX_CONTENT, unlike ENCRYPTED_PACKET_MAX_CONTENT, has no
+// +DESTINATION_LENGTH adjustment, confirming the header doesn't carry it here).
+export function lxmf_build_direct(content, source_priv, destination_hash, source_hash, timestamp, title, fields = {}) {
+    const signed = lxmf_sign(content, source_priv, destination_hash, source_hash, timestamp, title, fields);
+    return crypto.concat(destination_hash, signed.source_hash, signed.signature, signed.msgpack_raw);
+}
+
+export function lxmf_parse_direct(decrypted, sender_pub) {
+    if (decrypted.length < 96) return false;
+    const destination_hash = decrypted.slice(0, 16);
+    const source_hash = decrypted.slice(16, 32);
+    const signature = decrypted.slice(32, 96);
+    const msgpack_raw = decrypted.slice(96);
+
+    try {
+        const data = lxmfMsgpack.unpack(msgpack_raw);
+        if (!data || data.length < 4) return false;
+
+        const hashed_part = crypto.concat(destination_hash, source_hash, msgpack_raw);
+        const message_id = crypto.sha256(hashed_part);
+        const signed_data = crypto.concat(hashed_part, message_id);
+        const valid = crypto.ed25519_validate(signature, signed_data, sender_pub.slice(32));
+
+        return { destination_hash, source_hash, signature, message_id, timestamp: data[0], title: data[1], content: data[2], fields: data[3], valid };
     } catch {
         return false;
     }

@@ -93,6 +93,153 @@ test('lxmf_parse rejects a message whose signature does not match the claimed se
   assert.equal(parsed.valid, false);
 });
 
+test('DIRECT-delivery LXMF wire form (lxmf_build_direct) matches LXMF.LXMessage.pack() byte-for-byte, including the destination_hash prefix OPPORTUNISTIC omits', () => {
+  const sourcePub = crypto.public_identity(SOURCE_PRIVATE_KEY);
+  const destPub = crypto.public_identity(DEST_PRIVATE_KEY);
+  const sourceHash = protocol.get_identity_destination_hash(sourcePub, 'lxmf.delivery');
+  const destHash = protocol.get_identity_destination_hash(destPub, 'lxmf.delivery');
+
+  const wirePayload = protocol.lxmf_build_direct('hello lxmf', SOURCE_PRIVATE_KEY, destHash, sourceHash, 1700000000.0, 'greeting');
+
+  // Captured from a real `LXMF.LXMessage(desired_method=DIRECT).pack()` call
+  // for the same fixed source/dest/timestamp/content — note the signature
+  // and msgpack payload bytes are identical to the OPPORTUNISTIC test above;
+  // only the destination_hash prefix differs (present here, omitted there).
+  assert.equal(
+    crypto.bytesToHex(wirePayload),
+    'cf0b2a4a8d2a0b6978b71290da7cc80e' +
+    'fae321c442e3c9bdcd7a3e79d850e03c' +
+    '44fbbf318b717a3445c26dc6e14cc7fda7e5b8f9f8f4e581ee53e756a0d4c37b623b89740cc80234b7785aad76d39be5c2049f68c8851cad8847683086b0ed07' +
+    '94cb41d954fc40000000c4086772656574696e67c40a68656c6c6f206c786d6680'
+  );
+  assert.equal(wirePayload.length, 129);
+
+  const parsed = protocol.lxmf_parse_direct(wirePayload, sourcePub);
+  assert.equal(parsed.valid, true);
+  assert.equal(crypto.bytesToHex(parsed.destination_hash), crypto.bytesToHex(destHash));
+  assert.equal(crypto.bytesToHex(parsed.source_hash), crypto.bytesToHex(sourceHash));
+  assert.equal(new TextDecoder().decode(parsed.title), 'greeting');
+  assert.equal(new TextDecoder().decode(parsed.content), 'hello lxmf');
+});
+
+test('lxmf_parse_direct rejects a message whose signature does not match the claimed sender', () => {
+  const sourcePub = crypto.public_identity(SOURCE_PRIVATE_KEY);
+  const destPub = crypto.public_identity(DEST_PRIVATE_KEY);
+  const sourceHash = protocol.get_identity_destination_hash(sourcePub, 'lxmf.delivery');
+  const destHash = protocol.get_identity_destination_hash(destPub, 'lxmf.delivery');
+
+  const wirePayload = protocol.lxmf_build_direct('hello lxmf', SOURCE_PRIVATE_KEY, destHash, sourceHash, 1700000000.0, 'greeting');
+  const parsed = protocol.lxmf_parse_direct(wirePayload, destPub);
+  assert.equal(parsed.valid, false);
+});
+
+test('Link.sendLXMF() delivers a DIRECT LXMF message as a single packet, and emits \'lxmf\' (not a plain \'packet\') on the receiving side', async () => {
+  const rnsA = new Reticulum();
+  const rnsB = new Reticulum();
+
+  class Bridge extends Interface {
+    connect() {}
+    sendData(data) { setTimeout(() => this.other.rns.onPacketReceived(data, this.other), 0); }
+  }
+  const ifaceA = new Bridge('A');
+  const ifaceB = new Bridge('B');
+  ifaceA.other = ifaceB;
+  ifaceB.other = ifaceA;
+  rnsA.addInterface(ifaceA);
+  rnsB.addInterface(ifaceB);
+
+  const identityA = Identity.create();
+  const identityB = Identity.create();
+  const selfA = new Destination(rnsA, identityA, Destination.IN, Destination.SINGLE, 'lxmf', 'delivery');
+  const selfB = new Destination(rnsB, identityB, Destination.IN, Destination.SINGLE, 'lxmf', 'delivery');
+  const bFromA = new Destination(rnsA, identityB, Destination.OUT, Destination.SINGLE, 'lxmf', 'delivery');
+
+  const aGotAnnounce = new Promise((resolve) => rnsA.once('announce', resolve));
+  selfB.announce();
+  await aGotAnnounce;
+
+  // B must also learn A's identity before it can validate the DIRECT
+  // message's signature (tryParseLxmfDirect() looks up the sender by hash).
+  const bGotAnnounce = new Promise((resolve) => rnsB.once('announce', resolve));
+  selfA.announce();
+  await bGotAnnounce;
+
+  const responderLinkPromise = new Promise((resolve) => selfB.on('link', resolve));
+  const initiatorLink = new Link(rnsA, bFromA);
+  await new Promise((resolve) => initiatorLink.once('established', resolve));
+  const responderLink = await responderLinkPromise;
+  await new Promise((resolve) => (responderLink.status === Link.ACTIVE ? resolve() : responderLink.once('established', resolve)));
+
+  let gotPlainPacket = false;
+  responderLink.on('packet', () => { gotPlainPacket = true; });
+  const gotLxmf = new Promise((resolve) => responderLink.on('lxmf', resolve));
+
+  await initiatorLink.sendLXMF(selfA, 'direct hi', 'a small direct message', { via: 'link' });
+  const received = await gotLxmf;
+
+  assert.equal(gotPlainPacket, false, "a DIRECT LXMF payload is not also emitted as a generic 'packet' event");
+  assert.equal(received.valid, true);
+  assert.equal(new TextDecoder().decode(received.title), 'direct hi');
+  assert.equal(new TextDecoder().decode(received.content), 'a small direct message');
+  assert.deepEqual(received.fields, { via: 'link' });
+  assert.equal(crypto.bytesToHex(received.source_hash), crypto.bytesToHex(selfA.hash));
+  assert.equal(crypto.bytesToHex(received.destination_hash), crypto.bytesToHex(selfB.hash));
+
+  initiatorLink.close();
+});
+
+test('Link.sendLXMF() falls back to a Resource for a DIRECT LXMF message too large for a single link packet, and still emits \'lxmf\' (not \'resource\') on receipt', async () => {
+  const rnsA = new Reticulum();
+  const rnsB = new Reticulum();
+
+  class Bridge extends Interface {
+    connect() {}
+    sendData(data) { setTimeout(() => this.other.rns.onPacketReceived(data, this.other), 0); }
+  }
+  const ifaceA = new Bridge('A');
+  const ifaceB = new Bridge('B');
+  ifaceA.other = ifaceB;
+  ifaceB.other = ifaceA;
+  rnsA.addInterface(ifaceA);
+  rnsB.addInterface(ifaceB);
+
+  const identityA = Identity.create();
+  const identityB = Identity.create();
+  const selfA = new Destination(rnsA, identityA, Destination.IN, Destination.SINGLE, 'lxmf', 'delivery');
+  const selfB = new Destination(rnsB, identityB, Destination.IN, Destination.SINGLE, 'lxmf', 'delivery');
+  const bFromA = new Destination(rnsA, identityB, Destination.OUT, Destination.SINGLE, 'lxmf', 'delivery');
+
+  const aGotAnnounce = new Promise((resolve) => rnsA.once('announce', resolve));
+  selfB.announce();
+  await aGotAnnounce;
+
+  // B must also learn A's identity before it can validate the DIRECT
+  // message's signature (tryParseLxmfDirect() looks up the sender by hash).
+  const bGotAnnounce = new Promise((resolve) => rnsB.once('announce', resolve));
+  selfA.announce();
+  await bGotAnnounce;
+
+  const responderLinkPromise = new Promise((resolve) => selfB.on('link', resolve));
+  const initiatorLink = new Link(rnsA, bFromA);
+  await new Promise((resolve) => initiatorLink.once('established', resolve));
+  const responderLink = await responderLinkPromise;
+  await new Promise((resolve) => (responderLink.status === Link.ACTIVE ? resolve() : responderLink.once('established', resolve)));
+
+  let gotPlainResource = false;
+  responderLink.on('resource', () => { gotPlainResource = true; });
+  const gotLxmf = new Promise((resolve) => responderLink.on('lxmf', resolve));
+
+  const bigContent = 'x'.repeat(protocol.LINK_MDU * 2);
+  await initiatorLink.sendLXMF(selfA, 'direct big', bigContent, {});
+  const received = await gotLxmf;
+
+  assert.equal(gotPlainResource, false, "a DIRECT LXMF payload sent as a Resource is not also emitted as a generic 'resource' event");
+  assert.equal(received.valid, true);
+  assert.equal(new TextDecoder().decode(received.content), bigContent);
+
+  initiatorLink.close();
+});
+
 test('Destination.sendLXMF() delivers an LXMF message end to end between two independent Reticulum peers', async () => {
   const rnsA = new Reticulum();
   const rnsB = new Reticulum();

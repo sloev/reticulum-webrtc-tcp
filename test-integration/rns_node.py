@@ -9,7 +9,8 @@ Commands (stdin, one JSON object per line):
   {"cmd": "announce"}
   {"cmd": "request_path", "dest_hash": "<hex>"}
   {"cmd": "send", "dest_hash": "<hex>", "text": "..."}
-  {"cmd": "send_lxmf", "dest_hash": "<hex>", "title": "...", "content": "..."}
+  {"cmd": "send_lxmf", "dest_hash": "<hex>", "title": "...", "content": "..."} — OPPORTUNISTIC (single packet, no link)
+  {"cmd": "send_lxmf_direct", "dest_hash": "<hex>", "title": "...", "content": "..."} — DIRECT (over a real RNS.Link to the peer's lxmf.delivery destination; packet or Resource, chosen the same way LXMessage.pack() does)
   {"cmd": "send_resource", "text": "..."}
   {"cmd": "channel_send", "hex": "..."} — sends over a real RNS.Channel (get_channel())
   {"cmd": "buffer_send", "hex": "...", "stream_id": 1} — sends over a real RNS.Buffer, then eof (stream_id defaults to 1)
@@ -181,6 +182,37 @@ loglevel = 3
 
     lxmf_destination.set_packet_callback(lxmf_callback)
 
+    # DIRECT delivery: a real LXMF message arriving over an established
+    # RNS.Link to this node's lxmf.delivery destination, either as a plain
+    # link packet or (for an oversized message) a Resource — matching
+    # LXMessage.__as_packet()/__as_resource() for method=DIRECT, which send
+    # the full self.packed bytes (destination hash prefix included) as-is
+    # over the link.
+    def on_lxmf_link_established(link):
+        def lxmf_direct_packet_callback(data, packet):
+            try:
+                msg = LXMF.LXMessage.unpack_from_bytes(data)
+                emit("lxmf_received", source_hash=msg.source_hash.hex(), title=msg.title_as_string(), content=msg.content_as_string(), valid=msg.signature_validated)
+            except Exception as e:
+                emit("lxmf_error", error=str(e))
+        link.set_packet_callback(lxmf_direct_packet_callback)
+
+        link.set_resource_strategy(RNS.Link.ACCEPT_ALL)
+        def lxmf_direct_resource_concluded(resource):
+            if resource.status == RNS.Resource.COMPLETE:
+                try:
+                    data = resource.data.read()
+                    msg = LXMF.LXMessage.unpack_from_bytes(data)
+                    emit("lxmf_received", source_hash=msg.source_hash.hex(), title=msg.title_as_string(), content=msg.content_as_string(), valid=msg.signature_validated)
+                except Exception as e:
+                    emit("lxmf_error", error=str(e))
+            else:
+                emit("resource_failed", status=resource.status)
+        link.set_resource_concluded_callback(lxmf_direct_resource_concluded)
+        state["lxmf_link"] = link
+
+    lxmf_destination.set_link_established_callback(on_lxmf_link_established)
+
     class Handler:
         aspect_filter = None
 
@@ -232,6 +264,34 @@ loglevel = 3
             )
             msg.pack()
             RNS.Packet(lxmf_out_dest, msg.packed[LXMF.LXMessage.DESTINATION_LENGTH:]).send()
+        elif cmd.get("cmd") == "send_lxmf_direct":
+            # DIRECT delivery: establish a real RNS.Link to the recipient's
+            # lxmf.delivery destination, then send the message over the link
+            # exactly like LXMessage.__as_packet()/__as_resource() do for
+            # method=DIRECT — a plain link packet if it fits, otherwise a
+            # Resource, both carrying msg.packed (destination hash prefix
+            # included) as-is. Uses LXMessage.pack()/RNS.Packet/RNS.Resource
+            # directly rather than a full LXMRouter, since only the wire
+            # format is under test here.
+            dest_hash = bytes.fromhex(cmd["dest_hash"])
+            peer_identity = RNS.Identity.recall(dest_hash)
+            if peer_identity is None:
+                emit("send_failed", reason="identity not known")
+                return
+            lxmf_out_dest = RNS.Destination(peer_identity, RNS.Destination.OUT, RNS.Destination.SINGLE, LXMF.APP_NAME, "delivery")
+            link = RNS.Link(lxmf_out_dest)
+            def on_established(link):
+                msg = LXMF.LXMessage(
+                    lxmf_out_dest, lxmf_destination,
+                    cmd.get("content", ""), cmd.get("title", ""),
+                    desired_method=LXMF.LXMessage.DIRECT,
+                )
+                msg.pack()
+                if msg.representation == LXMF.LXMessage.PACKET:
+                    RNS.Packet(link, msg.packed).send()
+                else:
+                    RNS.Resource(msg.packed, link)
+            link.set_link_established_callback(on_established)
         elif cmd.get("cmd") == "send_resource":
             if state["link"] is None:
                 emit("send_failed", reason="no established link")

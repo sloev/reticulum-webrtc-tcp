@@ -110,7 +110,7 @@ reason).
 | Peering-key stamps | `LXMF/LXStamper.py` `generate_peering_key` | `shared/rns/stamp.js` `generate/validate_peering_key` | DONE | byte-exact + live |
 | Propagation node store & client sync (`/get`) | `LXMF/LXMRouter.py` `message_get_request` | `shared/rns/propagation.js` `PropagationNode`, `syncFromRealPropagationNode` | DONE | live (upload + download vs real node) |
 | Node-to-node peer sync (`/offer`) | `LXMF/LXMPeer.py`, `LXMRouter.offer_request` | `shared/rns/propagation.js` `syncToPeer/_onOfferRequest` | DONE | live (real node accepts + stores) |
-| DIRECT delivery (over a Link; packet or Resource) | `LXMF/LXMessage.py:30–34` (methods), `:390–460` (representation), `:534/:654` (send) | — | MISSING | **Phase 5.1** |
+| DIRECT delivery (over a Link; packet or Resource) | `LXMF/LXMessage.py:30–34` (methods), `:355–460` (`pack`), `:626–654` (`__as_packet`/`__as_resource`) | `shared/rns/protocol.js` `lxmf_build_direct/lxmf_parse_direct`, `shared/rns/index.js` `Link.sendLXMF` | DONE | byte-exact + live `test:integration:lxmf` (both directions, both representations) |
 | Delivery announce app_data (`[display_name, stamp_cost, [SF_COMPRESSION]]`) | `LXMF/LXMRouter.py:985–1000` `get_announce_app_data`, `LXMF/LXMF.py:174` `stamp_cost_from_app_data` | — | MISSING | **Phase 5.2** |
 | Compression negotiation (`SF_COMPRESSION` → `auto_compress`) | `LXMF/LXMessage.py:510–517` `determine_compression_support` | — | MISSING (needs Phase 2.2) | **Phase 5.2** |
 | Propagation-node announce app_data (7-element list) | `LXMF/LXMRouter.py:300–318` `get_propagation_node_app_data`, `LXMF/LXMF.py:224` `pn_announce_data_is_valid` | — (stamp cost must be known out of band) | MISSING | **Phase 5.3** |
@@ -397,16 +397,45 @@ changes, still passing).
 
 ### Phase 5 — LXMF outbound parity
 
-**5.1 DIRECT delivery.** Read `LXMF/LXMessage.py:380–540` and `LXMRouter`'s outbound
-processing. Implement (new `shared/rns/lxmessage.js` or extend `protocol.js`): method
-constants (OPPORTUNISTIC=0x01, DIRECT=0x02, PROPAGATED=0x03); DIRECT packs *without* the
-destination-hash prefix (the link implies it — note `DESTINATION_LENGTH` handling in
-`packed_size` math, :79–90); fits-in-one-packet → plain link packet (:534); otherwise a
-Resource over the link (:654) with `auto_compress`. Receive side: a link-data packet or
-completed Resource on an `lxmf.delivery` destination's link parses as an LXMF message
-(prepend the destination hash back before `lxmf_parse`). Live: extend
-`lxmf-cross-language-check.mjs` — real `lxmf` client sends DIRECT to JS over a link and
-vice versa, both packet-sized and Resource-sized (≥ LINK_PACKET_MAX_CONTENT) messages.
+**5.1 DIRECT delivery — ✅ Done.** Read `LXMF/LXMessage.py:355–460` (`pack()`) and
+`:626–654` (`__as_packet`/`__as_resource`). Correction to the plan as originally
+written: reading the actual source shows the destination-hash prefix is the other
+way around from what's stated above — **OPPORTUNISTIC** is the one that omits it
+(implied by the packet's own destination), while **DIRECT** keeps the full
+`destination_hash + source_hash + signature + msgpack_payload` layout (`self.packed`,
+unsliced) as-is over the Link, since the Link's own outer packet is addressed to the
+link_id, not the LXMF destination — confirmed both by reading `__as_packet()`
+(`RNS.Packet(self.__delivery_destination, self.packed)`, no slice, vs. OPPORTUNISTIC's
+`self.packed[DESTINATION_LENGTH:]`) and by capturing a real `LXMessage(desired_method=
+DIRECT).pack()` byte vector for the project's fixed test identities.
+
+Implemented: `protocol.js`'s `lxmf_build_direct()`/`lxmf_parse_direct()` (the full
+4-field wire form) alongside the existing OPPORTUNISTIC `lxmf_build()`/`lxmf_parse()`
+(refactored to share the common sign/hash logic via a private `lxmf_sign()` helper).
+`Link.sendLXMF(source, title, content, fields)` (`shared/rns/index.js`) picks
+representation exactly like `LXMessage.pack()` does: a plain link packet if the built
+payload fits within `LINK_MDU`, otherwise a Resource (already auto-compressed, same as
+any other Resource here — real compression *negotiation* via a peer's announced
+`SF_COMPRESSION` is Phase 5.2). Receive side: `Link.onPacket()`'s `CONTEXT_NONE`
+branch and `_assembleResource()`'s completed-Resource branch both now try
+`tryParseLxmfDirect()` first (mirroring how `Destination.onData()` already tries
+OPPORTUNISTIC `tryParseLxmf()` before falling back to a plain `'packet'` event) and
+emit an `'lxmf'` event instead of `'packet'`/`'resource'` on a match — no destination
+prepending needed, since DIRECT's wire form already carries its own.
+
+Verified: unit tests (`test/lxmf-compliance.test.js`) — the DIRECT wire form's
+byte-exact match against a real `LXMessage.pack()` capture (including the
+destination-hash-included layout), signature rejection, and two full JS-to-JS Link
+tests (packet-sized and `LINK_MDU`-exceeding Resource-sized, confirming the `'lxmf'`
+event fires instead of `'packet'`/`'resource'`). Live: `test-integration/rns_node.py`
+extended with a Link-scoped LXMF packet/resource callback on its `lxmf.delivery`
+destination and a `send_lxmf_direct` command (using `LXMessage.pack()` +
+`RNS.Packet`/`RNS.Resource` directly against an established Link, the same primitives
+`LXMessage.send()` uses internally, without needing a full `LXMRouter` for this
+wire-format-focused check); `lxmf-cross-language-check.mjs` extended to exchange
+DIRECT messages in both directions, both packet-sized and Resource-sized (re-run 3×
+for stability). Full regression re-run clean: 66/66 unit tests, `vite build`, and the
+`resource`/`lxmf-propagation`/`lxmf-peer-sync` live checks (unaffected, still passing).
 
 **5.2 Delivery announce app_data + compression negotiation.** Implement
 `[display_name|null, stamp_cost|null, [SF_COMPRESSION]]` (msgpack) as the demo/LXMF
@@ -468,3 +497,4 @@ its "verified by" filled in; remove stale caveats elsewhere (module comments cit
 | 2026-07-05 | Phase 2.3 | Resource HMU (hashmap update) receive path implemented — this project's receiver can now complete a transfer whose advertisement doesn't include the whole hashmap upfront, matching real RNS's `HASHMAP_MAX_LEN`-based truncation exactly. Send-side truncation/HMU-response scoped out (nothing currently needs it). 57/57 unit tests pass; live `test:integration:resource` confirms a genuine HMU exchange with a real ~87-part `RNS.Resource` sender (re-verified twice). Phase 2 (Resource parity) is now complete. |
 | 2026-07-05 | Phase 3 | Request/Response Resource fallback implemented for oversized payloads in both directions, matching `RNS.Link.request()`'s own fallback exactly (including its distinct `request_id` hash for the Resource form). 59/59 unit tests pass; live `test:integration:lxmf-propagation` extended to force a real, unmodified `LXMRouter`'s own `/get` response over `LINK_MDU` (4 uploaded messages) and confirms it downloads correctly via the new fallback (re-run 3× for stability). Full regression clean: unit tests, `vite build`, `resource`/`channel` live checks. |
 | 2026-07-06 | Phase 4 | Transport parity implemented: `requestPath()` throttling (`PATH_REQUEST_MI`), a persistent per-instance transport identity powering the 3-field path request form (previously 2-field only), path table expiry (`DESTINATION_TIMEOUT`), and an announce rate table mechanism (unenforced, matching RNS's own default-off `announce_rate_target`). Path-request rebroadcast grace and `LOCAL_REBROADCASTS_MAX` scoped out (LAN-collision-avoidance optimizations tied to RNS's announce-table retry machinery, not needed for correctness or interop). 62/62 unit tests pass; new live `test:integration:path-request` confirms a real, unmodified `rns` process's `path_request_handler()` correctly parses and answers the new 3-field form, and that repeat requests are suppressed (re-run 3× for stability). Full regression clean: unit tests, `vite build`, sparse-mesh live check. |
+| 2026-07-06 | Phase 5.1 | LXMF DIRECT delivery implemented (`Link.sendLXMF()`, packet or Resource, matching `LXMessage.pack()`'s own representation choice) — corrected a mistake in this plan's own original wording along the way (DIRECT keeps the destination-hash prefix; OPPORTUNISTIC is the one that omits it, confirmed by reading `LXMessage.__as_packet()` and capturing a real `.pack()` byte vector). 66/66 unit tests pass; live `lxmf-cross-language-check.mjs` extended to exchange DIRECT messages with a real, unmodified `lxmf`/`rns` process in both directions and both packet/Resource representations (re-run 3× for stability). Full regression clean: unit tests, `vite build`, `resource`/`lxmf-propagation`/`lxmf-peer-sync` live checks. |

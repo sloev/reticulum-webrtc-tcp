@@ -324,6 +324,20 @@ export function tryParseLxmf(rns, destination_hash, decrypted) {
     return (parsed && parsed.valid) ? parsed : null;
 }
 
+// Same idea as tryParseLxmf() above, but for LXMF's DIRECT delivery form
+// (arriving as a Link's plain application-data packet or a completed generic
+// Resource — see Link.onPacket()/_assembleResource()) — the destination hash
+// isn't passed in separately since DIRECT's wire form carries its own (see
+// protocol.lxmf_build_direct/lxmf_parse_direct).
+export function tryParseLxmfDirect(rns, decrypted) {
+    if (decrypted.length < 32) return null;
+    const senderIdentity = rns.identities.get(crypto.bytesToHex(decrypted.slice(16, 32)));
+    if (!senderIdentity) return null;
+
+    const parsed = protocol.lxmf_parse_direct(decrypted, senderIdentity.public_key);
+    return (parsed && parsed.valid) ? parsed : null;
+}
+
 export class Destination extends EventEmitter {
     static IN = 0;
     static OUT = 1;
@@ -701,7 +715,12 @@ export class Link extends EventEmitter {
         } else if (packet.context === protocol.CONTEXT_RESOURCE_HMU) {
             this._onHashmapUpdate(plaintext);
         } else if (packet.context === protocol.CONTEXT_NONE) {
-            this.emit('packet', plaintext);
+            const parsedLxmf = tryParseLxmfDirect(this.rns, plaintext);
+            if (parsedLxmf) {
+                this.emit('lxmf', parsedLxmf);
+            } else {
+                this.emit('packet', plaintext);
+            }
         } else if (packet.context === protocol.CONTEXT_CHANNEL) {
             if (this._channel) {
                 this._sendChannelPacketProof(rawBytes);
@@ -1088,7 +1107,12 @@ export class Link extends EventEmitter {
                 return;
             }
 
-            this.emit('resource', fullData);
+            const parsedLxmf = tryParseLxmfDirect(this.rns, fullData);
+            if (parsedLxmf) {
+                this.emit('lxmf', parsedLxmf);
+            } else {
+                this.emit('resource', fullData);
+            }
         }
     }
 
@@ -1176,6 +1200,28 @@ export class Link extends EventEmitter {
     send(data) {
         if (this.status !== Link.ACTIVE) return;
         this.rns.sendData(protocol.build_link_packet(this.linkId, this.derivedKey, data, protocol.CONTEXT_NONE));
+    }
+
+    // Sends an LXMF message over this established Link, matching LXMF's
+    // DIRECT delivery method (LXMessage.py's method=DIRECT, representation
+    // chosen the same way: a plain application-data packet if it fits within
+    // LINK_MDU, otherwise a Resource — auto-compressed, same as any other
+    // Resource here). `this.destination.hash` is the LXMF delivery
+    // destination on both ends of the link (the initiator's own outbound
+    // destination, or the responder's own inbound one) — see the Link
+    // constructor/fromRequest(). The receiving side's onPacket()/
+    // _assembleResource() auto-detect a DIRECT LXMF payload and emit an
+    // 'lxmf' event instead of a plain 'packet'/'resource' one.
+    sendLXMF(source, title, content, fields = {}) {
+        if (!source || source.direction !== Destination.IN) {
+            throw new Error('LXMF source must be your own IN destination.');
+        }
+        const payload = protocol.lxmf_build_direct(content, source.identity.private, this.destination.hash, source.hash, null, title, fields);
+        if (payload.length <= protocol.LINK_MDU) {
+            this.send(payload);
+            return Promise.resolve();
+        }
+        return this.sendResource(payload);
     }
 
     // Proves `identity` to the peer on the other end of this link — an
