@@ -114,7 +114,7 @@ reason).
 | Delivery announce app_data (`[display_name, stamp_cost, [SF_COMPRESSION]]`) | `LXMF/LXMRouter.py:985–1000` `get_announce_app_data`, `LXMF/LXMF.py:174` `stamp_cost_from_app_data` | `shared/rns/protocol.js` `lxmf_build_announce_app_data/lxmf_stamp_cost_from_app_data` | DONE | byte-exact |
 | Compression negotiation (`SF_COMPRESSION` → `auto_compress`) | `LXMF/LXMessage.py:510–517` `determine_compression_support` | `shared/rns/protocol.js` `lxmf_compression_supported`, `shared/rns/index.js` `Link.sendLXMF` | DONE | unit + live `test:integration:lxmf` |
 | Propagation-node announce app_data (7-element list) | `LXMF/LXMRouter.py:300–318` `get_propagation_node_app_data`, `LXMF/LXMF.py:224` `pn_announce_data_is_valid` | `shared/rns/protocol.js` `lxmf_build_propagation_announce_app_data/lxmf_parse_propagation_announce_app_data` | DONE | byte-exact + live (`propagateLXMF`/`syncToPeer` auto-detect from a real `LXMRouter`'s own announce) |
-| Interop with end-user clients (NomadNet, Sideband) | n/a | — | UNTESTED | **Phase 6** |
+| Interop with end-user clients (NomadNet, Sideband) | n/a | `test-integration/nomadnet-interop-check.mjs`, `test-integration/sideband-interop-check.mjs` | DONE (both, both directions) | live, against real unmodified clients |
 | PAPER delivery method (QR-encoded messages) | `LXMF/LXMessage.py:33,446–456` | — | N/A — no meaningful use over WebRTC/TCP; revisit on request | — |
 
 ### Persistence & environment
@@ -515,17 +515,57 @@ values before using *only* the parsed announce to drive `propagateLXMF()`/
 timing dependency). Full regression re-run clean: 73/73 unit tests, `vite build`,
 and the `lxmf`/`resource`/`channel` live checks.
 
-### Phase 6 — end-user client interop
+### Phase 6 — end-user client interop — ✅ Done
 
-1. `pip install --target=$PYLIBS nomadnet`; run headless (`nomadnet --daemon
-   --config <tmp>`) attached to the TCP gateway; exchange LXMF messages with the JS
-   stack both directions — direct and via a propagation node. NomadNet is textual/UI-driven;
-   drive it via its config + filesystem inbox, or fall back to scripting `lxmf`
-   directly with NomadNet's exact announce/app_data conventions if the TUI can't be
-   automated — document which was possible.
-2. Attempt Sideband (`pip install sbapp`, kivy GUI): expected infeasible headless; if
-   so, record that honestly (do not claim interop).
-3. Update README's "hasn't been tested" language to the actual, verified state.
+**NomadNet.** `pip install --target=$PYLIBS nomadnet`. Its real `-d`/`--daemon` mode
+runs genuinely headless (a `NomadNetworkApp` with `daemon=True` never touches its
+TUI) — no TUI automation needed at all for the receiving direction, and for sending,
+`nomadnet.Conversation`'s own code calls exactly `app.message_router.
+handle_outbound(lxm)` (confirmed by reading `Conversation.py:320,394`), so this
+project's `test-integration/nomadnet_driver.py` drives NomadNet's own real
+`NomadNetworkApp` instance (built the same way `nomadnet -d` itself does — same
+identity file, same `LXMRouter`, same start-of-day announce after
+`NomadNetworkApp.START_ANNOUNCE_DELAY=3s`) and calls that exact same router method
+directly, rather than reimplementing or synthesizing a message. `test-integration/
+lxmf-cross-language-check.mjs`'s pattern extends cleanly here too. Confirmed both
+directions: JS's OPPORTUNISTIC send is received and written to NomadNet's own
+`storage/conversations/<hash>/` on disk; NomadNet's own outbound call is received and
+validated by this stack. Also confirmed NomadNet's real announce app_data
+(`[display_name, stamp_cost, [SF_COMPRESSION]]`) is genuinely parsed correctly by
+this project's Phase 5.2 functions, cross-checked against NomadNet's own configured
+display name — not just against a synthetic byte vector.
+
+**Sideband.** `pip install --target=$PYLIBS sbapp`. **Correction to this plan's own
+original assumption**: Sideband was expected to be infeasible headless (it's a
+Kivy/KivyMD GUI app) — it isn't. Reading `sbapp/main.py` shows its entire
+Kivy/KivyMD/LXST(audio) import block is gated behind `if not args.daemon:`, so real
+`-d`/`--daemon` mode never imports Kivy's graphics stack at all — confirmed by
+actually running it with no virtual display and observing a clean daemon startup
+with no GL/display errors. `SidebandCore(...).start()` (the same two calls
+`sbapp.main.run()` makes for `-d` mode) returns normally rather than blocking
+forever, so `test-integration/sideband_driver.py` calls them directly and layers a
+thin delivery-callback wrapper (`LXMRouter.register_delivery_callback()` only ever
+keeps one callback, so re-registering one that emits a JSON event then forwards to
+Sideband's own real `lxmf_delivery` was the cleanest hook) to observe receipt without
+touching Sideband's own logic. Sending uses Sideband's own public `send_message()` —
+the same method its UI's send button calls — which itself defaults to LXMF's DIRECT
+method (opening a real `Link`) rather than OPPORTUNISTIC when no ratchet is yet known
+for the recipient, so this also genuinely exercises this project's DIRECT delivery
+(Phase 5.1) against a real end-user client, not just bare `lxmf`. Confirmed both
+directions, live, against the real unmodified client (re-run 3× each for stability).
+
+Both `test-integration/nomadnet-interop-check.mjs` and `test-integration/sideband-
+interop-check.mjs` require their respective package installed into `$PYLIBS` in
+addition to `rns`/`lxmf` (`pip install --target=$PYLIBS nomadnet` / `sbapp`) — not
+part of this project's own `package.json`, since they're reference clients for this
+one-off interop verification, not a runtime dependency.
+
+**Not attempted**: propagation-node interop with either client (only direct
+delivery, both methods, both directions) — the existing `LXMRouter`-based
+propagation checks (Phase 5.3) already cover the propagation-node wire format
+against the reference implementation; a client-specific propagation test would
+mostly re-exercise the same code path through a heavier dependency, for limited
+additional confidence.
 
 ### Phase 7 — persistence parity
 
@@ -561,3 +601,4 @@ its "verified by" filled in; remove stale caveats elsewhere (module comments cit
 | 2026-07-06 | Phase 5.1 | LXMF DIRECT delivery implemented (`Link.sendLXMF()`, packet or Resource, matching `LXMessage.pack()`'s own representation choice) — corrected a mistake in this plan's own original wording along the way (DIRECT keeps the destination-hash prefix; OPPORTUNISTIC is the one that omits it, confirmed by reading `LXMessage.__as_packet()` and capturing a real `.pack()` byte vector). 66/66 unit tests pass; live `lxmf-cross-language-check.mjs` extended to exchange DIRECT messages with a real, unmodified `lxmf`/`rns` process in both directions and both packet/Resource representations (re-run 3× for stability). Full regression clean: unit tests, `vite build`, `resource`/`lxmf-propagation`/`lxmf-peer-sync` live checks. |
 | 2026-07-06 | Phase 5.2 | LXMF delivery announce app_data (`lxmf_build_announce_app_data`/`lxmf_stamp_cost_from_app_data`/`lxmf_compression_supported`, byte-exact) and compression negotiation implemented — `Link.sendLXMF()` skips compression for a Resource-sized message when the recipient's cached announce explicitly declares no `SF_COMPRESSION` support. 69/69 unit tests pass; live `lxmf-cross-language-check.mjs` extended so a real, unmodified `rns`/`lxmf` process re-announces declaring no compression support, and JS's next oversized DIRECT send is confirmed (via the real `RNS.Resource`'s own `compressed` attribute on the Python side) to have genuinely honored it (re-run 3× for stability). Full regression clean: unit tests, `vite build`. |
 | 2026-07-06 | Phase 5.3 | Propagation-node announce app_data implemented (`lxmf_build_propagation_announce_app_data`/`lxmf_parse_propagation_announce_app_data`, byte-exact, including catching a would-be integer-vs-string msgpack key mismatch before it could break interop). `PropagationNode.announce()` now embeds real stamp/peering cost; `propagateLXMF()`/`syncToPeer()` default to reading it from a cached announce instead of a required argument. 73/73 unit tests pass; both propagation live checks extended to make a real `LXMRouter` fire its actual `announce_propagation_node()` (~20s delay) and drive JS's uploads/peer-sync using *only* the parsed real announce, cross-checked against the test harness's own values (re-run twice each for stability). Full regression clean: unit tests, `vite build`, `lxmf`/`resource`/`channel` live checks. **Phase 5 (LXMF outbound parity) is now complete.** |
+| 2026-07-06 | Phase 6 | End-user client interop verified live against real, unmodified `nomadnet` and `sbapp` (Sideband) installs, both directions, both message directions confirmed via each client's own real code paths (`NomadNetworkApp`'s real disk storage / `message_router.handle_outbound()`; `SidebandCore`'s real `send_message()`/delivery callback). Corrected this plan's own assumption that Sideband would be infeasible headless — its daemon mode never imports Kivy at all, confirmed by actually running it. No code changes to `shared/rns/*` (investigation + test-integration only); 73/73 unit tests and `vite build` unaffected and still clean. |
