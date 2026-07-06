@@ -14,13 +14,17 @@
     "test:integration:resource": "node test-integration/resource-cross-language-check.mjs",
     "test:integration:lxmf-propagation": "node test-integration/lxmf-propagation-cross-language-check.mjs",
     "test:integration:lxmf-peer-sync": "node test-integration/lxmf-propagation-peer-sync-cross-language-check.mjs",
-    "test:integration:channel": "node test-integration/channel-cross-language-check.mjs"
+    "test:integration:channel": "node test-integration/channel-cross-language-check.mjs",
+    "test:integration:path-request": "node test-integration/path-request-cross-language-check.mjs",
+    "test:integration:nomadnet": "node test-integration/nomadnet-interop-check.mjs",
+    "test:integration:sideband": "node test-integration/sideband-interop-check.mjs"
   },
   "dependencies": {
     "@noble/ciphers": "^2.2.0",
     "@noble/curves": "^2.2.0",
     "@noble/hashes": "^2.2.0",
     "buffer": "^6.0.3",
+    "bzip2-wasm": "^1.0.1",
     "crypto-browserify": "^3.12.1",
     "events": "^3.3.0",
     "msgpackr": "^2.0.4",

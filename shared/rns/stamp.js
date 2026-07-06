@@ -15,6 +15,12 @@
 // Not implemented: multi-process/worker-thread parallel search (LXStamper
 // spawns OS processes to search faster; this runs single-threaded, so the
 // same target_cost takes longer here than in the reference implementation).
+// generate_stamp() does periodically yield to the event loop (see below) so
+// a long search doesn't starve everything else — e.g. a Link's own
+// keepalives, which (unlike LXStamper's separate-process search) would
+// otherwise silently stop being sent for the whole duration of a search on
+// this single-threaded runtime, risking a real peer legitimately timing out
+// the link.
 import * as crypto from './crypto.js';
 import * as msgpack from './msgpack.js';
 
@@ -70,14 +76,20 @@ export function stamp_valid(stamp, target_cost, workblock) {
 // exponentially with target_cost (expect roughly 2^target_cost attempts) —
 // keep target_cost modest unless you want this to run for a long time (see
 // the module comment above re: no parallel search).
-export function generate_stamp(material, target_cost, expand_rounds = WORKBLOCK_EXPAND_ROUNDS_PN) {
+export async function generate_stamp(material, target_cost, expand_rounds = WORKBLOCK_EXPAND_ROUNDS_PN) {
     const workblock = stamp_workblock(material, expand_rounds);
     let attempts = 0;
+    let lastYield = Date.now();
     for (;;) {
         const stamp = crypto.randomBytes(STAMP_SIZE);
         attempts++;
         const value = stamp_value(workblock, stamp);
         if (value >= target_cost) return { stamp, value, attempts };
+
+        if (Date.now() - lastYield > 15) {
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            lastYield = Date.now();
+        }
     }
 }
 
@@ -95,7 +107,7 @@ export function peering_key_material(responder_identity_hash, requester_identity
     return crypto.concat(responder_identity_hash, requester_identity_hash);
 }
 
-export function generate_peering_key(responder_identity_hash, requester_identity_hash, target_cost) {
+export async function generate_peering_key(responder_identity_hash, requester_identity_hash, target_cost) {
     const material = peering_key_material(responder_identity_hash, requester_identity_hash);
     return generate_stamp(material, target_cost, WORKBLOCK_EXPAND_ROUNDS_PEERING);
 }

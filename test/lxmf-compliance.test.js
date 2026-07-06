@@ -93,6 +93,243 @@ test('lxmf_parse rejects a message whose signature does not match the claimed se
   assert.equal(parsed.valid, false);
 });
 
+test('DIRECT-delivery LXMF wire form (lxmf_build_direct) matches LXMF.LXMessage.pack() byte-for-byte, including the destination_hash prefix OPPORTUNISTIC omits', () => {
+  const sourcePub = crypto.public_identity(SOURCE_PRIVATE_KEY);
+  const destPub = crypto.public_identity(DEST_PRIVATE_KEY);
+  const sourceHash = protocol.get_identity_destination_hash(sourcePub, 'lxmf.delivery');
+  const destHash = protocol.get_identity_destination_hash(destPub, 'lxmf.delivery');
+
+  const wirePayload = protocol.lxmf_build_direct('hello lxmf', SOURCE_PRIVATE_KEY, destHash, sourceHash, 1700000000.0, 'greeting');
+
+  // Captured from a real `LXMF.LXMessage(desired_method=DIRECT).pack()` call
+  // for the same fixed source/dest/timestamp/content — note the signature
+  // and msgpack payload bytes are identical to the OPPORTUNISTIC test above;
+  // only the destination_hash prefix differs (present here, omitted there).
+  assert.equal(
+    crypto.bytesToHex(wirePayload),
+    'cf0b2a4a8d2a0b6978b71290da7cc80e' +
+    'fae321c442e3c9bdcd7a3e79d850e03c' +
+    '44fbbf318b717a3445c26dc6e14cc7fda7e5b8f9f8f4e581ee53e756a0d4c37b623b89740cc80234b7785aad76d39be5c2049f68c8851cad8847683086b0ed07' +
+    '94cb41d954fc40000000c4086772656574696e67c40a68656c6c6f206c786d6680'
+  );
+  assert.equal(wirePayload.length, 129);
+
+  const parsed = protocol.lxmf_parse_direct(wirePayload, sourcePub);
+  assert.equal(parsed.valid, true);
+  assert.equal(crypto.bytesToHex(parsed.destination_hash), crypto.bytesToHex(destHash));
+  assert.equal(crypto.bytesToHex(parsed.source_hash), crypto.bytesToHex(sourceHash));
+  assert.equal(new TextDecoder().decode(parsed.title), 'greeting');
+  assert.equal(new TextDecoder().decode(parsed.content), 'hello lxmf');
+});
+
+test('lxmf_parse_direct rejects a message whose signature does not match the claimed sender', () => {
+  const sourcePub = crypto.public_identity(SOURCE_PRIVATE_KEY);
+  const destPub = crypto.public_identity(DEST_PRIVATE_KEY);
+  const sourceHash = protocol.get_identity_destination_hash(sourcePub, 'lxmf.delivery');
+  const destHash = protocol.get_identity_destination_hash(destPub, 'lxmf.delivery');
+
+  const wirePayload = protocol.lxmf_build_direct('hello lxmf', SOURCE_PRIVATE_KEY, destHash, sourceHash, 1700000000.0, 'greeting');
+  const parsed = protocol.lxmf_parse_direct(wirePayload, destPub);
+  assert.equal(parsed.valid, false);
+});
+
+test('Link.sendLXMF() delivers a DIRECT LXMF message as a single packet, and emits \'lxmf\' (not a plain \'packet\') on the receiving side', async () => {
+  const rnsA = new Reticulum();
+  const rnsB = new Reticulum();
+
+  class Bridge extends Interface {
+    connect() {}
+    sendData(data) { setTimeout(() => this.other.rns.onPacketReceived(data, this.other), 0); }
+  }
+  const ifaceA = new Bridge('A');
+  const ifaceB = new Bridge('B');
+  ifaceA.other = ifaceB;
+  ifaceB.other = ifaceA;
+  rnsA.addInterface(ifaceA);
+  rnsB.addInterface(ifaceB);
+
+  const identityA = Identity.create();
+  const identityB = Identity.create();
+  const selfA = new Destination(rnsA, identityA, Destination.IN, Destination.SINGLE, 'lxmf', 'delivery');
+  const selfB = new Destination(rnsB, identityB, Destination.IN, Destination.SINGLE, 'lxmf', 'delivery');
+  const bFromA = new Destination(rnsA, identityB, Destination.OUT, Destination.SINGLE, 'lxmf', 'delivery');
+
+  const aGotAnnounce = new Promise((resolve) => rnsA.once('announce', resolve));
+  selfB.announce();
+  await aGotAnnounce;
+
+  // B must also learn A's identity before it can validate the DIRECT
+  // message's signature (tryParseLxmfDirect() looks up the sender by hash).
+  const bGotAnnounce = new Promise((resolve) => rnsB.once('announce', resolve));
+  selfA.announce();
+  await bGotAnnounce;
+
+  const responderLinkPromise = new Promise((resolve) => selfB.on('link', resolve));
+  const initiatorLink = new Link(rnsA, bFromA);
+  await new Promise((resolve) => initiatorLink.once('established', resolve));
+  const responderLink = await responderLinkPromise;
+  await new Promise((resolve) => (responderLink.status === Link.ACTIVE ? resolve() : responderLink.once('established', resolve)));
+
+  let gotPlainPacket = false;
+  responderLink.on('packet', () => { gotPlainPacket = true; });
+  const gotLxmf = new Promise((resolve) => responderLink.on('lxmf', resolve));
+
+  await initiatorLink.sendLXMF(selfA, 'direct hi', 'a small direct message', { via: 'link' });
+  const received = await gotLxmf;
+
+  assert.equal(gotPlainPacket, false, "a DIRECT LXMF payload is not also emitted as a generic 'packet' event");
+  assert.equal(received.valid, true);
+  assert.equal(new TextDecoder().decode(received.title), 'direct hi');
+  assert.equal(new TextDecoder().decode(received.content), 'a small direct message');
+  assert.deepEqual(received.fields, { via: 'link' });
+  assert.equal(crypto.bytesToHex(received.source_hash), crypto.bytesToHex(selfA.hash));
+  assert.equal(crypto.bytesToHex(received.destination_hash), crypto.bytesToHex(selfB.hash));
+
+  initiatorLink.close();
+});
+
+test('Link.sendLXMF() falls back to a Resource for a DIRECT LXMF message too large for a single link packet, and still emits \'lxmf\' (not \'resource\') on receipt', async () => {
+  const rnsA = new Reticulum();
+  const rnsB = new Reticulum();
+
+  class Bridge extends Interface {
+    connect() {}
+    sendData(data) { setTimeout(() => this.other.rns.onPacketReceived(data, this.other), 0); }
+  }
+  const ifaceA = new Bridge('A');
+  const ifaceB = new Bridge('B');
+  ifaceA.other = ifaceB;
+  ifaceB.other = ifaceA;
+  rnsA.addInterface(ifaceA);
+  rnsB.addInterface(ifaceB);
+
+  const identityA = Identity.create();
+  const identityB = Identity.create();
+  const selfA = new Destination(rnsA, identityA, Destination.IN, Destination.SINGLE, 'lxmf', 'delivery');
+  const selfB = new Destination(rnsB, identityB, Destination.IN, Destination.SINGLE, 'lxmf', 'delivery');
+  const bFromA = new Destination(rnsA, identityB, Destination.OUT, Destination.SINGLE, 'lxmf', 'delivery');
+
+  const aGotAnnounce = new Promise((resolve) => rnsA.once('announce', resolve));
+  selfB.announce();
+  await aGotAnnounce;
+
+  // B must also learn A's identity before it can validate the DIRECT
+  // message's signature (tryParseLxmfDirect() looks up the sender by hash).
+  const bGotAnnounce = new Promise((resolve) => rnsB.once('announce', resolve));
+  selfA.announce();
+  await bGotAnnounce;
+
+  const responderLinkPromise = new Promise((resolve) => selfB.on('link', resolve));
+  const initiatorLink = new Link(rnsA, bFromA);
+  await new Promise((resolve) => initiatorLink.once('established', resolve));
+  const responderLink = await responderLinkPromise;
+  await new Promise((resolve) => (responderLink.status === Link.ACTIVE ? resolve() : responderLink.once('established', resolve)));
+
+  let gotPlainResource = false;
+  responderLink.on('resource', () => { gotPlainResource = true; });
+  const gotLxmf = new Promise((resolve) => responderLink.on('lxmf', resolve));
+
+  const bigContent = 'x'.repeat(protocol.LINK_MDU * 2);
+  await initiatorLink.sendLXMF(selfA, 'direct big', bigContent, {});
+  const received = await gotLxmf;
+
+  assert.equal(gotPlainResource, false, "a DIRECT LXMF payload sent as a Resource is not also emitted as a generic 'resource' event");
+  assert.equal(received.valid, true);
+  assert.equal(new TextDecoder().decode(received.content), bigContent);
+
+  initiatorLink.close();
+});
+
+// --- Delivery announce app_data + compression negotiation (Phase 5.2) ---
+
+test('lxmf_build_announce_app_data matches LXMRouter.get_announce_app_data() byte-for-byte, for both an empty and a fully-populated case', () => {
+  // Captured from real `RNS.vendor.umsgpack.packb([display_name, stamp_cost,
+  // [LXMF.SF_COMPRESSION]])` — the exact structure get_announce_app_data() builds.
+  assert.equal(crypto.bytesToHex(protocol.lxmf_build_announce_app_data()), '93c0c09100');
+  assert.equal(crypto.bytesToHex(protocol.lxmf_build_announce_app_data('Alice', 12)), '93c405416c6963650c9100');
+});
+
+test('lxmf_stamp_cost_from_app_data and lxmf_compression_supported match LXMF.stamp_cost_from_app_data/compression_support_from_app_data', () => {
+  assert.equal(protocol.lxmf_stamp_cost_from_app_data(null), null);
+  assert.equal(protocol.lxmf_compression_supported(null), true, 'no announce seen yet defaults to compression supported');
+
+  const withCost = protocol.lxmf_build_announce_app_data('Alice', 12);
+  assert.equal(protocol.lxmf_stamp_cost_from_app_data(withCost), 12);
+  assert.equal(protocol.lxmf_compression_supported(withCost), true);
+
+  // An app_data whose functionality list doesn't include SF_COMPRESSION (an
+  // empty list, matching a real peer that declared it doesn't support
+  // compression) — real LXMF.compression_support_from_app_data() returns
+  // False here, not a permissive default, since the list is present.
+  const noCompressionAppData = msgpack.pack([null, null, []]);
+  assert.equal(protocol.lxmf_compression_supported(noCompressionAppData), false);
+});
+
+test('Link.sendLXMF() skips compression for an oversized message when the recipient\'s announced app_data says they don\'t support it', async () => {
+  const rnsA = new Reticulum();
+  const rnsB = new Reticulum();
+
+  class Bridge extends Interface {
+    connect() {}
+    sendData(data) { setTimeout(() => this.other.rns.onPacketReceived(data, this.other), 0); }
+  }
+  const ifaceA = new Bridge('A');
+  const ifaceB = new Bridge('B');
+  ifaceA.other = ifaceB;
+  ifaceB.other = ifaceA;
+  rnsA.addInterface(ifaceA);
+  rnsB.addInterface(ifaceB);
+
+  const identityA = Identity.create();
+  const identityB = Identity.create();
+  const selfA = new Destination(rnsA, identityA, Destination.IN, Destination.SINGLE, 'lxmf', 'delivery');
+  const selfB = new Destination(rnsB, identityB, Destination.IN, Destination.SINGLE, 'lxmf', 'delivery');
+  const bFromA = new Destination(rnsA, identityB, Destination.OUT, Destination.SINGLE, 'lxmf', 'delivery');
+
+  // B announces with an app_data that explicitly declares no compression
+  // support (an empty functionality list) — A must honor that.
+  const aGotAnnounce = new Promise((resolve) => rnsA.once('announce', resolve));
+  const noCompressionAppData = msgpack.pack([null, null, []]);
+  selfB.announce({ appData: noCompressionAppData });
+  await aGotAnnounce;
+
+  const bGotAnnounce = new Promise((resolve) => rnsB.once('announce', resolve));
+  selfA.announce();
+  await bGotAnnounce;
+
+  const responderLinkPromise = new Promise((resolve) => selfB.on('link', resolve));
+  const initiatorLink = new Link(rnsA, bFromA);
+  await new Promise((resolve) => initiatorLink.once('established', resolve));
+  const responderLink = await responderLinkPromise;
+  await new Promise((resolve) => (responderLink.status === Link.ACTIVE ? resolve() : responderLink.once('established', resolve)));
+
+  // Intercept the outgoing advertisement's own `compressed` flag directly —
+  // real proof that compression wasn't even attempted, not just that the
+  // final decompressed content happens to match either way.
+  let advCompressed = null;
+  const originalSendData = ifaceA.sendData.bind(ifaceA);
+  ifaceA.sendData = (data) => {
+    const packet = protocol.packet_unpack(data);
+    if (packet && packet.context === protocol.CONTEXT_RESOURCE_ADV) {
+      const plaintext = protocol.link_decrypt(initiatorLink.derivedKey, packet.data);
+      const adv = protocol.parse_resource_advertisement(plaintext);
+      if (adv) advCompressed = adv.compressed;
+    }
+    originalSendData(data);
+  };
+
+  const gotLxmf = new Promise((resolve) => responderLink.on('lxmf', resolve));
+  const bigContent = 'a'.repeat(protocol.LINK_MDU * 2); // highly compressible, to make the effect obvious if compression WERE attempted
+  await initiatorLink.sendLXMF(selfA, 'no compress', bigContent, {});
+  const received = await gotLxmf;
+
+  assert.equal(advCompressed, false, "the Resource advertisement's own compressed flag is false — compression was not attempted at all, matching the recipient's declared lack of support");
+  assert.equal(received.valid, true);
+  assert.equal(new TextDecoder().decode(received.content), bigContent);
+
+  initiatorLink.close();
+});
+
 test('Destination.sendLXMF() delivers an LXMF message end to end between two independent Reticulum peers', async () => {
   const rnsA = new Reticulum();
   const rnsB = new Reticulum();
@@ -263,9 +500,9 @@ test('stamp_workblock matches LXStamper.stamp_workblock byte-for-byte', () => {
   assert.equal(workblock.length, 256);
 });
 
-test('generate_stamp produces a stamp that stamp_valid (and real LXStamper) both accept', () => {
+test('generate_stamp produces a stamp that stamp_valid (and real LXStamper) both accept', async () => {
   const material = crypto.randomBytes(32);
-  const { stamp: stampBytes, value } = stamp.generate_stamp(material, 8, 50);
+  const { stamp: stampBytes, value } = await stamp.generate_stamp(material, 8, 50);
 
   assert.ok(value >= 8);
   const workblock = stamp.stamp_workblock(material, 50);
@@ -313,6 +550,83 @@ test('a propagation node configured with a stampCost rejects an unproven upload 
   link2.close();
   await new Promise((r) => setTimeout(r, 50));
   assert.equal(propNode.messages.size, 1);
+});
+
+// --- Propagation-node announce app_data (Phase 5.3) ---
+
+test('lxmf_build_propagation_announce_app_data matches LXMRouter.get_propagation_node_app_data() byte-for-byte', () => {
+  // Captured from a real `RNS.vendor.umsgpack.packb([False, 1700000000, True,
+  // 1000, 10, [16, 3, 18], {LXMF.PN_META_NAME: b"testnode"}])` — the exact
+  // structure get_propagation_node_app_data() builds (with a fixed timebase
+  // in place of real time.time()).
+  const built = protocol.lxmf_build_propagation_announce_app_data({
+    stampCost: 16, stampCostFlexibility: 3, peeringCost: 18,
+    perTransferLimitKb: 1000, perSyncLimit: 10, name: 'testnode',
+  });
+  // Re-parse and compare fields rather than raw bytes, since the builder
+  // uses the current time as its timebase (matching real
+  // get_propagation_node_app_data()'s int(time.time())) rather than a fixed
+  // one — the fixed-timebase byte vector is checked directly below instead.
+  const parsed = protocol.lxmf_parse_propagation_announce_app_data(built);
+  assert.equal(parsed.stampCost, 16);
+  assert.equal(parsed.stampCostFlexibility, 3);
+  assert.equal(parsed.peeringCost, 18);
+  assert.equal(parsed.perTransferLimitKb, 1000);
+  assert.equal(parsed.perSyncLimit, 10);
+  assert.equal(parsed.nodeState, true);
+  assert.equal(parsed.name, 'testnode');
+
+  const fixedTimebaseCapture = crypto.hexToBytes('97c2ce6553f100c3cd03e80a931003128101c408746573746e6f6465');
+  const parsedFixed = protocol.lxmf_parse_propagation_announce_app_data(fixedTimebaseCapture);
+  assert.equal(parsedFixed.timebase, 1700000000);
+  assert.equal(parsedFixed.stampCost, 16);
+  assert.equal(parsedFixed.stampCostFlexibility, 3);
+  assert.equal(parsedFixed.peeringCost, 18);
+  assert.equal(parsedFixed.name, 'testnode');
+});
+
+test('lxmf_parse_propagation_announce_app_data returns null for invalid/absent data, matching pn_announce_data_is_valid rules', () => {
+  assert.equal(protocol.lxmf_parse_propagation_announce_app_data(null), null);
+  assert.equal(protocol.lxmf_parse_propagation_announce_app_data(new Uint8Array(0)), null);
+  // A 3-element list (the lxmf.delivery announce shape, not propagation's 7-element one).
+  assert.equal(protocol.lxmf_parse_propagation_announce_app_data(protocol.lxmf_build_announce_app_data('Alice', 12)), null);
+});
+
+test("PropagationNode.announce() embeds real stamp/peering cost app_data, and propagateLXMF()/syncToPeer() auto-detect it instead of needing the cost supplied out of band", async () => {
+  const rnsSender = new Reticulum();
+  const rnsPropNode = new Reticulum();
+  makeBridgedPair(rnsSender, rnsPropNode);
+
+  const propNodeIdentity = Identity.create();
+  const propNode = new propagation.PropagationNode(rnsPropNode, propNodeIdentity, { stampCost: 8, peeringCost: 12 });
+
+  const senderIdentity = Identity.create();
+  const senderSelf = new Destination(rnsSender, senderIdentity, Destination.IN, Destination.SINGLE, 'lxmf', 'delivery');
+
+  const recipientIdentity = Identity.create();
+  const recipientSelfHash = protocol.get_identity_destination_hash(recipientIdentity.public, 'lxmf.delivery');
+  rnsSender.identities.set(crypto.bytesToHex(recipientSelfHash), { public_key: recipientIdentity.public, ratchet: recipientIdentity.ratchetPublic });
+
+  const senderKnowsPropNode = new Promise((resolve) => rnsSender.once('announce', resolve));
+  propNode.announce();
+  const nodeAnnounce = await senderKnowsPropNode;
+
+  // Confirm the announce itself really carries the node's configured cost —
+  // not just that propagateLXMF() happens to work below.
+  const parsedNodeAppData = protocol.lxmf_parse_propagation_announce_app_data(nodeAnnounce.app_data);
+  assert.equal(parsedNodeAppData.stampCost, 8);
+  assert.equal(parsedNodeAppData.peeringCost, 12);
+
+  const destOut = new Destination(rnsSender, recipientIdentity, Destination.OUT, Destination.SINGLE, 'lxmf', 'delivery');
+  const propNodeOutFromSender = new Destination(rnsSender, propNodeIdentity, Destination.OUT, Destination.SINGLE, 'lxmf', 'propagation');
+
+  // No stampCost argument at all — must be read from the node's own announce.
+  const link = new Link(rnsSender, propNodeOutFromSender);
+  await new Promise((resolve) => link.once('established', resolve));
+  await propagation.propagateLXMF(link, destOut, senderSelf, 'auto-detected cost', 'no out-of-band stamp cost needed', {});
+  link.close();
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(propNode.messages.size, 1, 'the upload, stamped at the auto-detected cost of 8, was accepted');
 });
 
 // --- Node-to-node peer sync ("/offer" protocol, peering-key stamps) ---
@@ -403,6 +717,55 @@ test('syncToPeer() offers a stored message to another propagation node, which ac
   recipientLink.close();
 });
 
+test('syncToPeer() auto-detects the peer\'s required peeringCost from its announce, instead of needing it supplied out of band', async () => {
+  const rnsSender = new Reticulum();
+  const rnsNodeA = new Reticulum();
+  const rnsNodeB = new Reticulum();
+  makeBridgedPair(rnsSender, rnsNodeA);
+  makeBridgedPair(rnsNodeA, rnsNodeB);
+
+  const nodeAIdentity = Identity.create();
+  const nodeA = new propagation.PropagationNode(rnsNodeA, nodeAIdentity, { peeringCost: 8 });
+  const nodeBIdentity = Identity.create();
+  const nodeB = new propagation.PropagationNode(rnsNodeB, nodeBIdentity, { peeringCost: 8 });
+
+  const senderIdentity = Identity.create();
+  const senderSelf = new Destination(rnsSender, senderIdentity, Destination.IN, Destination.SINGLE, 'lxmf', 'delivery');
+  const recipientIdentity = Identity.create();
+  const recipientSelfHash = protocol.get_identity_destination_hash(recipientIdentity.public, 'lxmf.delivery');
+  rnsSender.identities.set(crypto.bytesToHex(recipientSelfHash), { public_key: recipientIdentity.public, ratchet: recipientIdentity.ratchetPublic });
+
+  const senderKnowsNodeA = new Promise((resolve) => rnsSender.once('announce', resolve));
+  nodeA.announce();
+  await senderKnowsNodeA;
+
+  const destOut = new Destination(rnsSender, recipientIdentity, Destination.OUT, Destination.SINGLE, 'lxmf', 'delivery');
+  const nodeAOutFromSender = new Destination(rnsSender, nodeAIdentity, Destination.OUT, Destination.SINGLE, 'lxmf', 'propagation');
+  const senderLink = new Link(rnsSender, nodeAOutFromSender);
+  await new Promise((resolve) => senderLink.once('established', resolve));
+  await propagation.propagateLXMF(senderLink, destOut, senderSelf, 'auto-peering', 'no out-of-band peering cost needed', {});
+  senderLink.close();
+  assert.equal(nodeA.messages.size, 1);
+
+  // Node A must have actually heard node B's announce for the auto-detect
+  // path to have anything to read.
+  const nodeAKnowsNodeB = new Promise((resolve) => rnsNodeA.once('announce', resolve));
+  nodeB.announce();
+  await nodeAKnowsNodeB;
+
+  const nodeBOutFromA = new Destination(rnsNodeA, nodeBIdentity, Destination.OUT, Destination.SINGLE, 'lxmf', 'propagation');
+  const peerLink = new Link(rnsNodeA, nodeBOutFromA);
+  await new Promise((resolve) => peerLink.once('established', resolve));
+
+  // No peeringCost argument at all — must be read from node B's own announce.
+  const result = await propagation.syncToPeer(nodeA, peerLink, nodeB.identity);
+  assert.equal(result.offered, 1);
+  assert.equal(result.synced, 1, 'the peering key, generated at the auto-detected cost of 8, was accepted by node B');
+  assert.equal(nodeB.messages.size, 1);
+
+  peerLink.close();
+});
+
 test('a propagation node rejects an /offer whose peering key does not meet its required peeringCost', async () => {
   const rnsNodeA = new Reticulum();
   const rnsNodeB = new Reticulum();
@@ -418,7 +781,7 @@ test('a propagation node rejects an /offer whose peering key does not meet its r
   await new Promise((resolve) => peerLink.once('established', resolve));
 
   peerLink.identify(nodeA.identity);
-  const { stamp: lowCostKey } = stamp.generate_peering_key(nodeBIdentity.hash, nodeAIdentity.hash, 8);
+  const { stamp: lowCostKey } = await stamp.generate_peering_key(nodeBIdentity.hash, nodeAIdentity.hash, 8);
   const response = await peerLink.request('/offer', [lowCostKey, []]);
   assert.equal(response, 0xf3);
 

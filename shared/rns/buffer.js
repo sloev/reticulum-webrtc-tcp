@@ -10,10 +10,10 @@
 // (`.write(bytes)`, `.close()`) — the wire format and chunking/EOF semantics
 // are what matters for interop, not the local consumption API.
 //
-// Not implemented: bz2 compression of *outgoing* chunks (this writer never
-// sets StreamDataMessage's `compressed` flag, since it has no need to
-// compress) — but an incoming compressed chunk from a real RNS peer is
-// transparently decompressed (see shared/rns/compression.js).
+// Each outgoing chunk is bz2-compressed if that's smaller (see
+// shared/rns/compression.js's bz2_compress_if_beneficial()), matching real
+// RNS's own per-chunk compression — and, as always, an incoming compressed
+// chunk from a real RNS peer is transparently decompressed the same way.
 import * as protocol from './protocol.js';
 import { EventEmitter } from 'events';
 import { ChannelError } from './channel.js';
@@ -111,12 +111,18 @@ export class RawChannelWriter {
     // Sends up to one chunk's worth of `data` (a Uint8Array), truncating to
     // this writer's max chunk length if it's larger — matching
     // RawChannelWriter.write()'s single-chunk-per-call contract in real RNS.
-    // Returns the number of bytes actually sent. Throws if the channel isn't
-    // ready to send (ME_LINK_NOT_READY) rather than swallowing it, since
-    // callers here are expected to check `channel.isReadyToSend()` first.
-    write(data) {
+    // Compresses the chunk first if that's smaller (matching real RNS's own
+    // per-chunk compression), but always returns the number of *uncompressed*
+    // input bytes consumed (not the compressed size actually sent), since
+    // that's what callers use to track their offset into the source data —
+    // matching real RawChannelWriter.write()'s own return-value contract.
+    // Throws if the channel isn't ready to send (ME_LINK_NOT_READY) rather
+    // than swallowing it, since callers here are expected to check
+    // `channel.isReadyToSend()` first.
+    async write(data) {
         const chunk = data.length > this._maxChunkLen ? data.slice(0, this._maxChunkLen) : data;
-        const message = protocol.build_stream_data_message(this.streamId, chunk, this._eof, false);
+        const { data: sendData, compressed } = await compression.bz2_compress_if_beneficial(chunk);
+        const message = protocol.build_stream_data_message(this.streamId, sendData, this._eof, compressed);
         try {
             this.channel.send(protocol.CHANNEL_MSGTYPE_STREAM_DATA, message);
         } catch (e) {
@@ -135,7 +141,7 @@ export class RawChannelWriter {
             await new Promise((resolve) => setTimeout(resolve, pollMs));
         }
         this._eof = true;
-        this.write(new Uint8Array(0));
+        await this.write(new Uint8Array(0));
     }
 }
 

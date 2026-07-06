@@ -121,8 +121,14 @@ await new Promise((resolve) => {
 });
 assertEqual(receivedFromPython[0], crypto.bytesToHex(pyToJsPayload), 'JS correctly received a message sent by real RNS.Channel.send()');
 
-// --- JS -> Python: a real RNS.Buffer stream, split across several chunks ---
-const jsToPyStreamPayload = crypto.randomBytes(3000); // several chunks at STREAM_DATA_MAX_LEN=423
+// --- JS -> Python: a real RNS.Buffer stream, split across several chunks.
+// Repetitive text like this compresses well, so this also exercises this
+// stack's outgoing per-chunk bz2 compression (shared/rns/compression.js) —
+// real RNS.Buffer only correctly reassembles this if it actually recognized
+// and decompressed the compressed chunks, since the wire bytes are no
+// longer the plaintext otherwise (the separate incompressible-data check
+// below, in the other direction, covers the not-worth-compressing path). ---
+const jsToPyStreamPayload = new TextEncoder().encode('compressible buffer stream chunk from this project\'s Buffer writer! '.repeat(50)); // several chunks at STREAM_DATA_MAX_LEN=423
 const pyGotBuffer = waitFor((m) => m.event === 'buffer_received', 15000);
 const writer = RnsBuffer.createWriter(1, channel);
 let offset = 0;
@@ -130,7 +136,7 @@ while (offset < jsToPyStreamPayload.length) {
   while (!channel.isReadyToSend()) {
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
-  offset += writer.write(jsToPyStreamPayload.slice(offset));
+  offset += await writer.write(jsToPyStreamPayload.slice(offset));
 }
 await writer.close();
 const pyBufferEvent = await pyGotBuffer;

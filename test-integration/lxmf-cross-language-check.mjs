@@ -6,7 +6,7 @@
 // but wire-compatible with the actual reference LXMF implementation.
 import { spawn } from 'node:child_process';
 import { rmSync } from 'node:fs';
-import { Reticulum, Identity, Destination } from '../shared/rns/index.js';
+import { Reticulum, Identity, Destination, Link } from '../shared/rns/index.js';
 import { createTCPGateway } from '../node/tcp-gateway.js';
 import * as crypto from '../shared/rns/crypto.js';
 
@@ -116,6 +116,70 @@ const jsReceived = await jsGotLxmf;
 assertTrue(jsReceived.valid, 'JS validated the Python-signed LXMF message');
 assertEqual(new TextDecoder().decode(jsReceived.title), 'hello from Python', 'JS received the correct LXMF title');
 assertEqual(new TextDecoder().decode(jsReceived.content), 'this is a real lxmf message from the real rns/lxmf packages', 'JS received the correct LXMF content');
+
+// --- DIRECT delivery (over a real RNS.Link), both directions, both
+// packet-sized and Resource-sized (compliance.md Phase 5.1) ---
+
+// JS -> Python, single packet.
+const pyGotDirectLxmf1 = waitFor((m) => m.event === 'lxmf_received' && m.title === 'direct js small', 5000);
+const jsToPyLink1 = new Link(rns, jsToPyDest);
+await new Promise((resolve) => jsToPyLink1.once('established', resolve));
+await jsToPyLink1.sendLXMF(self, 'direct js small', 'a small DIRECT message from JS over a real Link', {});
+const pyDirect1 = await pyGotDirectLxmf1;
+assertTrue(pyDirect1.valid, "Python validated the JS-signed DIRECT LXMF message (single packet)");
+assertEqual(pyDirect1.content, 'a small DIRECT message from JS over a real Link', 'Python received the correct DIRECT (packet) content');
+jsToPyLink1.close();
+
+// JS -> Python, forced into a Resource by exceeding a single link packet.
+const bigContent = 'padding to force a DIRECT LXMF message into a Resource transfer instead of a single link packet. '.repeat(10);
+const pyGotDirectLxmf2 = waitFor((m) => m.event === 'lxmf_received' && m.title === 'direct js big', 10000);
+const jsToPyLink2 = new Link(rns, jsToPyDest);
+await new Promise((resolve) => jsToPyLink2.once('established', resolve));
+await jsToPyLink2.sendLXMF(self, 'direct js big', bigContent, {});
+const pyDirect2 = await pyGotDirectLxmf2;
+assertTrue(pyDirect2.valid, 'Python validated the JS-signed DIRECT LXMF message (Resource fallback)');
+assertEqual(pyDirect2.content, bigContent, 'Python received the correct DIRECT (Resource) content, forced over the size of a single link packet');
+jsToPyLink2.close();
+
+// Python -> JS, single packet: JS accepts an incoming Link (registerRequestHandler
+// not needed — any Link to `self` surfaces via the 'link' event) and listens for 'lxmf'.
+const jsLinkPromise1 = new Promise((resolve) => self.once('link', resolve));
+py.stdin.write(JSON.stringify({ cmd: 'send_lxmf_direct', dest_hash: crypto.bytesToHex(self.hash), title: 'direct py small', content: 'a small DIRECT message from real lxmf over a real Link' }) + '\n');
+const jsDirectLink1 = await jsLinkPromise1;
+const jsDirect1 = await new Promise((resolve) => jsDirectLink1.on('lxmf', resolve));
+assertTrue(jsDirect1.valid, 'JS validated the Python-signed DIRECT LXMF message (single packet)');
+assertEqual(new TextDecoder().decode(jsDirect1.content), 'a small DIRECT message from real lxmf over a real Link', 'JS received the correct DIRECT (packet) content');
+
+// Python -> JS, Resource fallback.
+const jsLinkPromise2 = new Promise((resolve) => self.once('link', resolve));
+py.stdin.write(JSON.stringify({ cmd: 'send_lxmf_direct', dest_hash: crypto.bytesToHex(self.hash), title: 'direct py big', content: bigContent }) + '\n');
+const jsDirectLink2 = await jsLinkPromise2;
+const jsDirect2 = await new Promise((resolve) => jsDirectLink2.on('lxmf', resolve));
+assertTrue(jsDirect2.valid, 'JS validated the Python-signed DIRECT LXMF message (Resource fallback)');
+assertEqual(new TextDecoder().decode(jsDirect2.content), bigContent, 'JS received the correct DIRECT (Resource) content, forced over the size of a single link packet, from real lxmf');
+
+// --- Compression negotiation (compliance.md Phase 5.2): Python re-announces
+// its lxmf.delivery destination with a real get_announce_app_data()-shaped
+// app_data explicitly declaring no SF_COMPRESSION support; JS must honor
+// that on its next oversized DIRECT send, skipping compression entirely —
+// confirmed from Python's own side via the resource's `compressed` flag. ---
+const jsSawNoCompressionAnnounce = new Promise((resolve) => {
+  rns.on('announce', function handler(a) {
+    if (crypto.bytesToHex(a.destination_hash) === ready.lxmf_dest_hash) { rns.off('announce', handler); resolve(); }
+  });
+});
+py.stdin.write(JSON.stringify({ cmd: 'announce_lxmf_no_compression' }) + '\n');
+await jsSawNoCompressionAnnounce;
+
+const pyGotDirectLxmf3 = waitFor((m) => m.event === 'lxmf_received' && m.title === 'direct js no compress', 10000);
+const jsToPyLink3 = new Link(rns, jsToPyDest);
+await new Promise((resolve) => jsToPyLink3.once('established', resolve));
+await jsToPyLink3.sendLXMF(self, 'direct js no compress', bigContent, {});
+const pyDirect3 = await pyGotDirectLxmf3;
+assertTrue(pyDirect3.valid, 'Python validated the JS-signed DIRECT LXMF message sent after negotiating no compression');
+assertEqual(pyDirect3.content, bigContent, 'Python received the correct content with compression negotiated off');
+assertEqual(pyDirect3.compressed, false, "the real RNS.Resource Python received reports compressed=False — JS genuinely read Python's real announce app_data and skipped compression, not just decoded it correctly either way");
+jsToPyLink3.close();
 
 py.kill();
 gateway.server.close();

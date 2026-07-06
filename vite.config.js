@@ -18,6 +18,15 @@ export default defineConfig({
       string_decoder: 'string_decoder',
     }
   },
+  // bzip2-wasm's Emscripten-generated glue code resolves its .wasm file
+  // relative to its own script location; Vite's dev-server dependency
+  // pre-bundling (esbuild) rewrites/caches that script somewhere the
+  // relative path no longer resolves, so excluding it from pre-bundling
+  // (it's still bundled normally for production builds via Rollup, which
+  // handles the .wasm asset correctly) keeps `npm run dev` working too.
+  optimizeDeps: {
+    exclude: ['bzip2-wasm'],
+  },
   define: {
     'process.env': {},
     'global': 'window',

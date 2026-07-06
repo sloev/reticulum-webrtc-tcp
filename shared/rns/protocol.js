@@ -16,6 +16,7 @@ export const CONTEXT_NONE = 0x00;
 export const CONTEXT_RESOURCE = 0x01;
 export const CONTEXT_RESOURCE_ADV = 0x02;
 export const CONTEXT_RESOURCE_REQ = 0x03;
+export const CONTEXT_RESOURCE_HMU = 0x04;
 export const CONTEXT_RESOURCE_PRF = 0x05;
 export const CONTEXT_REQUEST = 0x09;
 export const CONTEXT_RESPONSE = 0x0a;
@@ -443,13 +444,14 @@ export function build_link_packet(link_id, derived_key, data, context = CONTEXT_
     });
 }
 
-// --- RNS.Link Request/Response (small-payload form only) ---
+// --- RNS.Link Request/Response ---
 // Verified byte-for-byte against the real `rns` package: the request/
 // response msgpack envelopes, and that request_id (packet_truncated_hash of
 // the packed REQUEST packet) matches on both the sending and receiving side.
-// Only the direct-packet form is implemented — RNS falls back to a Resource
-// transfer when a request or response doesn't fit in a single packet (over
-// the link MDU); that fallback is not implemented here (see README).
+// A request or response too large for a single packet falls back to a
+// Resource transfer, matching RNS.Link's own fallback exactly (including its
+// distinct request_id hash for the Resource form — see
+// resource_request_id() below and index.js's Link.request()/_handleRequest()).
 
 export function request_path_hash(path) {
     return crypto.sha256(new TextEncoder().encode(path)).slice(0, 16);
@@ -499,16 +501,34 @@ export function parse_response_payload(plaintext) {
 // answer path requests.
 export const PATH_REQUEST_DEST_HASH = plain_destination_hash('rnstransport.path.request');
 
-// Matches the non-transport-enabled form of RNS.Transport.request_path():
-// destination_hash + a random tag, with no transport instance ID (this
-// project has no persistent "transport identity" concept — see above).
-export function build_path_request(destination_hash, tag) {
-    const data = crypto.concat(destination_hash, tag);
+// Matches RNS.Transport.request_path(): destination_hash + a random tag, or
+// (when a persistent transport instance identity is passed) destination_hash
+// + transport_id + tag — the 3-field form a transport-enabled real Reticulum
+// node sends (Transport.py:2811). Every Reticulum instance in this project
+// always forwards packets for destinations it doesn't own (see _forward()/
+// _forwardLinkRequest()), i.e. it's always acting as a transport node, so it
+// always uses the 3-field form (see Reticulum's `transportIdentity`) rather
+// than gating it behind an explicit transport-enabled toggle real RNS has and
+// this project doesn't.
+export function build_path_request(destination_hash, tag, transport_id = null) {
+    const data = transport_id ? crypto.concat(destination_hash, transport_id, tag) : crypto.concat(destination_hash, tag);
     return packet_pack({
         header_type: 0, context_flag: 0, transport_type: TRANSPORT_BROADCAST, destination_type: DEST_PLAIN,
         packet_type: PACKET_DATA, hops: 0, destination_hash: PATH_REQUEST_DEST_HASH, context: CONTEXT_NONE, data,
     });
 }
+
+// RNS.Transport.PATH_REQUEST_MI: minimum interval between automated path
+// requests for the same destination (Transport.py:83).
+export const PATH_REQUEST_MI_MS = 20 * 1000;
+
+// RNS.Transport.DESTINATION_TIMEOUT: path table entries are dropped if
+// unused for this long (Transport.py:91).
+export const DESTINATION_TIMEOUT_MS = 60 * 60 * 24 * 7 * 1000;
+
+// RNS.Transport.MAX_RATE_TIMESTAMPS: cap on how many announce timestamps are
+// kept per destination for announce-rate-limiting purposes (Transport.py:96).
+export const MAX_RATE_TIMESTAMPS = 16;
 
 // Matches RNS.Transport.path_request_handler(): the first 16 bytes are
 // always the destination hash being looked up; if more bytes follow, RNS
@@ -540,11 +560,16 @@ export function parse_path_request(packet) {
 // exact bytes LXMF's Python msgpack (umsgpack) would produce, and the message
 // hash/signature are computed over those exact bytes — hashed as
 // full_hash(destination_hash + source_hash + msgpack_payload), signed as
-// (that hash concatenated onto the hashed part). What's not implemented:
-// propagation-node stamps/tickets (LXMF's optional anti-spam proof-of-work),
-// the PROPAGATED/PAPER delivery methods, and Resource-based transfer for
-// messages too large for a single packet/link MDU — see README.
-export function lxmf_build(content, source_priv, destination_hash, source_hash, timestamp, title, fields = {}) {
+// (that hash concatenated onto the hashed part). Covers OPPORTUNISTIC
+// (lxmf_build/lxmf_parse below) and DIRECT (lxmf_build_direct/
+// lxmf_parse_direct, further down — sent as a packet or Resource over a
+// Link, see index.js's Link.sendLXMF()) delivery, plus admission stamps
+// (shared/rns/stamp.js) for this project's own propagation-node store-and-
+// forward (shared/rns/propagation.js). Not implemented: the PAPER delivery
+// method (QR-encoded messages — no meaningful use over WebRTC/TCP) and
+// real LXMF's own PROPAGATED wire format (this project's propagation nodes
+// use their own protocol on top of the same envelope — see README).
+function lxmf_sign(content, source_priv, destination_hash, source_hash, timestamp, title, fields) {
     timestamp = timestamp || Date.now() / 1000;
     title = title || new Uint8Array(0);
     if (typeof title === 'string') title = new TextEncoder().encode(title);
@@ -559,9 +584,15 @@ export function lxmf_build(content, source_priv, destination_hash, source_hash, 
     const signed_data = crypto.concat(hashed_part, message_id);
     const signature = crypto.ed25519_sign(source_priv.slice(32), signed_data);
 
-    // This is the OPPORTUNISTIC wire form: destination_hash is omitted since
-    // it's implied by the packet's own (already-encrypted-to) destination.
-    return crypto.concat(source_hash, signature, msgpack_raw);
+    return { source_hash, signature, msgpack_raw };
+}
+
+// The OPPORTUNISTIC wire form (LXMessage.__as_packet(), method=OPPORTUNISTIC):
+// destination_hash is omitted from the packed bytes since it's implied by the
+// packet's own (already-encrypted-to) destination.
+export function lxmf_build(content, source_priv, destination_hash, source_hash, timestamp, title, fields = {}) {
+    const signed = lxmf_sign(content, source_priv, destination_hash, source_hash, timestamp, title, fields);
+    return crypto.concat(signed.source_hash, signed.signature, signed.msgpack_raw);
 }
 
 export function lxmf_parse(decrypted, destination_hash, sender_pub) {
@@ -585,6 +616,153 @@ export function lxmf_parse(decrypted, destination_hash, sender_pub) {
     }
 }
 
+// The DIRECT wire form (LXMessage.__as_packet()/__as_resource(), method=DIRECT):
+// the full destination_hash + source_hash + signature + msgpack_payload, sent
+// as-is over an established Link's application-data packet or Resource. Unlike
+// OPPORTUNISTIC's single packet (addressed directly to the LXMF destination,
+// so its own header already implies the destination), a Link's outer packet
+// is addressed to the link_id, not the LXMF destination — so DIRECT keeps the
+// destination hash inside the payload itself (LXMessage.py's
+// LINK_PACKET_MAX_CONTENT, unlike ENCRYPTED_PACKET_MAX_CONTENT, has no
+// +DESTINATION_LENGTH adjustment, confirming the header doesn't carry it here).
+export function lxmf_build_direct(content, source_priv, destination_hash, source_hash, timestamp, title, fields = {}) {
+    const signed = lxmf_sign(content, source_priv, destination_hash, source_hash, timestamp, title, fields);
+    return crypto.concat(destination_hash, signed.source_hash, signed.signature, signed.msgpack_raw);
+}
+
+export function lxmf_parse_direct(decrypted, sender_pub) {
+    if (decrypted.length < 96) return false;
+    const destination_hash = decrypted.slice(0, 16);
+    const source_hash = decrypted.slice(16, 32);
+    const signature = decrypted.slice(32, 96);
+    const msgpack_raw = decrypted.slice(96);
+
+    try {
+        const data = lxmfMsgpack.unpack(msgpack_raw);
+        if (!data || data.length < 4) return false;
+
+        const hashed_part = crypto.concat(destination_hash, source_hash, msgpack_raw);
+        const message_id = crypto.sha256(hashed_part);
+        const signed_data = crypto.concat(hashed_part, message_id);
+        const valid = crypto.ed25519_validate(signature, signed_data, sender_pub.slice(32));
+
+        return { destination_hash, source_hash, signature, message_id, timestamp: data[0], title: data[1], content: data[2], fields: data[3], valid };
+    } catch {
+        return false;
+    }
+}
+
+// LXMF's supported-functionality signaling codes (LXMF.py:142) — currently
+// only compression negotiation exists.
+export const SF_COMPRESSION = 0x00;
+
+// Matches LXMRouter.get_announce_app_data(): an `lxmf.delivery` destination's
+// announce app_data is [display_name|null, stamp_cost|null,
+// supported_functionality_list], msgpacked. Byte-exact against a real
+// `get_announce_app_data()` capture for both an empty and a fully-populated
+// case (see test/lxmf-compliance.test.js).
+export function lxmf_build_announce_app_data(display_name = null, stamp_cost = null) {
+    const nameBytes = display_name ? (typeof display_name === 'string' ? new TextEncoder().encode(display_name) : display_name) : null;
+    const cost = (typeof stamp_cost === 'number' && stamp_cost > 0 && stamp_cost < 255) ? stamp_cost : null;
+    return lxmfMsgpack.pack([nameBytes, cost, [SF_COMPRESSION]]);
+}
+
+// Matches LXMF.stamp_cost_from_app_data(): a recipient's required stamp cost
+// for unsolicited (OPPORTUNISTIC/DIRECT) delivery, read from their own
+// announce instead of needing to be known out of band. Returns null if
+// absent (no cost required) or the app_data isn't the list-shaped format.
+export function lxmf_stamp_cost_from_app_data(app_data) {
+    if (!app_data || app_data.length === 0) return null;
+    try {
+        const peer_data = lxmfMsgpack.unpack(app_data);
+        if (!Array.isArray(peer_data) || peer_data.length < 2) return null;
+        return peer_data[1] ?? null;
+    } catch {
+        return null;
+    }
+}
+
+// Matches LXMF.compression_support_from_app_data(), folded together with
+// LXMessage.determine_compression_support()'s no-app_data default: no
+// announce seen yet (or one with no functionality-signaling field at all) is
+// assumed to support compression, matching RNS's own default of True — only
+// an explicit, present-but-empty (or non-matching) functionality list turns
+// this false.
+export function lxmf_compression_supported(app_data) {
+    if (!app_data || app_data.length === 0) return true;
+    try {
+        const peer_data = lxmfMsgpack.unpack(app_data);
+        if (!Array.isArray(peer_data) || peer_data.length < 3) return true;
+        if (!Array.isArray(peer_data[2])) return true;
+        return peer_data[2].includes(SF_COMPRESSION);
+    } catch {
+        return true;
+    }
+}
+
+// LXMRouter's propagation-node metadata keys (LXMF.py:132-138) — only NAME is
+// used here; the others (sync stratum/throttle, auth band, utilization
+// pressure, custom) have no equivalent concept in this project's
+// PropagationNode.
+export const PN_META_NAME = 0x01;
+
+// Matches LXMRouter.get_propagation_node_app_data(): a propagation node's
+// announce app_data is a 7-element msgpack list — [false (legacy PN support
+// flag, always false), timebase, node_state, per_transfer_limit_kb,
+// per_sync_limit, [stamp_cost, stamp_cost_flexibility, peering_cost],
+// metadata (a map keyed by the PN_META_* integer codes above, not a plain
+// object — real LXMF's msgpack keys are integers, so a JS object's
+// always-string keys would encode wrong; a Map is used instead)]. Byte-exact
+// against a real get_propagation_node_app_data()-shaped capture.
+export function lxmf_build_propagation_announce_app_data({
+    stampCost = 0, stampCostFlexibility = 0, peeringCost = 0,
+    nodeState = true, perTransferLimitKb = 0, perSyncLimit = 0, name = null,
+} = {}) {
+    const metadata = new Map();
+    if (name) metadata.set(PN_META_NAME, typeof name === 'string' ? new TextEncoder().encode(name) : name);
+
+    return lxmfMsgpack.pack([
+        false, Math.floor(Date.now() / 1000), nodeState,
+        perTransferLimitKb, perSyncLimit,
+        [stampCost, stampCostFlexibility, peeringCost],
+        metadata,
+    ]);
+}
+
+// Matches LXMF.pn_announce_data_is_valid()'s validation rules (LXMF.py:224):
+// a 7-element list with a decodable timebase, a strictly-boolean node_state,
+// integer transfer/sync limits, a 3-element integer stamp-cost list, and a
+// dict-typed metadata field. Returns null (matching pn_stamp_cost_from_app_
+// data()'s "else return None" for invalid data) rather than throwing, so
+// callers can safely fall back to an out-of-band-provided cost.
+export function lxmf_parse_propagation_announce_app_data(app_data) {
+    if (!app_data || app_data.length === 0) return null;
+    try {
+        const data = lxmfMsgpack.unpack(app_data);
+        if (!Array.isArray(data) || data.length < 7) return null;
+        if (typeof data[2] !== 'boolean') return null;
+        if (!Number.isInteger(data[3]) || !Number.isInteger(data[4])) return null;
+        if (!Array.isArray(data[5]) || data[5].length < 3) return null;
+        const [stampCost, stampCostFlexibility, peeringCost] = data[5];
+        if (![stampCost, stampCostFlexibility, peeringCost].every(Number.isInteger)) return null;
+        const metadata = data[6];
+        // msgpack.js's decoder returns maps as plain objects (integer keys
+        // coerced to string property names, per JS object semantics) rather
+        // than a Map — see readMap() in shared/rns/msgpack.js.
+        if (typeof metadata !== 'object' || metadata === null || Array.isArray(metadata)) return null;
+
+        const nameBytes = metadata[PN_META_NAME];
+        return {
+            timebase: data[1], nodeState: data[2],
+            perTransferLimitKb: data[3], perSyncLimit: data[4],
+            stampCost, stampCostFlexibility, peeringCost,
+            name: nameBytes ? new TextDecoder().decode(nameBytes) : null,
+        };
+    } catch {
+        return null;
+    }
+}
+
 // --- RNS.Resource (chunked large-transfer protocol over a Link) ---
 // Transfers larger than one segment's worth (RESOURCE_SEGMENT_MAX_SIZE) are
 // split into multiple segments — each with its own independent advertise/
@@ -594,28 +772,25 @@ export function lxmf_parse(decrypted, destination_hash, sender_pub) {
 // as real RNS.Resource's segmenting, just at a much smaller per-segment size
 // (see RESOURCE_MAX_PARTS's comment for why). Sending a large payload this
 // way to a real RNS peer works (it just processes whatever segment size we
-// advertise); *receiving* one from a real peer only works up to one segment
-// still, since a real sender only segments past 1MiB-1 and a segment that
-// large needs RNS's HMU packets (splitting a hashmap across more than one
-// packet) to receive, which isn't implemented. No *outgoing* compression
-// either (real RNS bz2-compresses by default when it shrinks the payload;
-// this project's sender never does, since it has no need to — see
-// shared/rns/compression.js for why decoding a real peer's compressed
-// transfer is still supported).
-// The receiver requests parts in a fixed-size window (see
-// index.js's Link._requestNextResourceParts()) rather than RNS.Resource's
-// adaptive window (which grows from a small starting size up toward a much
-// larger one on a fast, well-behaved link, tuned for lossy shared-bandwidth
-// radio links) — a real RNS sender doesn't care how a receiver paces its
-// requests (it just resends whatever's asked for from its own already-built
-// part list, unconditionally), so this fixed window is enough for genuine
-// interop with a real RNS peer in either direction, just without RNS's
-// throughput ramp-up on fast links. Also not implemented: retrying a request
-// after a timeout with no response, since this project's transports (WebRTC
-// data channels, TCP) are already reliable and ordered, unlike the lossy
-// radio links that timeout/retry logic is for. The wire primitives —
-// advertisement, request, part, and proof packets, and the hashing scheme
-// that ties them together — match RNS.Resource/ResourceAdvertisement's
+// advertise); receiving one from a real peer whose own advertisement
+// truncates its hashmap (past ~74 entries at default MTU) is supported via
+// the HMU (hashmap update) receive path — see CONTEXT_RESOURCE_HMU/
+// build_resource_hmu/parse_resource_hmu below and index.js's
+// Link._onHashmapUpdate(). This project's own sender never truncates its own
+// advertisements the same way, so it never needs to *send* an HMU packet —
+// only receive one.
+// Outgoing data is bz2-compressed whenever that's smaller (matching real
+// RNS's own compress-if-beneficial policy exactly), via a WebAssembly build
+// of the real reference libbzip2 — see shared/rns/compression.js.
+// The receiver requests parts in a rate-adaptive window (see index.js's
+// Link._growResourceWindow()/_requestNextResourceParts()), matching
+// RNS.Resource's own window/window_max growth and fast/very-slow-rate
+// promotion logic — not implemented: retry-driven window *shrinking*, since
+// there's no per-part retry/timeout mechanism (this project's transports,
+// WebRTC data channels and TCP, are already reliable and ordered, unlike the
+// lossy radio links that retry/timeout logic is for). The wire primitives —
+// advertisement, request, part, proof, and HMU packets, and the hashing
+// scheme that ties them together — match RNS.Resource/ResourceAdvertisement's
 // format and context bytes exactly. See README's Compliance section.
 // Bytes available per Link packet in general (Channel, Request/Response) —
 // matches RNS.Link's own `self.mdu` instance attribute exactly (with RNS's
@@ -634,6 +809,11 @@ export function lxmf_parse(decrypted, destination_hash, sender_pub) {
 export const LINK_MDU = Math.floor((500 - 1 - 19 - 48) / 16) * 16 - 1;
 export const RESOURCE_MAPHASH_LEN = 4;
 export const RESOURCE_RANDOM_HASH_LEN = 4;
+// Matches RNS.ResourceAdvertisement.HASHMAP_MAX_LEN: how many map hashes fit
+// in one advertisement packet, bounded by the link MDU. A transfer with more
+// parts than this needs HMU (hashmap update) packets to deliver the rest of
+// the hashmap incrementally — see Link._onResourceAdvertisement/_onHashmapUpdate.
+export const RESOURCE_HASHMAP_MAX_LEN = Math.floor((LINK_MDU - 134) / RESOURCE_MAPHASH_LEN);
 // Bytes per Resource part packet. Matches RNS.Resource.sdu exactly (with
 // RNS's default Reticulum.MTU=500 and no IFAC): `self.link.mtu -
 // HEADER_MAXSIZE - IFAC_MIN_SIZE` — notably *not* AES-block-rounded, unlike
@@ -644,23 +824,40 @@ export const RESOURCE_RANDOM_HASH_LEN = 4;
 // SDU makes the two sides disagree on how many parts there are, and RNS
 // silently drops the whole transfer as corrupt.
 export const RESOURCE_SDU = 500 - 35 - 1;
-// Caps a single *segment* to what fits in one advertisement's hashmap (a
-// real RNS receiver expects the whole hashmap in the initial advertisement
-// packet; RNS.Resource's own HMU context, for hashmaps too big to fit in one
-// packet, isn't implemented here). Real RNS instead segments once transfer
-// size exceeds MAX_EFFICIENT_SIZE (1MiB-1) — this project segments much
-// smaller and more often, at this per-segment part-count limit, so it never
-// needs an HMU packet for any segment it sends. See resource_prepare()'s
-// segmenting comment below for what this means for interop in each
-// direction.
+// Caps a single *segment* on the send side: this project's own sender always
+// includes the whole hashmap in the initial advertisement packet rather than
+// truncating it to RESOURCE_HASHMAP_MAX_LEN and sending the rest via HMU
+// packets on request (both a real receiver and this project's own receiver
+// tolerate an advertisement's hashmap being larger than what real RNS itself
+// would ever send in one packet — the size limit is a real-RNS sender-side
+// packing choice, not a receiver-side validation rule). Real RNS instead
+// segments once transfer size exceeds MAX_EFFICIENT_SIZE (1MiB-1) — this
+// project segments much smaller and more often, at this per-segment
+// part-count limit. Receiving a segment larger than this from a *real* RNS
+// sender (which does truncate its hashmap and expects HMU requests) is
+// supported — see Link._onResourceAdvertisement/_onHashmapUpdate.
 export const RESOURCE_MAX_PARTS = 128;
 // The largest raw (pre-encryption) plaintext chunk that's guaranteed to fit
 // within RESOURCE_MAX_PARTS parts after the random-hash prefix, PKCS7
 // padding, and the link Token's IV+HMAC overhead — see resource_prepare().
 export const RESOURCE_SEGMENT_MAX_SIZE = RESOURCE_MAX_PARTS * RESOURCE_SDU - 128;
-// Matches RNS.Resource.WINDOW, the window size RNS.Resource itself starts
-// at before adapting — used here as a fixed size, with no ramp-up.
+// Matches RNS.Resource's rate-adaptive request window (RNS/Resource.py):
+// starts small and grows by 1 each round the previous window was fully
+// satisfied, up to window_max — which itself starts modest and is promoted
+// to RESOURCE_WINDOW_MAX_FAST once the measured transfer rate has been
+// "fast" for RESOURCE_FAST_RATE_THRESHOLD consecutive rounds (or demoted to
+// RESOURCE_WINDOW_MAX_VERY_SLOW if it's been "very slow" instead). See
+// Link._requestNextResourceParts()/_onResourcePart() in index.js.
 export const RESOURCE_WINDOW = 4;
+export const RESOURCE_WINDOW_MIN = 2;
+export const RESOURCE_WINDOW_MAX_SLOW = 10;
+export const RESOURCE_WINDOW_MAX_VERY_SLOW = 4;
+export const RESOURCE_WINDOW_MAX_FAST = 75;
+export const RESOURCE_WINDOW_FLEXIBILITY = 4;
+export const RESOURCE_RATE_FAST = (50 * 1000) / 8; // bytes/sec (50kbit/s)
+export const RESOURCE_RATE_VERY_SLOW = (2 * 1000) / 8; // bytes/sec (2kbit/s)
+export const RESOURCE_FAST_RATE_THRESHOLD = RESOURCE_WINDOW_MAX_SLOW - RESOURCE_WINDOW - 2;
+export const RESOURCE_VERY_SLOW_RATE_THRESHOLD = 2;
 
 export function resource_map_hash(part_data, random_hash) {
     return crypto.sha256(crypto.concat(part_data, random_hash)).slice(0, RESOURCE_MAPHASH_LEN);
@@ -673,13 +870,21 @@ export function resource_map_hash(part_data, random_hash) {
 // segment alone would need more than RESOURCE_MAX_PARTS parts — callers
 // transferring more than RESOURCE_SEGMENT_MAX_SIZE bytes are expected to
 // call this once per segment (see index.js's Link.sendResource()).
-export function resource_prepare(plaintext, link_encrypt_fn) {
+//
+// `compressed`/`sendData` let a caller pass in an already bz2-compressed
+// version of `plaintext` to actually encrypt and send (see
+// compression.js's bz2_compress_if_beneficial(), which decides whether
+// compressing was worthwhile) — matching real RNS.Resource, the resource's
+// hash/proof/dataSize are always computed over the original, uncompressed
+// `plaintext` regardless, since compression is purely a transport-level
+// optimization transparent to the resource's own identity.
+export function resource_prepare(plaintext, link_encrypt_fn, { compressed = false, sendData = plaintext } = {}) {
     const embeddedSalt = crypto.randomBytes(RESOURCE_RANDOM_HASH_LEN);
-    const cipherBlob = link_encrypt_fn(crypto.concat(embeddedSalt, plaintext));
+    const cipherBlob = link_encrypt_fn(crypto.concat(embeddedSalt, sendData));
 
     const totalParts = Math.max(1, Math.ceil(cipherBlob.length / RESOURCE_SDU));
     if (totalParts > RESOURCE_MAX_PARTS) {
-        throw new Error(`Resource of ${plaintext.length} bytes needs ${totalParts} parts, exceeding the ${RESOURCE_MAX_PARTS}-part single-segment limit (see README's Compliance section)`);
+        throw new Error(`Resource of ${sendData.length} bytes needs ${totalParts} parts, exceeding the ${RESOURCE_MAX_PARTS}-part single-segment limit (see README's Compliance section)`);
     }
 
     const randomHash = crypto.randomBytes(RESOURCE_RANDOM_HASH_LEN);
@@ -695,33 +900,41 @@ export function resource_prepare(plaintext, link_encrypt_fn) {
     }
 
     return {
-        randomHash, resourceHash, expectedProof, parts, hashmapEntries,
+        randomHash, resourceHash, expectedProof, parts, hashmapEntries, compressed,
         hashmap: crypto.concat(...hashmapEntries),
         totalParts, transferSize: cipherBlob.length, dataSize: plaintext.length,
     };
 }
 
 // Matches ResourceAdvertisement's msgpack field layout ({t,d,n,h,r,o,i,l,q,f,m}).
-// f (flags) sets the "encrypted" bit (always, this project always encrypts)
-// and the "split" bit when totalSegments > 1, matching
-// `0x00 | has_metadata<<5 | is_response<<4 | is_request<<3 | split<<2 |
-// compressed<<1 | encrypted` — has_metadata/is_response/is_request/
-// compressed aren't implemented on send, so those bits are always 0. i
-// (segment_index) and l (total_segments) are 1-based in real RNS — a
-// receiver only treats a resource as fully concluded once segment_index ==
-// total_segments, so a single (first-and-only) segment must be numbered 1,
-// not 0. originalHash defaults to resourceHash (matching a first/only
-// segment); a later segment passes the *first* segment's resourceHash here
-// instead, linking it back to the same overall transfer.
+// f (flags) sets the "encrypted" bit (always, this project always encrypts),
+// the "split" bit when totalSegments > 1, the "compressed" bit when the
+// sender bz2-compressed this segment's data, and the "is_request"/
+// "is_response" bits when this Resource carries an oversized Link.request()/
+// response payload (see Link.request()/_handleRequest() in index.js) —
+// matching `0x00 | has_metadata<<5 | is_response<<4 | is_request<<3 |
+// split<<2 | compressed<<1 | encrypted`. has_metadata isn't implemented on
+// send, so that bit is always 0. i (segment_index) and l (total_segments)
+// are 1-based in real RNS — a receiver only treats a resource as fully
+// concluded once segment_index == total_segments, so a single (first-and-
+// only) segment must be numbered 1, not 0. originalHash defaults to
+// resourceHash (matching a first/only segment); a later segment passes the
+// *first* segment's resourceHash here instead, linking it back to the same
+// overall transfer.
 export function build_resource_advertisement({
     transferSize, dataSize, totalParts, resourceHash, randomHash, hashmap,
-    segmentIndex = 1, totalSegments = 1, originalHash = resourceHash,
+    segmentIndex = 1, totalSegments = 1, originalHash = resourceHash, compressed = false,
+    requestId = null, isRequest = false, isResponse = false,
 }) {
     const split = totalSegments > 1 ? 0x04 : 0x00;
+    const compressedFlag = compressed ? 0x02 : 0x00;
+    const requestFlag = isRequest ? 0x08 : 0x00;
+    const responseFlag = isResponse ? 0x10 : 0x00;
     const dict = {
         t: transferSize, d: dataSize, n: totalParts,
         h: resourceHash, r: randomHash, o: originalHash,
-        i: segmentIndex, l: totalSegments, q: null, f: 0x01 | split, m: hashmap,
+        i: segmentIndex, l: totalSegments, q: requestId,
+        f: 0x01 | split | compressedFlag | requestFlag | responseFlag, m: hashmap,
     };
     return lxmfMsgpack.pack(dict);
 }
@@ -736,28 +949,60 @@ export function parse_resource_advertisement(data) {
         encrypted: (flags & 0x01) === 0x01,
         compressed: ((flags >> 1) & 0x01) === 0x01,
         split: ((flags >> 2) & 0x01) === 0x01,
+        isRequest: ((flags >> 3) & 0x01) === 0x01,
+        isResponse: ((flags >> 4) & 0x01) === 0x01,
         hasMetadata: ((flags >> 5) & 0x01) === 0x01,
         hashmap: dict.m,
     };
 }
 
+// Matches RNS.Identity.truncated_hash(packed_request): the request ID for a
+// request (or its response) sent as a Resource rather than a single packet
+// — a plain hash of the packed [timestamp, path_hash, data] payload itself
+// (not of the outer packet, unlike the single-packet form's
+// packet_truncated_hash() — a real Resource has no single "packet" to hash).
+export function resource_request_id(packed_request) {
+    return crypto.sha256(packed_request).slice(0, 16);
+}
+
 // Matches Resource.request_next()'s request_data layout: a hashmap-exhausted
-// flag byte (always "not exhausted" here, since this implementation always
-// requests every part in one shot — see the module comment above) + the
-// resource hash + the requested map hashes concatenated.
-export function build_resource_request(resource_hash, requested_hashes) {
-    return crypto.concat(new Uint8Array([0x00]), resource_hash, requested_hashes);
+// flag byte (0xff + the last known map hash, when this receiver has used up
+// every hashmap entry it's been sent and needs more via HMU; 0x00 otherwise)
+// + the resource hash + the requested map hashes concatenated.
+export function build_resource_request(resource_hash, requested_hashes, { lastMapHash = null } = {}) {
+    const prefix = lastMapHash ? crypto.concat(new Uint8Array([0xff]), lastMapHash) : new Uint8Array([0x00]);
+    return crypto.concat(prefix, resource_hash, requested_hashes);
 }
 
 export function parse_resource_request(data) {
-    const hashmapExhausted = data[0];
-    const resourceHash = data.slice(1, 33);
-    const requestedHashesRaw = data.slice(33);
+    const hashmapExhausted = data[0] === 0xff;
+    let offset = 1;
+    let lastMapHash = null;
+    if (hashmapExhausted) {
+        lastMapHash = data.slice(1, 1 + RESOURCE_MAPHASH_LEN);
+        offset = 1 + RESOURCE_MAPHASH_LEN;
+    }
+    const resourceHash = data.slice(offset, offset + 32);
+    const requestedHashesRaw = data.slice(offset + 32);
     const requestedHashes = [];
     for (let i = 0; i < requestedHashesRaw.length; i += RESOURCE_MAPHASH_LEN) {
         requestedHashes.push(requestedHashesRaw.slice(i, i + RESOURCE_MAPHASH_LEN));
     }
-    return { hashmapExhausted, resourceHash, requestedHashes };
+    return { hashmapExhausted, lastMapHash, resourceHash, requestedHashes };
+}
+
+// Matches RNS.Resource's hashmap-update (HMU) packet: resource_hash (32
+// bytes) + msgpack([segment_index, hashmap_chunk_bytes]) — sent by a sender
+// in response to a request whose hashmap-exhausted flag is set, carrying the
+// next chunk of a hashmap too large to fit in the initial advertisement.
+export function build_resource_hmu(resource_hash, segment, hashmap_chunk) {
+    return crypto.concat(resource_hash, lxmfMsgpack.pack([segment, hashmap_chunk]));
+}
+
+export function parse_resource_hmu(data) {
+    const resourceHash = data.slice(0, 32);
+    const [segment, hashmap] = lxmfMsgpack.unpack(data.slice(32));
+    return { resourceHash, segment, hashmap };
 }
 
 // Resource part packets carry a raw ciphertext slice, unencrypted at the

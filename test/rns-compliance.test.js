@@ -224,6 +224,98 @@ test('Link establishes, exchanges data both ways, and tears down between two ind
   assert.equal(rnsB.links.size, 0);
 });
 
+test('Link keepalive/stale timing scales with RTT matching RNS.Link\'s KEEPALIVE_MAX/MIN/MAX_RTT/STALE_FACTOR formula', async () => {
+  const rnsA = new Reticulum();
+  const rnsB = new Reticulum();
+  class Bridge extends Interface {
+    connect() {}
+    sendData(data) { setTimeout(() => this.other.rns.onPacketReceived(data, this.other), 0); }
+  }
+  const ifaceA = new Bridge('A');
+  const ifaceB = new Bridge('B');
+  ifaceA.other = ifaceB;
+  ifaceB.other = ifaceA;
+  rnsA.addInterface(ifaceA);
+  rnsB.addInterface(ifaceB);
+
+  const responderIdentity = Identity.create();
+  const responderDest = new Destination(rnsB, responderIdentity, Destination.IN, Destination.SINGLE, 'test', 'keepalive');
+  const outDest = new Destination(rnsA, responderIdentity, Destination.OUT, Destination.SINGLE, 'test', 'keepalive');
+  outDest.hash = responderDest.hash;
+
+  const link = new Link(rnsA, outDest);
+  await new Promise((resolve) => link.once('established', resolve));
+
+  // Below KEEPALIVE_MIN_RTT-equivalent: clamps to KEEPALIVE_MIN (5s).
+  link.rtt = 0.001;
+  link._updateKeepalive();
+  assert.equal(link.keepaliveMs, Link.KEEPALIVE_MIN * 1000);
+  assert.equal(link.staleTimeMs, Link.KEEPALIVE_MIN * Link.STALE_FACTOR * 1000);
+
+  // At KEEPALIVE_MAX_RTT exactly: keepalive saturates to KEEPALIVE_MAX (360s).
+  link.rtt = Link.KEEPALIVE_MAX_RTT;
+  link._updateKeepalive();
+  assert.equal(link.keepaliveMs, Link.KEEPALIVE_MAX * 1000);
+
+  // Somewhere in between: keepalive = rtt * (KEEPALIVE_MAX/KEEPALIVE_MAX_RTT), clamped.
+  link.rtt = 1.0;
+  link._updateKeepalive();
+  const expectedS = Math.max(Math.min(1.0 * (Link.KEEPALIVE_MAX / Link.KEEPALIVE_MAX_RTT), Link.KEEPALIVE_MAX), Link.KEEPALIVE_MIN);
+  assert.equal(link.keepaliveMs, expectedS * 1000);
+  assert.equal(link.staleTimeMs, link.keepaliveMs * Link.STALE_FACTOR);
+
+  link.close();
+});
+
+test('a Link transitions ACTIVE -> STALE after the stale timeout, recovers to ACTIVE on inbound traffic, and tears down with reason TIMEOUT if nothing arrives during the STALE grace period', async () => {
+  const rnsA = new Reticulum();
+  const rnsB = new Reticulum();
+  class Bridge extends Interface {
+    connect() {}
+    sendData(data) { setTimeout(() => this.other.rns.onPacketReceived(data, this.other), 0); }
+  }
+  const ifaceA = new Bridge('A');
+  const ifaceB = new Bridge('B');
+  ifaceA.other = ifaceB;
+  ifaceB.other = ifaceA;
+  rnsA.addInterface(ifaceA);
+  rnsB.addInterface(ifaceB);
+
+  const responderIdentity = Identity.create();
+  const responderDest = new Destination(rnsB, responderIdentity, Destination.IN, Destination.SINGLE, 'test', 'stale');
+  const outDest = new Destination(rnsA, responderIdentity, Destination.OUT, Destination.SINGLE, 'test', 'stale');
+  outDest.hash = responderDest.hash;
+
+  const link = new Link(rnsA, outDest);
+  await new Promise((resolve) => link.once('established', resolve));
+  assert.equal(link.status, Link.ACTIVE);
+
+  // Simulate time passing well beyond stale_time without needing to
+  // actually wait for it in real time: back-date lastInbound/activatedAt,
+  // then drive the same tick function the real watchdog timer calls.
+  link.lastInbound -= link.staleTimeMs + 1000;
+  link.activatedAt -= link.staleTimeMs + 1000;
+  link._watchdogTick();
+  assert.equal(link.status, Link.STALE, 'link goes STALE once idle past stale_time');
+
+  // Any inbound traffic recovers a STALE link back to ACTIVE.
+  link._noteInbound();
+  assert.equal(link.status, Link.ACTIVE, 'inbound traffic recovers a STALE link to ACTIVE');
+
+  // Now let it go STALE again and simulate the grace period elapsing with
+  // nothing arriving — should tear down with reason TIMEOUT.
+  link.lastInbound -= link.staleTimeMs + 1000;
+  link.activatedAt -= link.staleTimeMs + 1000;
+  link._watchdogTick();
+  assert.equal(link.status, Link.STALE);
+  const closed = new Promise((resolve) => link.once('closed', resolve));
+  link._watchdogTick(); // STALE tick tears down immediately (grace period already modeled by the scheduled delay, not by this call)
+  await closed;
+  assert.equal(link.status, Link.CLOSED);
+  assert.equal(link.teardownReason, Link.TIMEOUT);
+  assert.equal(rnsA.links.size, 0);
+});
+
 test('Link.identify() reveals the initiator\'s real identity to the responder, matching RNS.Link.identify()/get_remote_identity()', async () => {
   const rnsA = new Reticulum();
   const rnsB = new Reticulum();
@@ -346,6 +438,73 @@ test('Link.request()/registerRequestHandler() round-trip a request and response 
   initiatorLink.close();
 });
 
+test('build_resource_advertisement()/parse_resource_advertisement() round-trip the is_request/is_response flags and request_id ("q") field, matching RNS.ResourceAdvertisement\'s layout', () => {
+  const resourceHash = crypto.randomBytes(32);
+  const randomHash = crypto.randomBytes(4);
+  const requestId = crypto.randomBytes(16);
+
+  const reqAdv = protocol.build_resource_advertisement({
+    transferSize: 100, dataSize: 90, totalParts: 1, resourceHash, randomHash, hashmap: crypto.randomBytes(4),
+    requestId, isRequest: true,
+  });
+  const parsedReq = protocol.parse_resource_advertisement(reqAdv);
+  assert.equal(parsedReq.isRequest, true);
+  assert.equal(parsedReq.isResponse, false);
+  assert.equal(crypto.bytesToHex(parsedReq.requestId), crypto.bytesToHex(requestId));
+
+  const respAdv = protocol.build_resource_advertisement({
+    transferSize: 100, dataSize: 90, totalParts: 1, resourceHash, randomHash, hashmap: crypto.randomBytes(4),
+    requestId, isResponse: true,
+  });
+  const parsedResp = protocol.parse_resource_advertisement(respAdv);
+  assert.equal(parsedResp.isRequest, false);
+  assert.equal(parsedResp.isResponse, true);
+  assert.equal(crypto.bytesToHex(parsedResp.requestId), crypto.bytesToHex(requestId));
+
+  const plainAdv = protocol.build_resource_advertisement({
+    transferSize: 100, dataSize: 90, totalParts: 1, resourceHash, randomHash, hashmap: crypto.randomBytes(4),
+  });
+  const parsedPlain = protocol.parse_resource_advertisement(plainAdv);
+  assert.equal(parsedPlain.isRequest, false);
+  assert.equal(parsedPlain.isResponse, false);
+  assert.equal(parsedPlain.requestId, null);
+});
+
+test('Link.request() falls back to a Resource transfer for a request and/or response too large for a single packet, matching RNS.Link.request()\'s own fallback', async () => {
+  const rnsA = new Reticulum();
+  const rnsB = new Reticulum();
+  class Bridge extends Interface {
+    connect() {}
+    sendData(data) { setTimeout(() => this.other.rns.onPacketReceived(data, this.other), 0); }
+  }
+  const ifaceA = new Bridge('A');
+  const ifaceB = new Bridge('B');
+  ifaceA.other = ifaceB;
+  ifaceB.other = ifaceA;
+  rnsA.addInterface(ifaceA);
+  rnsB.addInterface(ifaceB);
+
+  const responderIdentity = Identity.create();
+  const responderDest = new Destination(rnsB, responderIdentity, Destination.IN, Destination.SINGLE, 'test', 'bigreqresp');
+  // A large reply (bigger than LINK_MDU), forcing the response side of the
+  // fallback regardless of the request's own size.
+  const bigReply = 'y'.repeat(protocol.LINK_MDU * 2);
+  responderDest.registerRequestHandler('echo-big', (data) => ({ echoedLength: data.name.length, reply: bigReply }));
+
+  const outDest = new Destination(rnsA, responderIdentity, Destination.OUT, Destination.SINGLE, 'test', 'bigreqresp');
+  outDest.hash = responderDest.hash;
+  const initiatorLink = new Link(rnsA, outDest);
+  await new Promise((resolve) => initiatorLink.once('established', resolve));
+
+  // A large request payload too, forcing the request side of the fallback.
+  const bigName = 'x'.repeat(protocol.LINK_MDU * 2);
+  const response = await initiatorLink.request('echo-big', { name: bigName }, { timeout: 5000 });
+  assert.equal(response.echoedLength, bigName.length);
+  assert.equal(response.reply, bigReply);
+
+  initiatorLink.close();
+});
+
 test('Link.sendResource() transfers a multi-part payload and resolves once the receiver proves it, with content and hash verified on both ends', async () => {
   const rnsA = new Reticulum();
   const rnsB = new Reticulum();
@@ -433,12 +592,176 @@ test('Link.sendResource() splits a payload bigger than one segment into multiple
   initiatorLink.close();
 });
 
+test('Link.sendResource()\'s receive window grows round over round, matching RNS.Resource\'s rate-adaptive window instead of a fixed size', async () => {
+  const rnsA = new Reticulum();
+  const rnsB = new Reticulum();
+
+  class Bridge extends Interface {
+    connect() {}
+    sendData(data) { setTimeout(() => this.other.rns.onPacketReceived(data, this.other), 0); }
+  }
+  const ifaceA = new Bridge('A');
+  const ifaceB = new Bridge('B');
+  ifaceA.other = ifaceB;
+  ifaceB.other = ifaceA;
+  rnsA.addInterface(ifaceA);
+  rnsB.addInterface(ifaceB);
+
+  const identityB = Identity.create();
+  const destB = new Destination(rnsB, identityB, Destination.IN, Destination.SINGLE, 'test', 'window');
+
+  const responderLinkPromise = new Promise((resolve) => destB.on('link', resolve));
+  const outDest = new Destination(rnsA, identityB, Destination.OUT, Destination.SINGLE, 'test', 'window');
+  outDest.hash = destB.hash;
+  const initiatorLink = new Link(rnsA, outDest);
+
+  await new Promise((resolve) => initiatorLink.once('established', resolve));
+  const responderLink = await responderLinkPromise;
+  await new Promise((resolve) => (responderLink.status === Link.ACTIVE ? resolve() : responderLink.once('established', resolve)));
+
+  // Enough parts (well over the initial window of 4) to observe several
+  // rounds of growth toward window_max.
+  const payload = crypto.randomBytes(protocol.RESOURCE_SDU * 30);
+
+  const observedWindows = [];
+  const originalGrow = responderLink._growResourceWindow.bind(responderLink);
+  responderLink._growResourceWindow = (incoming) => {
+    originalGrow(incoming);
+    observedWindows.push(incoming.window);
+  };
+
+  const responderGot = new Promise((resolve) => responderLink.once('resource', resolve));
+  const sendPromise = initiatorLink.sendResource(payload);
+  const received = await responderGot;
+  assert.equal(crypto.bytesToHex(received), crypto.bytesToHex(payload));
+  await sendPromise;
+
+  assert.ok(observedWindows.length > 1, 'transfer took multiple request rounds');
+  assert.ok(Math.max(...observedWindows) > protocol.RESOURCE_WINDOW, `window grew beyond the initial ${protocol.RESOURCE_WINDOW} (observed: ${observedWindows})`);
+  // Monotonically non-decreasing — this test's fast/local rate never
+  // demotes window_max, so window should never shrink.
+  for (let i = 1; i < observedWindows.length; i++) {
+    assert.ok(observedWindows[i] >= observedWindows[i - 1], `window shrank unexpectedly: ${observedWindows}`);
+  }
+
+  initiatorLink.close();
+});
+
 test('resource_prepare() throws if a single segment alone would still need more than RESOURCE_MAX_PARTS parts', () => {
   // Link.sendResource() always chops at RESOURCE_SEGMENT_MAX_SIZE, which is
   // sized so no chunk it produces can ever hit this — so this guard is only
   // reachable by calling resource_prepare() directly with an oversized chunk.
   const tooBig = new Uint8Array(protocol.RESOURCE_MAX_PARTS * protocol.RESOURCE_SDU + 1000);
   assert.throws(() => protocol.resource_prepare(tooBig, (pt) => pt));
+});
+
+test('build_resource_request()/parse_resource_request() round-trip both the plain and hashmap-exhausted forms, matching RNS.Resource.request_next()\'s layout', () => {
+  const resourceHash = crypto.randomBytes(32);
+  const requestedHashes = crypto.concat(crypto.randomBytes(4), crypto.randomBytes(4));
+
+  const plain = protocol.build_resource_request(resourceHash, requestedHashes);
+  assert.equal(plain[0], 0x00);
+  const parsedPlain = protocol.parse_resource_request(plain);
+  assert.equal(parsedPlain.hashmapExhausted, false);
+  assert.equal(parsedPlain.lastMapHash, null);
+  assert.equal(crypto.bytesToHex(parsedPlain.resourceHash), crypto.bytesToHex(resourceHash));
+  assert.equal(parsedPlain.requestedHashes.length, 2);
+
+  const lastMapHash = crypto.randomBytes(4);
+  const exhausted = protocol.build_resource_request(resourceHash, requestedHashes, { lastMapHash });
+  assert.equal(exhausted[0], 0xff);
+  const parsedExhausted = protocol.parse_resource_request(exhausted);
+  assert.equal(parsedExhausted.hashmapExhausted, true);
+  assert.equal(crypto.bytesToHex(parsedExhausted.lastMapHash), crypto.bytesToHex(lastMapHash));
+  assert.equal(crypto.bytesToHex(parsedExhausted.resourceHash), crypto.bytesToHex(resourceHash));
+  assert.equal(parsedExhausted.requestedHashes.length, 2);
+});
+
+test('build_resource_hmu()/parse_resource_hmu() round-trip, matching RNS.Resource\'s hashmap-update packet layout', () => {
+  const resourceHash = crypto.randomBytes(32);
+  const hashmapChunk = crypto.concat(crypto.randomBytes(4), crypto.randomBytes(4), crypto.randomBytes(4));
+
+  const packed = protocol.build_resource_hmu(resourceHash, 1, hashmapChunk);
+  const parsed = protocol.parse_resource_hmu(packed);
+  assert.equal(crypto.bytesToHex(parsed.resourceHash), crypto.bytesToHex(resourceHash));
+  assert.equal(parsed.segment, 1);
+  assert.equal(crypto.bytesToHex(parsed.hashmap), crypto.bytesToHex(hashmapChunk));
+});
+
+test('a Resource transfer whose advertisement carries a truncated hashmap (fewer entries than totalParts) is completed via an HMU packet, matching how a real RNS sender with a large single segment behaves', async () => {
+  const rnsA = new Reticulum();
+  const rnsB = new Reticulum();
+  class Bridge extends Interface {
+    connect() {}
+    sendData(data) { setTimeout(() => this.other.rns.onPacketReceived(data, this.other), 0); }
+  }
+  const ifaceA = new Bridge('A');
+  const ifaceB = new Bridge('B');
+  ifaceA.other = ifaceB;
+  ifaceB.other = ifaceA;
+  rnsA.addInterface(ifaceA);
+  rnsB.addInterface(ifaceB);
+
+  const identityB = Identity.create();
+  const destB = new Destination(rnsB, identityB, Destination.IN, Destination.SINGLE, 'test', 'hmu');
+  const responderLinkPromise = new Promise((resolve) => destB.on('link', resolve));
+  const outDest = new Destination(rnsA, identityB, Destination.OUT, Destination.SINGLE, 'test', 'hmu');
+  outDest.hash = destB.hash;
+  const initiatorLink = new Link(rnsA, outDest);
+  await new Promise((resolve) => initiatorLink.once('established', resolve));
+  const responderLink = await responderLinkPromise;
+  await new Promise((resolve) => (responderLink.status === Link.ACTIVE ? resolve() : responderLink.once('established', resolve)));
+
+  // Build a resource "by hand" with a hashmap deliberately truncated to
+  // fewer entries than totalParts, simulating a real RNS sender whose
+  // segment needs more parts than fit in one advertisement — then confirm
+  // this stack's own receiver correctly requests and applies an HMU packet
+  // to complete it, exactly like it would with a real Python sender.
+  const payload = crypto.randomBytes(protocol.RESOURCE_SDU * 6);
+  const prepared = protocol.resource_prepare(payload, (pt) => protocol.link_encrypt(initiatorLink.derivedKey, pt));
+  const truncateTo = 3;
+  assert.ok(prepared.totalParts > truncateTo, 'test payload must need more parts than the simulated truncation point');
+
+  const advPayload = protocol.build_resource_advertisement({
+    transferSize: prepared.transferSize, dataSize: prepared.dataSize, totalParts: prepared.totalParts,
+    resourceHash: prepared.resourceHash, randomHash: prepared.randomHash,
+    hashmap: prepared.hashmap.slice(0, truncateTo * protocol.RESOURCE_MAPHASH_LEN),
+  });
+  const advPacket = protocol.build_link_packet(initiatorLink.linkId, initiatorLink.derivedKey, advPayload, protocol.CONTEXT_RESOURCE_ADV);
+
+  const responderGotResource = new Promise((resolve) => responderLink.once('resource', resolve));
+
+  // Manually stand in for the sender: serve part requests, and — since our
+  // hand-built advertisement only advertised `truncateTo` entries — answer
+  // the hashmap-exhausted request with the rest of the real hashmap via HMU.
+  // REQUEST packets flow responder (B) -> initiator (A), so they're
+  // intercepted on ifaceB's outgoing side; replies are sent via rnsA.sendData
+  // (A's own broadcast path, same as the advertisement above), which the
+  // Bridge delivers to B, exactly like a real sender's traffic would.
+  const originalBridgeSendData = Bridge.prototype.sendData;
+  ifaceB.sendData = function (data) {
+    const unpacked = protocol.packet_unpack(data);
+    if (unpacked && unpacked.context === protocol.CONTEXT_RESOURCE_REQ) {
+      const plaintext = protocol.link_decrypt(initiatorLink.derivedKey, unpacked.data);
+      const req = protocol.parse_resource_request(plaintext);
+      for (const wantedHash of req.requestedHashes) {
+        const idx = prepared.hashmapEntries.findIndex((h) => crypto.bytesToHex(h) === crypto.bytesToHex(wantedHash));
+        if (idx !== -1) rnsA.sendData(protocol.build_resource_part_packet(initiatorLink.linkId, prepared.parts[idx]));
+      }
+      if (req.hashmapExhausted) {
+        const hmuPayload = protocol.build_resource_hmu(prepared.resourceHash, 1, prepared.hashmap.slice(truncateTo * protocol.RESOURCE_MAPHASH_LEN));
+        rnsA.sendData(protocol.build_link_packet(initiatorLink.linkId, initiatorLink.derivedKey, hmuPayload, protocol.CONTEXT_RESOURCE_HMU));
+      }
+      return;
+    }
+    originalBridgeSendData.call(this, data);
+  };
+
+  rnsA.sendData(advPacket);
+  const received = await responderGotResource;
+  assert.equal(crypto.bytesToHex(received), crypto.bytesToHex(payload));
+
+  initiatorLink.close();
 });
 
 // --- RNS.Transport: path requests/responses ---
@@ -467,12 +790,80 @@ test('path request destination hash and packet match RNS byte-for-byte', () => {
   assert.equal(crypto.bytesToHex(parsed.requesting_transport_id), crypto.bytesToHex(transportId));
   assert.equal(crypto.bytesToHex(parsed.tag), crypto.bytesToHex(tag));
 
-  // build_path_request() uses the simpler 2-field form (no transport ID).
+  // build_path_request() defaults to the simpler 2-field form (no transport ID).
   const simplePacket = protocol.build_path_request(destHash, tag);
   const simpleParsed = protocol.parse_path_request(protocol.packet_unpack(simplePacket));
   assert.equal(crypto.bytesToHex(simpleParsed.destination_hash), crypto.bytesToHex(destHash));
   assert.equal(simpleParsed.requesting_transport_id, null);
   assert.equal(crypto.bytesToHex(simpleParsed.tag), crypto.bytesToHex(tag));
+
+  // build_path_request() also supports the 3-field (transport-enabled) form,
+  // matching the byte-exact packet built by hand above.
+  const transportPacket = protocol.build_path_request(destHash, tag, transportId);
+  assert.equal(crypto.bytesToHex(transportPacket), crypto.bytesToHex(packet));
+});
+
+test("Reticulum.requestPath() sends the 3-field form using its own transportIdentity, and throttles repeat requests within PATH_REQUEST_MI", () => {
+  const rns = new Reticulum();
+  const sent = [];
+  rns.addInterface(new (class extends Interface { connect() {} sendData(data) { sent.push(data); } })('noop'));
+
+  const destHash = new Uint8Array(16).fill(0x11);
+  rns.requestPath(destHash);
+  assert.equal(sent.length, 1, 'first requestPath() call sends a packet');
+
+  const parsed = protocol.parse_path_request(protocol.packet_unpack(sent[0]));
+  assert.equal(crypto.bytesToHex(parsed.destination_hash), crypto.bytesToHex(destHash));
+  assert.equal(
+    crypto.bytesToHex(parsed.requesting_transport_id),
+    crypto.bytesToHex(rns.transportIdentity.hash),
+    "requestPath()'s 3-field form carries this Reticulum instance's own transportIdentity hash"
+  );
+
+  // A second call for the same destination immediately afterward is
+  // suppressed, matching RNS.Transport's PATH_REQUEST_MI throttle.
+  rns.requestPath(destHash);
+  assert.equal(sent.length, 1, 'a repeat requestPath() call within PATH_REQUEST_MI is suppressed');
+
+  // Back-dating the recorded timestamp past the throttle window allows the
+  // next call through, without needing to actually wait 20s.
+  const destHex = crypto.bytesToHex(destHash);
+  rns.pathRequestTimestamps.set(destHex, Date.now() - protocol.PATH_REQUEST_MI_MS - 1);
+  rns.requestPath(destHash);
+  assert.equal(sent.length, 2, 'a requestPath() call after PATH_REQUEST_MI has elapsed is not suppressed');
+
+  // A different destination is never throttled by another one's timer.
+  rns.requestPath(new Uint8Array(16).fill(0x22));
+  assert.equal(sent.length, 3, 'requestPath() for a different destination is unaffected by another destination\'s throttle');
+});
+
+test('Reticulum._cleanupPathTable() drops path table entries older than DESTINATION_TIMEOUT, matching RNS.Transport.DESTINATION_TIMEOUT', () => {
+  const rns = new Reticulum();
+  const staleHex = crypto.bytesToHex(new Uint8Array(16).fill(0x33));
+  const freshHex = crypto.bytesToHex(new Uint8Array(16).fill(0x44));
+  rns.pathTable.set(staleHex, { hops: 1, timestamp: Date.now() - protocol.DESTINATION_TIMEOUT_MS - 1 });
+  rns.pathTable.set(freshHex, { hops: 1, timestamp: Date.now() });
+
+  rns._cleanupPathTable();
+
+  assert.equal(rns.pathTable.has(staleHex), false, 'an entry older than DESTINATION_TIMEOUT is dropped');
+  assert.equal(rns.pathTable.has(freshHex), true, 'a recently-refreshed entry is kept');
+});
+
+test('an announce records a timestamp in the announce rate table, capped at MAX_RATE_TIMESTAMPS entries, matching RNS.Transport', async () => {
+  const rns = new Reticulum();
+  rns.addInterface(new (class extends Interface { connect() {} sendData() {} })('noop'));
+  const identity = Identity.create();
+  const dest = new Destination(rns, identity, Destination.IN, Destination.SINGLE, 'test', 'rate');
+
+  for (let i = 0; i < protocol.MAX_RATE_TIMESTAMPS + 5; i++) {
+    const packet = protocol.build_announce(identity.private, identity.public, dest.hash, null, new Uint8Array(0), 'test.rate', new Uint8Array(0), protocol.CONTEXT_NONE);
+    rns.onPacketReceived(packet, rns.interfaces[0]);
+  }
+
+  const rateEntry = rns.announceRateTable.get(crypto.bytesToHex(dest.hash));
+  assert.ok(rateEntry);
+  assert.equal(rateEntry.length, protocol.MAX_RATE_TIMESTAMPS, "the rate table never keeps more than MAX_RATE_TIMESTAMPS entries per destination");
 });
 
 test('path-response announce uses context=PATH_RESPONSE and matches RNS byte-for-byte', () => {

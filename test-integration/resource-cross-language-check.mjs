@@ -107,12 +107,28 @@ await new Promise((resolve) => link.once('established', resolve));
 await pyGotLink;
 console.log('real RNS.Link established in both directions');
 
-// --- JS -> Python: a real RNS.Resource transfer, larger than one packet ---
+// --- JS -> Python: a real RNS.Resource transfer, larger than one packet.
+// Repetitive text like this compresses well, so this also exercises this
+// stack's outgoing bz2 compression (shared/rns/compression.js) — asserting
+// resource.compressed on the Python side confirms the real reference
+// implementation actually recognized and decompressed it, not just that the
+// content happens to match either way. ---
 const pyPayloadText = 'resource payload from JS: '.repeat(80);
 const pyGotResource = waitFor((m) => m.event === 'resource_received', 15000);
 await link.sendResource(new TextEncoder().encode(pyPayloadText));
 const pyResourceEvent = await pyGotResource;
 assertEqual(Buffer.from(pyResourceEvent.data_hex, 'hex').toString('utf-8'), pyPayloadText, 'Python (real RNS.Resource) correctly reassembled the JS-sent resource');
+assertTrue(pyResourceEvent.compressed === true, 'Python (real RNS.Resource) recognized the JS-sent resource as bz2-compressed');
+
+// --- JS -> Python: high-entropy random data, which bz2 can't usefully
+// compress — confirms the compress-if-beneficial decision correctly falls
+// back to sending uncompressed rather than always compressing regardless. ---
+const pyIncompressiblePayload = crypto.randomBytes(5000);
+const pyGotIncompressibleResource = waitFor((m) => m.event === 'resource_received' && m.data_hex.length === pyIncompressiblePayload.length * 2, 15000);
+await link.sendResource(pyIncompressiblePayload);
+const pyIncompressibleEvent = await pyGotIncompressibleResource;
+assertEqual(pyIncompressibleEvent.data_hex, crypto.bytesToHex(pyIncompressiblePayload), 'Python (real RNS.Resource) correctly reassembled a JS-sent, high-entropy resource');
+assertTrue(pyIncompressibleEvent.compressed === false, 'Python (real RNS.Resource) recognized the JS-sent high-entropy resource as NOT worth compressing');
 
 // --- JS -> Python: a real RNS.Resource transfer spanning multiple segments
 // (this project segments past protocol.RESOURCE_SEGMENT_MAX_SIZE, ~55KB —
@@ -144,6 +160,20 @@ const jsGotCompressedResource = new Promise((resolve) => link.once('resource', r
 py.stdin.write(JSON.stringify({ cmd: 'send_resource', hex: pyToJsCompressibleHex }) + '\n');
 const jsCompressedResourceData = await jsGotCompressedResource;
 assertEqual(Buffer.from(jsCompressedResourceData).toString('utf-8'), pyToJsCompressiblePayload, 'JS correctly decompressed and reassembled a bz2-compressed resource sent by real Python RNS.Resource');
+
+// --- Python -> JS: a single segment large enough (>74 parts, i.e. bigger
+// than RESOURCE_HASHMAP_MAX_LEN entries) that a real RNS.Resource sender
+// truncates its advertisement's hashmap and expects an HMU (hashmap update)
+// exchange to deliver the rest — exercises this stack's receive-side HMU
+// support (shared/rns/index.js's _onHashmapUpdate) against the real
+// reference implementation, not just against itself. High-entropy so it
+// stays uncompressed, keeping the part count purely a function of size. ---
+const pyToJsHmuPayload = crypto.randomBytes(40000);
+const pyToJsHmuHex = crypto.bytesToHex(pyToJsHmuPayload);
+const jsGotHmuResource = new Promise((resolve) => link.once('resource', resolve));
+py.stdin.write(JSON.stringify({ cmd: 'send_resource', hex: pyToJsHmuHex }) + '\n');
+const jsHmuResourceData = await jsGotHmuResource;
+assertEqual(crypto.bytesToHex(jsHmuResourceData), pyToJsHmuHex, 'JS correctly reassembled a large single-segment resource from real Python RNS.Resource, requiring an HMU exchange');
 
 link.close();
 py.kill();

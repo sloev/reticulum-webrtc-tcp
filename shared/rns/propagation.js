@@ -57,10 +57,10 @@ export function propagated_transient_id(envelope) {
 // each uploaded message must carry a trailing 32-byte stamp valid for at
 // least this many leading zero bits, computed over its own transient_id.
 // The default of 0 accepts any stamp (including an all-zero one), i.e. no
-// real anti-spam requirement — real LXMF propagation nodes announce their
-// required cost so senders know what to compute; that announce-parsing
-// isn't implemented here, so a sender must be told the required cost out of
-// band (see propagateLXMF's stampCost parameter).
+// real anti-spam requirement. Matches real LXMF: this cost is announced
+// (see announce()/get_propagation_node_app_data() below) so a sender can
+// read it automatically instead of needing it out of band — see
+// propagateLXMF()'s stampCost parameter, which defaults to exactly that.
 //
 // peeringCost sets the proof-of-work required of another propagation node
 // before it's allowed to sync messages to this one (see syncToPeer() below
@@ -83,8 +83,44 @@ export class PropagationNode {
         });
     }
 
-    announce() {
-        this.destination.announce();
+    // Matches LXMRouter.announce()/get_propagation_node_app_data(): the
+    // announce carries this node's real stamp/peering cost (and an optional
+    // display name) so a sender no longer needs to be told the required cost
+    // out of band — see propagateLXMF()/syncToPeer()'s stampCost/peeringCost
+    // auto-detection below.
+    announce({ name = null } = {}) {
+        const appData = protocol.lxmf_build_propagation_announce_app_data({
+            stampCost: this.stampCost, peeringCost: this.peeringCost, name,
+        });
+        this.destination.announce({ appData });
+    }
+
+    // Persists the message store to `storage` (see shared/rns/storage.js),
+    // one file per transient_id — mirroring LXMRouter's own storagepath
+    // layout in spirit (not byte format; this is an adaptation for
+    // surviving restarts, not a wire-format compliance concern). Each
+    // message's original admission stamp is included, since it needs to be
+    // re-attached on a later peer sync exactly like a fresh upload's (see
+    // syncToPeer()).
+    async saveState(storage) {
+        for (const [hex, message] of this.messages) {
+            await storage.save(`propagation/${hex}`, message);
+        }
+        // Removes on-disk files for messages purged since the last save
+        // (e.g. downloaded and removed via _onGetRequest()'s "erase" pass)
+        // so the store doesn't accumulate stale files forever.
+        for (const hex of await storage.listKeys('propagation')) {
+            if (!this.messages.has(hex)) await storage.delete(`propagation/${hex}`);
+        }
+    }
+
+    // Loads previously-saved messages back into the store — call right
+    // after construction.
+    async loadState(storage) {
+        for (const hex of await storage.listKeys('propagation')) {
+            const message = await storage.load(`propagation/${hex}`);
+            if (message) this.messages.set(hex, message);
+        }
     }
 
     _onUpload(resourceData) {
@@ -210,12 +246,19 @@ export class PropagationNode {
 // Sends an LXMF message via store-and-forward instead of directly: builds
 // the same LXMF envelope Destination.sendLXMF() would (signed by `source`,
 // your own IN destination), encrypts it to `destination`'s identity,
-// computes an admission stamp (see stamp.js — target `stampCost` must match
-// what the destination propagation node requires, since this implementation
-// doesn't parse a node's announced cost automatically), and uploads it over
-// an already-established Link. Returns the Link.sendResource() promise
+// computes an admission stamp (see stamp.js), and uploads it over an
+// already-established Link. Returns the Link.sendResource() promise
 // (resolves once the node acknowledges receipt of the transfer).
-export function propagateLXMF(propagationLink, destination, source, title, content, fields = {}, stampCost = 0) {
+//
+// `stampCost` defaults to null, meaning: read the target cost from the
+// propagation node's own most recently cached announce (`propagationLink.
+// destination`'s app_data, parsed via protocol.lxmf_parse_propagation_
+// announce_app_data() — matches LXMRouter.get_propagation_node_app_data()),
+// using stamp_cost - stamp_cost_flexibility as the safe target, same as a
+// real LXMF client would. Falls back to 0 if no announce has been seen.
+// Pass an explicit number to override this (e.g. if the node's announce
+// isn't available yet, or for testing rejection of an under-cost stamp).
+export async function propagateLXMF(propagationLink, destination, source, title, content, fields = {}, stampCost = null) {
     if (destination.direction !== Destination.OUT) {
         throw new Error("Can only propagate LXMF to OUT destinations.");
     }
@@ -228,10 +271,16 @@ export function propagateLXMF(propagationLink, destination, source, title, conte
         throw new Error("Cannot propagate LXMF: destination identity not known.");
     }
 
+    if (stampCost === null) {
+        const nodeIdentity = propagationLink.rns.identities.get(crypto.bytesToHex(propagationLink.destination.hash));
+        const nodeAnnounceData = protocol.lxmf_parse_propagation_announce_app_data(nodeIdentity?.app_data);
+        stampCost = nodeAnnounceData ? Math.max(0, nodeAnnounceData.stampCost - nodeAnnounceData.stampCostFlexibility) : 0;
+    }
+
     const wirePayload = protocol.lxmf_build(content, source.identity.private, destination.hash, source.hash, null, title, fields);
     const envelope = build_propagated_envelope(destination.hash, wirePayload, knownIdentity.public_key, knownIdentity.ratchet);
     const transientId = propagated_transient_id(envelope);
-    const { stamp: stampBytes } = stamp.generate_stamp(transientId, stampCost);
+    const { stamp: stampBytes } = await stamp.generate_stamp(transientId, stampCost);
     const container = msgpack.pack([new msgpack.Float64(Date.now() / 1000), [crypto.concat(envelope, stampBytes)]]);
 
     return propagationLink.sendResource(container);
@@ -345,14 +394,23 @@ export async function syncFromRealPropagationNode(propagationLink, source) {
 // retry backoff, or transfer-rate tracking: this is one explicit sync
 // attempt, not a standing peer relationship that syncs itself over time.
 //
-// peeringCost must match what the peer actually requires (its own
-// LXMRouter.peering_cost/PropagationNode.peeringCost) — like propagateLXMF's
-// stampCost, this isn't learned automatically from an announce, so it has
-// to be supplied by the caller. The peering key is generated once per
-// `node` (cached on first sync) and on real LXMF, at the default cost of
-// 18, expect this to take several seconds — see stamp.js's module comment
-// on why there's no parallel search to speed it up.
-export async function syncToPeer(node, peerLink, peerIdentity, { peeringCost = 18 } = {}) {
+// peeringCost defaults to null, meaning: read it from the peer's own most
+// recently cached announce (peerLink.destination's app_data, same parsing as
+// propagateLXMF's stampCost auto-detection above) — matching what the peer
+// actually requires (its own LXMRouter.peering_cost/PropagationNode.
+// peeringCost) without needing it supplied out of band. Falls back to 18
+// (real LXMF's own default) if no announce has been seen. Pass an explicit
+// number to override. The peering key is generated once per `node` (cached
+// on first sync) and, at a cost of 18, expect this to take several seconds
+// — see stamp.js's module comment on why there's no parallel search to
+// speed it up.
+export async function syncToPeer(node, peerLink, peerIdentity, { peeringCost = null } = {}) {
+    if (peeringCost === null) {
+        const peerNodeIdentity = peerLink.rns.identities.get(crypto.bytesToHex(peerLink.destination.hash));
+        const peerAnnounceData = protocol.lxmf_parse_propagation_announce_app_data(peerNodeIdentity?.app_data);
+        peeringCost = peerAnnounceData ? peerAnnounceData.peeringCost : 18;
+    }
+
     peerLink.identify(node.identity);
 
     const peerHashHex = crypto.bytesToHex(peerIdentity.hash);
@@ -362,7 +420,7 @@ export async function syncToPeer(node, peerLink, peerIdentity, { peeringCost = 1
         node.peers.set(peerHashHex, peerState);
     }
     if (!peerState.peeringKey) {
-        const { stamp: peeringKey } = stamp.generate_peering_key(peerIdentity.hash, node.identity.hash, peeringCost);
+        const { stamp: peeringKey } = await stamp.generate_peering_key(peerIdentity.hash, node.identity.hash, peeringCost);
         peerState.peeringKey = peeringKey;
     }
 
