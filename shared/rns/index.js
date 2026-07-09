@@ -929,16 +929,19 @@ export class Link extends EventEmitter {
 
     // A sender's response to a hashmap-exhausted request: the next chunk of
     // map hashes for a transfer whose hashmap didn't fit in one
-    // advertisement. Matches RNS.Resource.hashmap_update() — appends the new
-    // entries and resumes requesting parts.
+    // advertisement. Matches RNS.Resource.hashmap_update(): entries are
+    // written at segment * RESOURCE_HASHMAP_MAX_LEN offsets, so a duplicated
+    // HMU (e.g. after a retried request) overwrites the same slots instead
+    // of corrupting the map.
     _onHashmapUpdate(plaintext) {
-        const { resourceHash, hashmap } = protocol.parse_resource_hmu(plaintext);
+        const { resourceHash, segment, hashmap } = protocol.parse_resource_hmu(plaintext);
         const resourceHashHex = crypto.bytesToHex(resourceHash);
         const incoming = this._incomingResources.get(resourceHashHex);
         if (!incoming) return;
 
-        for (let i = 0; i < hashmap.length; i += protocol.RESOURCE_MAPHASH_LEN) {
-            incoming.hashmapEntries.push(hashmap.slice(i, i + protocol.RESOURCE_MAPHASH_LEN));
+        const base = segment * protocol.RESOURCE_HASHMAP_MAX_LEN;
+        for (let i = 0; i * protocol.RESOURCE_MAPHASH_LEN < hashmap.length; i++) {
+            incoming.hashmapEntries[base + i] = hashmap.slice(i * protocol.RESOURCE_MAPHASH_LEN, (i + 1) * protocol.RESOURCE_MAPHASH_LEN);
         }
         incoming.waitingForHmu = false;
         this._requestNextResourceParts(resourceHashHex);
@@ -983,10 +986,16 @@ export class Link extends EventEmitter {
     // advertised — send back whichever of our already-built parts match,
     // trusting the receiver's own window/pacing entirely (matching real
     // RNS.Resource.request(): the sender doesn't second-guess how many parts
-    // it's asked for at once).
+    // it's asked for at once). A request with the hashmap-exhausted flag set
+    // is additionally answered with the next hashmap chunk as an HMU packet
+    // — same as Resource.request()'s wants_more_hashmap branch, minus its
+    // receiver_min_consecutive_height search-scope optimization (this sender
+    // searches the whole part list; part counts are bounded by
+    // RESOURCE_MAX_PARTS).
     _onResourceRequest(plaintext) {
-        const { resourceHash, requestedHashes } = protocol.parse_resource_request(plaintext);
-        const pending = this._outgoingResources.get(crypto.bytesToHex(resourceHash));
+        const { hashmapExhausted, lastMapHash, resourceHash, requestedHashes } = protocol.parse_resource_request(plaintext);
+        const resourceHashHex = crypto.bytesToHex(resourceHash);
+        const pending = this._outgoingResources.get(resourceHashHex);
         if (!pending) return;
 
         for (const wantedHash of requestedHashes) {
@@ -994,6 +1003,28 @@ export class Link extends EventEmitter {
             const index = pending.hashmapEntries.findIndex((h) => crypto.bytesToHex(h) === wantedHex);
             if (index === -1) continue;
             this.rns.sendData(protocol.build_resource_part_packet(this.linkId, pending.parts[index]));
+        }
+
+        if (hashmapExhausted) {
+            // partIndex = index just past the receiver's last known map hash.
+            // Matching Resource.request(): it must land on a
+            // RESOURCE_HASHMAP_MAX_LEN boundary (the receiver's known hashmap
+            // is always whole chunks), otherwise the transfer is out of
+            // sequence and is cancelled.
+            const lastHex = crypto.bytesToHex(lastMapHash);
+            const partIndex = pending.hashmapEntries.findIndex((h) => crypto.bytesToHex(h) === lastHex) + 1;
+            if (partIndex === 0 || partIndex % protocol.RESOURCE_HASHMAP_MAX_LEN !== 0) {
+                clearTimeout(pending.timer);
+                this._outgoingResources.delete(resourceHashHex);
+                pending.reject(new Error('Resource sequencing error in hashmap-exhausted request'));
+                return;
+            }
+            const segment = partIndex / protocol.RESOURCE_HASHMAP_MAX_LEN;
+            const chunkStart = segment * protocol.RESOURCE_HASHMAP_MAX_LEN;
+            const chunkEnd = Math.min((segment + 1) * protocol.RESOURCE_HASHMAP_MAX_LEN, pending.hashmapEntries.length);
+            const chunk = crypto.concat(...pending.hashmapEntries.slice(chunkStart, chunkEnd));
+            const hmuPayload = protocol.build_resource_hmu(resourceHash, segment, chunk);
+            this.rns.sendData(protocol.build_link_packet(this.linkId, this.derivedKey, hmuPayload, protocol.CONTEXT_RESOURCE_HMU));
         }
     }
 

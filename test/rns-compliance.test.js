@@ -575,14 +575,19 @@ test('Link.sendResource() splits a payload bigger than one segment into multiple
   const responderLink = await responderLinkPromise;
   await new Promise((resolve) => (responderLink.status === Link.ACTIVE ? resolve() : responderLink.once('established', resolve)));
 
-  // Bigger than two full segments, forcing at least 3 segments — built from
-  // several smaller randomBytes() calls, since crypto.getRandomValues()
-  // (which crypto.randomBytes() wraps) rejects requests over 64KiB.
-  const payload = crypto.concat(crypto.randomBytes(60000), crypto.randomBytes(60000), crypto.randomBytes(1000));
+  // Bigger than two full segments (RESOURCE_SEGMENT_MAX_SIZE = 1MiB-1,
+  // matching RNS.Resource.MAX_EFFICIENT_SIZE), forcing 3 segments — built
+  // from several smaller randomBytes() calls, since crypto.getRandomValues()
+  // (which crypto.randomBytes() wraps) rejects requests over 64KiB. Random
+  // bytes keep every segment incompressible, so part counts stay put.
+  const chunks = [];
+  for (let i = 0; i < 33; i++) chunks.push(crypto.randomBytes(64000));
+  chunks.push(crypto.randomBytes(1000));
+  const payload = crypto.concat(...chunks);
   assert.ok(payload.length > protocol.RESOURCE_SEGMENT_MAX_SIZE * 2);
 
   const responderGot = new Promise((resolve) => responderLink.once('resource', resolve));
-  const sendPromise = initiatorLink.sendResource(payload);
+  const sendPromise = initiatorLink.sendResource(payload, { timeout: 120000 });
 
   const received = await responderGot;
   assert.equal(crypto.bytesToHex(received), crypto.bytesToHex(payload));
@@ -712,53 +717,37 @@ test('a Resource transfer whose advertisement carries a truncated hashmap (fewer
   const responderLink = await responderLinkPromise;
   await new Promise((resolve) => (responderLink.status === Link.ACTIVE ? resolve() : responderLink.once('established', resolve)));
 
-  // Build a resource "by hand" with a hashmap deliberately truncated to
-  // fewer entries than totalParts, simulating a real RNS sender whose
-  // segment needs more parts than fit in one advertisement — then confirm
-  // this stack's own receiver correctly requests and applies an HMU packet
-  // to complete it, exactly like it would with a real Python sender.
-  const payload = crypto.randomBytes(protocol.RESOURCE_SDU * 6);
-  const prepared = protocol.resource_prepare(payload, (pt) => protocol.link_encrypt(initiatorLink.derivedKey, pt));
-  const truncateTo = 3;
-  assert.ok(prepared.totalParts > truncateTo, 'test payload must need more parts than the simulated truncation point');
+  // A payload needing more parts than fit in one advertisement's hashmap
+  // (RESOURCE_HASHMAP_MAX_LEN = 74 at default MTU). Random bytes are
+  // incompressible, so the part count stays above the threshold after the
+  // sender's compress-if-beneficial attempt. The sender truncates the
+  // advertised hashmap and answers the receiver's hashmap-exhausted request
+  // with an HMU packet; the receiver applies it and completes the transfer.
+  const payload = crypto.randomBytes(protocol.RESOURCE_SDU * (protocol.RESOURCE_HASHMAP_MAX_LEN + 10));
 
-  const advPayload = protocol.build_resource_advertisement({
-    transferSize: prepared.transferSize, dataSize: prepared.dataSize, totalParts: prepared.totalParts,
-    resourceHash: prepared.resourceHash, randomHash: prepared.randomHash,
-    hashmap: prepared.hashmap.slice(0, truncateTo * protocol.RESOURCE_MAPHASH_LEN),
-  });
-  const advPacket = protocol.build_link_packet(initiatorLink.linkId, initiatorLink.derivedKey, advPayload, protocol.CONTEXT_RESOURCE_ADV);
-
-  const responderGotResource = new Promise((resolve) => responderLink.once('resource', resolve));
-
-  // Manually stand in for the sender: serve part requests, and — since our
-  // hand-built advertisement only advertised `truncateTo` entries — answer
-  // the hashmap-exhausted request with the rest of the real hashmap via HMU.
-  // REQUEST packets flow responder (B) -> initiator (A), so they're
-  // intercepted on ifaceB's outgoing side; replies are sent via rnsA.sendData
-  // (A's own broadcast path, same as the advertisement above), which the
-  // Bridge delivers to B, exactly like a real sender's traffic would.
-  const originalBridgeSendData = Bridge.prototype.sendData;
-  ifaceB.sendData = function (data) {
+  // Intercept A's outgoing traffic to confirm the advertisement really was
+  // truncated and an HMU packet really was sent — not just that the
+  // transfer completed.
+  let advertisedEntries = null;
+  let hmuSent = false;
+  const originalSendData = ifaceA.sendData.bind(ifaceA);
+  ifaceA.sendData = (data) => {
     const unpacked = protocol.packet_unpack(data);
-    if (unpacked && unpacked.context === protocol.CONTEXT_RESOURCE_REQ) {
-      const plaintext = protocol.link_decrypt(initiatorLink.derivedKey, unpacked.data);
-      const req = protocol.parse_resource_request(plaintext);
-      for (const wantedHash of req.requestedHashes) {
-        const idx = prepared.hashmapEntries.findIndex((h) => crypto.bytesToHex(h) === crypto.bytesToHex(wantedHash));
-        if (idx !== -1) rnsA.sendData(protocol.build_resource_part_packet(initiatorLink.linkId, prepared.parts[idx]));
-      }
-      if (req.hashmapExhausted) {
-        const hmuPayload = protocol.build_resource_hmu(prepared.resourceHash, 1, prepared.hashmap.slice(truncateTo * protocol.RESOURCE_MAPHASH_LEN));
-        rnsA.sendData(protocol.build_link_packet(initiatorLink.linkId, initiatorLink.derivedKey, hmuPayload, protocol.CONTEXT_RESOURCE_HMU));
-      }
-      return;
+    if (unpacked && unpacked.context === protocol.CONTEXT_RESOURCE_ADV) {
+      const adv = protocol.parse_resource_advertisement(protocol.link_decrypt(initiatorLink.derivedKey, unpacked.data));
+      advertisedEntries = adv.hashmap.length / protocol.RESOURCE_MAPHASH_LEN;
     }
-    originalBridgeSendData.call(this, data);
+    if (unpacked && unpacked.context === protocol.CONTEXT_RESOURCE_HMU) hmuSent = true;
+    originalSendData(data);
   };
 
-  rnsA.sendData(advPacket);
+  const responderGotResource = new Promise((resolve) => responderLink.once('resource', resolve));
+  const sendPromise = initiatorLink.sendResource(payload);
   const received = await responderGotResource;
+  await sendPromise;
+
+  assert.equal(advertisedEntries, protocol.RESOURCE_HASHMAP_MAX_LEN, 'advertisement hashmap is truncated to RESOURCE_HASHMAP_MAX_LEN entries');
+  assert.equal(hmuSent, true, 'sender answered the hashmap-exhausted request with an HMU packet');
   assert.equal(crypto.bytesToHex(received), crypto.bytesToHex(payload));
 
   initiatorLink.close();

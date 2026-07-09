@@ -130,15 +130,28 @@ const pyIncompressibleEvent = await pyGotIncompressibleResource;
 assertEqual(pyIncompressibleEvent.data_hex, crypto.bytesToHex(pyIncompressiblePayload), 'Python (real RNS.Resource) correctly reassembled a JS-sent, high-entropy resource');
 assertTrue(pyIncompressibleEvent.compressed === false, 'Python (real RNS.Resource) recognized the JS-sent high-entropy resource as NOT worth compressing');
 
-// --- JS -> Python: a real RNS.Resource transfer spanning multiple segments
-// (this project segments past protocol.RESOURCE_SEGMENT_MAX_SIZE, ~55KB —
-// real RNS only segments past 1MiB-1, but a real receiver just processes
-// whatever segment size the sender advertises) ---
-const pyMultiSegmentPayload = crypto.concat(crypto.randomBytes(60000), crypto.randomBytes(30000));
-const pyGotMultiSegmentResource = waitFor((m) => m.event === 'resource_received' && m.data_hex.length === pyMultiSegmentPayload.length * 2, 20000);
-await link.sendResource(pyMultiSegmentPayload);
+// --- JS -> Python: a single segment with more parts than fit in one
+// advertisement's hashmap (>74 at default MTU). The real RNS.Resource
+// receiver notices the truncated hashmap and sends hashmap-exhausted part
+// requests; this stack's sender must answer them with HMU packets the
+// reference implementation accepts — the send-side counterpart of the
+// Python->JS HMU check below. High-entropy so it stays uncompressed. ---
+const pyHmuPayload = crypto.concat(crypto.randomBytes(60000), crypto.randomBytes(30000));
+const pyGotHmuResource = waitFor((m) => m.event === 'resource_received' && m.data_hex.length === pyHmuPayload.length * 2, 30000);
+await link.sendResource(pyHmuPayload);
+const pyHmuEvent = await pyGotHmuResource;
+assertEqual(pyHmuEvent.data_hex, crypto.bytesToHex(pyHmuPayload), 'Python (real RNS.Resource) correctly reassembled a JS-sent >74-part resource, driving this stack\'s send-side HMU');
+
+// --- JS -> Python: a transfer spanning multiple segments
+// (RESOURCE_SEGMENT_MAX_SIZE = 1MiB-1, matching real RNS's own
+// MAX_EFFICIENT_SIZE segmenting threshold) ---
+const multiSegChunks = [];
+for (let i = 0; i < 18; i++) multiSegChunks.push(crypto.randomBytes(64000));
+const pyMultiSegmentPayload = crypto.concat(...multiSegChunks);
+const pyGotMultiSegmentResource = waitFor((m) => m.event === 'resource_received' && m.data_hex.length === pyMultiSegmentPayload.length * 2, 120000);
+await link.sendResource(pyMultiSegmentPayload, { timeout: 120000 });
 const pyMultiSegmentEvent = await pyGotMultiSegmentResource;
-assertEqual(pyMultiSegmentEvent.data_hex, crypto.bytesToHex(pyMultiSegmentPayload), 'Python (real RNS.Resource) correctly reassembled a JS-sent, multi-segment resource');
+assertEqual(pyMultiSegmentEvent.data_hex, crypto.bytesToHex(pyMultiSegmentPayload), 'Python (real RNS.Resource) correctly reassembled a JS-sent, multi-segment (2-segment, >1MiB) resource');
 
 // --- Python -> JS: a real RNS.Resource transfer, sent by the reference
 // implementation, using high-entropy random bytes that bz2 can't usefully
