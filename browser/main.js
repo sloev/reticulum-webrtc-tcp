@@ -124,7 +124,7 @@ dest.on('packet', (event) => {
 });
 
 // Handle LXMF messages (kept for interop with an older/different peer that
-// still sends this way — this demo's own send() now uses Link/Channel below)
+// still sends this way — this demo's own send() uses Link/Channel below)
 dest.on('lxmf', (lxmf) => {
   const from = crypto.bytesToHex(lxmf.source_hash).slice(0, 12);
   try {

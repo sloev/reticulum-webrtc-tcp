@@ -1,18 +1,16 @@
-// Manual, throwaway check: this JS stack talking to a real, unmodified
-// `nomadnet` (NomadNet) client — an actual end-user LXMF client, not just
-// the bare `rns`/`lxmf` libraries this repo's other integration checks use
-// (compliance.md Phase 6).
+// Verifies this stack's LXMF wire compatibility against a real, unmodified
+// `nomadnet` (NomadNet) client — an actual end-user application, not just
+// the bare `rns`/`lxmf` libraries the other integration checks use.
 //
-// NomadNet runs genuinely headless via its own `-d`/`--daemon` mode (no
-// virtual display or TUI automation needed) — real identity file, real
-// LXMRouter, real delivery destination, real start-of-day announce, exactly
-// as an end user would run it. Confirms:
+// NomadNet runs headless via its own `-d`/`--daemon` mode (no virtual
+// display or TUI automation needed) — real identity file, real LXMRouter,
+// real delivery destination, real start-of-day announce, exactly as an end
+// user would run it. Confirms:
 //   1. JS -> NomadNet: NomadNet's real, unmodified daemon receives and
 //      stores (under storage/conversations/<hash>/) an OPPORTUNISTIC LXMF
-//      message sent by this stack, and its own announce (parsed with this
-//      project's Phase 5.2 protocol.lxmf_stamp_cost_from_app_data /
-//      compression parsing) is genuinely NomadNet-produced app_data, not a
-//      synthetic vector.
+//      message sent by this stack, and its own announce (parsed with
+//      protocol.lxmf_stamp_cost_from_app_data/compression parsing) is
+//      genuine NomadNet-produced app_data, not a synthetic vector.
 //   2. NomadNet -> JS: since NomadNet has no scriptable send API and driving
 //      its TUI headlessly isn't practical, this direction is driven via
 //      test-integration/nomadnet_driver.py, which runs NomadNet's own
@@ -20,10 +18,11 @@
 //      `message_router.handle_outbound()` directly — the same call
 //      NomadNet's own Conversation/compose code makes internally — rather
 //      than a synthetic LXMF payload. See that file's module docstring and
-//      README's Compliance section for exactly what this does and doesn't
-//      prove relative to a fully TUI-driven interop test.
+//      README's Compliance section for what this does and doesn't prove
+//      relative to a fully TUI-driven interop test.
 //
-// Requires: pip install --target=$PYLIBS nomadnet (in addition to rns/lxmf).
+// Run with: PYLIBS=/path/to/site-packages npm run test:integration:nomadnet
+// (requires: pip install --target=$PYLIBS rns lxmf nomadnet)
 import { spawn } from 'node:child_process';
 import { rmSync, mkdirSync, writeFileSync, readdirSync, existsSync } from 'node:fs';
 import { Reticulum, Identity, Destination } from '../shared/rns/index.js';

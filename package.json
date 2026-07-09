@@ -14,6 +14,8 @@
     "test:integration:resource": "node test-integration/resource-cross-language-check.mjs",
     "test:integration:lxmf-propagation": "node test-integration/lxmf-propagation-cross-language-check.mjs",
     "test:integration:lxmf-peer-sync": "node test-integration/lxmf-propagation-peer-sync-cross-language-check.mjs",
+    "test:integration:propagation-client": "node test-integration/propagation-client-interop-check.mjs",
+    "test:integration:propagation-nomadnet": "node test-integration/propagation-node-nomadnet-interop-check.mjs",
     "test:integration:channel": "node test-integration/channel-cross-language-check.mjs",
     "test:integration:path-request": "node test-integration/path-request-cross-language-check.mjs",
     "test:integration:nomadnet": "node test-integration/nomadnet-interop-check.mjs",

@@ -1,9 +1,12 @@
-// Manual, throwaway check: a real Python `lxmf`/`rns` process and our JS
-// Reticulum + LXMF implementation exchange genuine LXMF messages over real
-// TCP + HDLC, in both directions, each side validating the other's Ed25519
-// signature. Confirms shared/rns/protocol.js's lxmf_build/lxmf_parse (and the
-// msgpack.js encoder they depend on) aren't just internally self-consistent,
-// but wire-compatible with the actual reference LXMF implementation.
+// Verifies shared/rns/protocol.js's lxmf_build/lxmf_parse (and the
+// msgpack.js encoder they depend on) against a real Python `lxmf`/`rns`
+// process: genuine LXMF messages exchanged over real TCP + HDLC, in both
+// directions, both delivery methods, each side validating the other's
+// Ed25519 signature; also covers compression negotiation and ratchet
+// rotation (see the relevant sections below).
+//
+// Run with: PYLIBS=/path/to/site-packages npm run test:integration:lxmf
+// (requires: pip install --target=$PYLIBS rns lxmf)
 import { spawn } from 'node:child_process';
 import { rmSync } from 'node:fs';
 import { Reticulum, Identity, Destination, Link } from '../shared/rns/index.js';
@@ -180,6 +183,31 @@ assertTrue(pyDirect3.valid, 'Python validated the JS-signed DIRECT LXMF message 
 assertEqual(pyDirect3.content, bigContent, 'Python received the correct content with compression negotiated off');
 assertEqual(pyDirect3.compressed, false, "the real RNS.Resource Python received reports compressed=False — JS genuinely read Python's real announce app_data and skipped compression, not just decoded it correctly either way");
 jsToPyLink3.close();
+
+// --- Ratchet rotation (RNS.Destination.rotate_ratchets): JS rotates its
+// destination's ratchet WITHOUT re-announcing — the situation of a peer
+// holding a stale announce. Python keeps encrypting against the previous
+// ratchet; the retained key must decrypt it. Then JS re-announces the fresh
+// ratchet and Python's next message uses it. ---
+self.latestRatchetTime = Date.now() - Destination.RATCHET_INTERVAL_MS - 1;
+self._rotateRatchets();
+assertEqual(self.ratchets.length, 2, 'JS destination rotated in a fresh ratchet and retained the old one');
+
+const jsGotStaleRatchetLxmf = new Promise((resolve) => self.once('lxmf', resolve));
+py.stdin.write(JSON.stringify({ cmd: 'send_lxmf', dest_hash: crypto.bytesToHex(self.hash), title: 'stale ratchet', content: 'encrypted against the pre-rotation announce' }) + '\n');
+const staleReceived = await jsGotStaleRatchetLxmf;
+assertTrue(staleReceived.valid, 'JS decrypted and validated a message Python encrypted against the pre-rotation ratchet (retained-key path)');
+assertEqual(new TextDecoder().decode(staleReceived.title), 'stale ratchet', 'stale-ratchet message content is intact');
+
+const pySawFreshAnnounce = waitFor((m) => m.event === 'announce_received' && m.dest_hash === crypto.bytesToHex(self.hash), 5000);
+self.announce();
+await pySawFreshAnnounce;
+
+const jsGotFreshRatchetLxmf = new Promise((resolve) => self.once('lxmf', resolve));
+py.stdin.write(JSON.stringify({ cmd: 'send_lxmf', dest_hash: crypto.bytesToHex(self.hash), title: 'fresh ratchet', content: 'encrypted against the post-rotation announce' }) + '\n');
+const freshReceived = await jsGotFreshRatchetLxmf;
+assertTrue(freshReceived.valid, "JS decrypted and validated a message Python encrypted against the rotated ratchet's announce");
+assertEqual(new TextDecoder().decode(freshReceived.title), 'fresh ratchet', 'fresh-ratchet message content is intact');
 
 py.kill();
 gateway.server.close();

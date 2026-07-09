@@ -370,6 +370,13 @@ export class Destination extends EventEmitter {
     static SINGLE = protocol.DEST_SINGLE;
     static LINK = protocol.DEST_LINK;
 
+    // Matches RNS.Destination.RATCHET_COUNT / RATCHET_INTERVAL
+    // (RNS/Destination.py:85,90): how many old ratchet keys an IN
+    // destination retains for decrypting messages encrypted against an
+    // earlier announce, and how often announce() rotates in a fresh one.
+    static RATCHET_COUNT = 512;
+    static RATCHET_INTERVAL_MS = 30 * 60 * 1000;
+
     constructor(rns, identity, direction, type, appName, ...aspects) {
         super();
         this.rns = rns;
@@ -386,6 +393,55 @@ export class Destination extends EventEmitter {
 
         if (this.direction === Destination.IN) {
             this.rns.destinations.set(crypto.bytesToHex(this.hash), this);
+
+            // Retained ratchet private keys, newest first — ratchets[0] is
+            // what announce() advertises; the rest keep messages encrypted
+            // against an earlier announce decryptable (see onData()).
+            // Seeded with the identity's ratchet so a destination announced
+            // before its first rotation behaves as before.
+            if (identity && identity.ratchetPrivate) {
+                this.ratchets = [identity.ratchetPrivate];
+                this.latestRatchetTime = Date.now();
+                this._ratchetStorage = null;
+            }
+        }
+    }
+
+    // Matches RNS.Destination.rotate_ratchets(): called from announce() —
+    // once RATCHET_INTERVAL has elapsed, a fresh ratchet key is prepended
+    // and the retained list is trimmed to RATCHET_COUNT. Persisted if
+    // loadRatchets() attached a storage adapter.
+    _rotateRatchets() {
+        if (!this.ratchets) return;
+        const now = Date.now();
+        if (now > this.latestRatchetTime + Destination.RATCHET_INTERVAL_MS) {
+            this.ratchets.unshift(crypto.private_ratchet());
+            this.latestRatchetTime = now;
+            if (this.ratchets.length > Destination.RATCHET_COUNT) {
+                this.ratchets = this.ratchets.slice(0, Destination.RATCHET_COUNT);
+            }
+            if (this._ratchetStorage) this.saveRatchets(this._ratchetStorage).catch(() => {});
+        }
+    }
+
+    // Persists/reloads the retained ratchet list via a storage adapter (see
+    // shared/rns/storage.js) — without this, a restart would orphan messages
+    // encrypted against a pre-restart announce's ratchet. Own storage
+    // format, not RNS's on-disk one (like Reticulum.saveState()).
+    // loadRatchets() also attaches the adapter so later rotations persist
+    // automatically.
+    async saveRatchets(storage) {
+        await storage.save(`ratchets/${crypto.bytesToHex(this.hash)}`, {
+            ratchets: this.ratchets, latestRatchetTime: this.latestRatchetTime,
+        });
+    }
+
+    async loadRatchets(storage) {
+        this._ratchetStorage = storage;
+        const saved = await storage.load(`ratchets/${crypto.bytesToHex(this.hash)}`);
+        if (saved && Array.isArray(saved.ratchets) && saved.ratchets.length > 0) {
+            this.ratchets = saved.ratchets.map((r) => new Uint8Array(r));
+            this.latestRatchetTime = saved.latestRatchetTime;
         }
     }
 
@@ -456,10 +512,13 @@ export class Destination extends EventEmitter {
     onData(packet, rawBytes) {
         if (this.direction === Destination.OUT) return;
 
-        // Try the destination's current ratchet first, then fall back to the
-        // identity's own X25519 key, matching RNS.Identity.decrypt()'s fallback
-        // for senders who didn't have (or use) an announced ratchet.
-        const decrypted = protocol.message_decrypt(packet, this.identity.public, [this.identity.ratchetPrivate, this.identity.private.slice(0, 32)]);
+        // Try every retained ratchet, newest first, then fall back to the
+        // identity's own X25519 key — matching RNS.Identity.decrypt()'s
+        // candidate order (Identity.py:869): a sender may have encrypted
+        // against any ratchet this destination has announced, or against no
+        // ratchet at all.
+        const candidates = this.ratchets ? this.ratchets : [this.identity.ratchetPrivate];
+        const decrypted = protocol.message_decrypt(packet, this.identity.public, [...candidates, this.identity.private.slice(0, 32)]);
         if (decrypted) {
             const parsedLxmf = tryParseLxmf(this.rns, this.hash, decrypted);
 
@@ -499,12 +558,17 @@ export class Destination extends EventEmitter {
         this.emit('proof', packet);
     }
 
+    // Announces this destination, advertising the newest ratchet — rotating
+    // one in first when RATCHET_INTERVAL has elapsed, matching
+    // RNS.Destination.announce()'s rotate_ratchets() call.
     announce({ pathResponse = false, appData = new Uint8Array(0) } = {}) {
         if (this.identity) {
+            this._rotateRatchets();
+            const ratchetPrivate = this.ratchets ? this.ratchets[0] : this.identity.ratchetPrivate;
             const context = pathResponse ? protocol.CONTEXT_PATH_RESPONSE : protocol.CONTEXT_NONE;
             const packet = protocol.build_announce(
                 this.identity.private, this.identity.public, this.hash,
-                this.identity.ratchetPrivate, this.identity.ratchetPublic, this.fullName,
+                ratchetPrivate, crypto.public_ratchet(ratchetPrivate), this.fullName,
                 appData, context
             );
             this.rns.sendData(packet);
@@ -538,10 +602,10 @@ export class Link extends EventEmitter {
 
     static DEFAULT_MTU = 500;
 
-    // RNS.Link's real RTT-adaptive keepalive/stale/timeout state machine
-    // (RNS/Link.py), replacing the fixed intervals this used to use — see
-    // _updateKeepalive()/_watchdogTick() below. Values match the Python
-    // constants (seconds); converted to ms at the point of use.
+    // Matches RNS.Link's RTT-adaptive keepalive/stale/timeout state machine
+    // (RNS/Link.py) — see _updateKeepalive()/_watchdogTick() below. Values
+    // match the Python constants (seconds); converted to ms at the point of
+    // use.
     static DEFAULT_PER_HOP_TIMEOUT = 6;
     static ESTABLISHMENT_TIMEOUT_PER_HOP = 6;
     static KEEPALIVE_MAX = 360;
@@ -798,19 +862,20 @@ export class Link extends EventEmitter {
     // peer is transparently decompressed the same way it always was.
     //
     // Payloads larger than one segment's worth (protocol.
-    // RESOURCE_SEGMENT_MAX_SIZE) are split into multiple segments, sent one
-    // at a time (each with its own full advertise/request/part/proof cycle,
-    // linked by a shared "original hash" — see protocol.js's "RNS.Resource"
-    // section) — real RNS peers handle this correctly since they only ever
-    // trust whatever segment size this sender advertises. The receiver's
-    // request window is rate-adaptive, matching RNS.Resource's own growth/
-    // fast-rate-promotion logic (see _growResourceWindow() below) — not yet
-    // implemented: retry-driven window *shrinking* (no per-part retry/
-    // timeout mechanism exists yet), and a segment size much smaller than
-    // real RNS's 1MiB-1 — so *sending* an arbitrarily large payload works,
-    // but *receiving* one bigger than a single segment from a real peer
-    // still doesn't, since that needs HMU packets this project doesn't
-    // implement. See compliance.md for the full parity checklist.
+    // RESOURCE_SEGMENT_MAX_SIZE, matching RNS.Resource.MAX_EFFICIENT_SIZE)
+    // are split into multiple segments, sent one at a time (each with its
+    // own full advertise/request/part/proof cycle, linked by a shared
+    // "original hash" — see protocol.js's "RNS.Resource" section) — real RNS
+    // peers handle this correctly since they only ever trust whatever
+    // segment size this sender advertises. The receiver's request window is
+    // rate-adaptive, matching RNS.Resource's own growth/fast-rate-promotion
+    // logic (see _growResourceWindow() below) and shrinks on a per-part
+    // retry/timeout (see _resourceRetryTick() below). Both directions
+    // truncate an oversized advertisement's hashmap and exchange the rest
+    // via HMU (hashmap update) packets, matching real RNS — see
+    // _onResourceRequest()'s hashmapExhausted handling (send side) and
+    // _onHashmapUpdate() (receive side). See compliance.md for the full
+    // parity checklist.
     sendResource(data, { timeout = 30000, requestId = null, isRequest = false, isResponse = false, autoCompress = true } = {}) {
         if (this.status !== Link.ACTIVE) return Promise.reject(new Error('Link is not active'));
 
@@ -922,6 +987,12 @@ export class Link extends EventEmitter {
             reqSentAt: 0,
             rttRxdBytes: 0,
             rttRxdBytesAtPartReq: 0,
+            // Retry state — matches RNS.Resource's receiver-side watchdog
+            // (see _resourceRetryTick()).
+            retriesLeft: protocol.RESOURCE_MAX_RETRIES,
+            partTimeoutFactor: protocol.RESOURCE_PART_TIMEOUT_FACTOR,
+            lastActivity: Date.now(),
+            retryTimer: null,
         });
 
         this._requestNextResourceParts(resourceHashHex);
@@ -929,16 +1000,24 @@ export class Link extends EventEmitter {
 
     // A sender's response to a hashmap-exhausted request: the next chunk of
     // map hashes for a transfer whose hashmap didn't fit in one
-    // advertisement. Matches RNS.Resource.hashmap_update() — appends the new
-    // entries and resumes requesting parts.
+    // advertisement. Matches RNS.Resource.hashmap_update(): entries are
+    // written at segment * RESOURCE_HASHMAP_MAX_LEN offsets, so a duplicated
+    // HMU (e.g. after a retried request) overwrites the same slots instead
+    // of corrupting the map.
     _onHashmapUpdate(plaintext) {
-        const { resourceHash, hashmap } = protocol.parse_resource_hmu(plaintext);
+        const { resourceHash, segment, hashmap } = protocol.parse_resource_hmu(plaintext);
         const resourceHashHex = crypto.bytesToHex(resourceHash);
         const incoming = this._incomingResources.get(resourceHashHex);
         if (!incoming) return;
 
-        for (let i = 0; i < hashmap.length; i += protocol.RESOURCE_MAPHASH_LEN) {
-            incoming.hashmapEntries.push(hashmap.slice(i, i + protocol.RESOURCE_MAPHASH_LEN));
+        // Matches RNS.Resource.hashmap_update_packet(): an HMU counts as
+        // activity and refills the retry budget.
+        incoming.lastActivity = Date.now();
+        incoming.retriesLeft = protocol.RESOURCE_MAX_RETRIES;
+
+        const base = segment * protocol.RESOURCE_HASHMAP_MAX_LEN;
+        for (let i = 0; i * protocol.RESOURCE_MAPHASH_LEN < hashmap.length; i++) {
+            incoming.hashmapEntries[base + i] = hashmap.slice(i * protocol.RESOURCE_MAPHASH_LEN, (i + 1) * protocol.RESOURCE_MAPHASH_LEN);
         }
         incoming.waitingForHmu = false;
         this._requestNextResourceParts(resourceHashHex);
@@ -977,16 +1056,83 @@ export class Link extends EventEmitter {
         const requestPayload = protocol.build_resource_request(incoming.resourceHash, crypto.concat(...requested), { lastMapHash });
         const requestPacket = protocol.build_link_packet(this.linkId, this.derivedKey, requestPayload, protocol.CONTEXT_RESOURCE_REQ);
         this.rns.sendData(requestPacket);
+        this._armResourceRetry(resourceHashHex);
+    }
+
+    // The deadline after which an unanswered part request is retried —
+    // matches RNS.Resource.__watchdog_job()'s receiver branch: measured from
+    // the last received part (or the request, whichever is later), scaled by
+    // part_timeout_factor, plus a grace period and extra patience per used
+    // retry. Python scales by an estimated in-flight rate (update_eifr());
+    // this port scales by the link RTT, floored at 25ms so a local-loopback
+    // link doesn't retry spuriously.
+    _resourceRetryDeadline(incoming) {
+        const rttMs = Math.max((this.rtt || 0) * 1000, 25);
+        const retriesUsed = protocol.RESOURCE_MAX_RETRIES - incoming.retriesLeft;
+        return Math.max(incoming.lastActivity, incoming.reqSentAt)
+            + incoming.partTimeoutFactor * rttMs
+            + protocol.RESOURCE_RETRY_GRACE_MS
+            + retriesUsed * protocol.RESOURCE_PER_RETRY_DELAY_MS;
+    }
+
+    _armResourceRetry(resourceHashHex) {
+        const incoming = this._incomingResources.get(resourceHashHex);
+        if (!incoming) return;
+        clearTimeout(incoming.retryTimer);
+        const delay = Math.max(this._resourceRetryDeadline(incoming) - Date.now(), 10);
+        incoming.retryTimer = setTimeout(() => this._resourceRetryTick(resourceHashHex), delay);
+        if (typeof incoming.retryTimer.unref === 'function') incoming.retryTimer.unref();
+    }
+
+    // Matches the timeout branch of RNS.Resource.__watchdog_job() (receiver
+    // side): shrink the window (and window_max, twice if it has drifted more
+    // than window_flexibility above the window), spend a retry, and re-send
+    // the request for whatever is still missing; cancel the transfer once
+    // retries run out.
+    _resourceRetryTick(resourceHashHex) {
+        const incoming = this._incomingResources.get(resourceHashHex);
+        if (!incoming) return;
+
+        if (Date.now() < this._resourceRetryDeadline(incoming)) {
+            this._armResourceRetry(resourceHashHex);
+            return;
+        }
+
+        if (incoming.retriesLeft <= 0) {
+            clearTimeout(incoming.retryTimer);
+            this._incomingResources.delete(resourceHashHex);
+            return;
+        }
+
+        if (incoming.window > incoming.windowMin) {
+            incoming.window -= 1;
+            if (incoming.windowMax > incoming.windowMin) {
+                incoming.windowMax -= 1;
+                if ((incoming.windowMax - incoming.window) > (protocol.RESOURCE_WINDOW_FLEXIBILITY - 1)) {
+                    incoming.windowMax -= 1;
+                }
+            }
+        }
+
+        incoming.retriesLeft -= 1;
+        incoming.waitingForHmu = false;
+        this._requestNextResourceParts(resourceHashHex);
     }
 
     // Sender side: the receiver requested some parts of a resource we
     // advertised — send back whichever of our already-built parts match,
     // trusting the receiver's own window/pacing entirely (matching real
     // RNS.Resource.request(): the sender doesn't second-guess how many parts
-    // it's asked for at once).
+    // it's asked for at once). A request with the hashmap-exhausted flag set
+    // is additionally answered with the next hashmap chunk as an HMU packet
+    // — same as Resource.request()'s wants_more_hashmap branch, minus its
+    // receiver_min_consecutive_height search-scope optimization (this sender
+    // searches the whole part list; part counts are bounded by
+    // RESOURCE_MAX_PARTS).
     _onResourceRequest(plaintext) {
-        const { resourceHash, requestedHashes } = protocol.parse_resource_request(plaintext);
-        const pending = this._outgoingResources.get(crypto.bytesToHex(resourceHash));
+        const { hashmapExhausted, lastMapHash, resourceHash, requestedHashes } = protocol.parse_resource_request(plaintext);
+        const resourceHashHex = crypto.bytesToHex(resourceHash);
+        const pending = this._outgoingResources.get(resourceHashHex);
         if (!pending) return;
 
         for (const wantedHash of requestedHashes) {
@@ -994,6 +1140,28 @@ export class Link extends EventEmitter {
             const index = pending.hashmapEntries.findIndex((h) => crypto.bytesToHex(h) === wantedHex);
             if (index === -1) continue;
             this.rns.sendData(protocol.build_resource_part_packet(this.linkId, pending.parts[index]));
+        }
+
+        if (hashmapExhausted) {
+            // partIndex = index just past the receiver's last known map hash.
+            // Matching Resource.request(): it must land on a
+            // RESOURCE_HASHMAP_MAX_LEN boundary (the receiver's known hashmap
+            // is always whole chunks), otherwise the transfer is out of
+            // sequence and is cancelled.
+            const lastHex = crypto.bytesToHex(lastMapHash);
+            const partIndex = pending.hashmapEntries.findIndex((h) => crypto.bytesToHex(h) === lastHex) + 1;
+            if (partIndex === 0 || partIndex % protocol.RESOURCE_HASHMAP_MAX_LEN !== 0) {
+                clearTimeout(pending.timer);
+                this._outgoingResources.delete(resourceHashHex);
+                pending.reject(new Error('Resource sequencing error in hashmap-exhausted request'));
+                return;
+            }
+            const segment = partIndex / protocol.RESOURCE_HASHMAP_MAX_LEN;
+            const chunkStart = segment * protocol.RESOURCE_HASHMAP_MAX_LEN;
+            const chunkEnd = Math.min((segment + 1) * protocol.RESOURCE_HASHMAP_MAX_LEN, pending.hashmapEntries.length);
+            const chunk = crypto.concat(...pending.hashmapEntries.slice(chunkStart, chunkEnd));
+            const hmuPayload = protocol.build_resource_hmu(resourceHash, segment, chunk);
+            this.rns.sendData(protocol.build_link_packet(this.linkId, this.derivedKey, hmuPayload, protocol.CONTEXT_RESOURCE_HMU));
         }
     }
 
@@ -1016,6 +1184,14 @@ export class Link extends EventEmitter {
                 }
             }
             if (matchedIndex === -1) continue;
+
+            // Matches RNS.Resource.receive_part(): every received part
+            // counts as activity, refills the retry budget, and (after the
+            // first response) relaxes the retry deadline's timeout factor.
+            incoming.lastActivity = Date.now();
+            incoming.retriesLeft = protocol.RESOURCE_MAX_RETRIES;
+            incoming.partTimeoutFactor = protocol.RESOURCE_PART_TIMEOUT_FACTOR_AFTER_RTT;
+
             if (incoming.parts[matchedIndex] !== null) return; // already have it
 
             incoming.parts[matchedIndex] = partData;
@@ -1042,9 +1218,8 @@ export class Link extends EventEmitter {
     // Grows the request window (and, if the measured transfer rate over
     // this round has been consistently fast or very slow, promotes/demotes
     // its ceiling) — matches RNS.Resource.receive_part()'s window-adaptation
-    // logic (RNS/Resource.py:900-924). Retry-driven window *shrinking* isn't
-    // implemented — this project's Resource has no per-part retry/timeout
-    // mechanism yet (see compliance.md).
+    // logic (RNS/Resource.py:900-924). The shrinking counterpart lives in
+    // _resourceRetryTick() above.
     _growResourceWindow(incoming) {
         if (incoming.window < incoming.windowMax) {
             incoming.window += 1;
@@ -1081,6 +1256,7 @@ export class Link extends EventEmitter {
     // verify it hashes to what was advertised, and — if it checks out —
     // emit it and send the sender a completion proof.
     _assembleResource(resourceHashHex, incoming) {
+        clearTimeout(incoming.retryTimer);
         this._incomingResources.delete(resourceHashHex);
 
         const cipherBlob = crypto.concat(...incoming.parts);
@@ -1410,6 +1586,9 @@ export class Link extends EventEmitter {
             pending.reject(new Error('Link closed before resource transfer completed'));
         }
         this._outgoingResources.clear();
+        for (const incoming of this._incomingResources.values()) {
+            clearTimeout(incoming.retryTimer);
+        }
         this._incomingResources.clear();
         this._resourceSegments.clear();
         for (const pending of this.pendingRequests.values()) {

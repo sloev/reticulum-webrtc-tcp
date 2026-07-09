@@ -800,12 +800,9 @@ export function lxmf_parse_propagation_announce_app_data(app_data) {
 //
 // This is a *different*, smaller value than RESOURCE_SDU below — real RNS
 // computes them differently (Resource.sdu doesn't use this AES-block-
-// rounded formula at all, see below), a distinction easy to miss since both
-// are "the per-packet payload budget" in spirit. Conflating them silently
-// produced a resource part-count mismatch that only showed up once a
-// transfer's part count crossed a boundary where the two formulas disagree
-// (found via live testing with a large multi-segment transfer — small
-// transfers happened to land on the same part count either way).
+// rounded formula at all, see below). Conflating them breaks part counts
+// for a transfer whose size crosses the boundary where the two formulas
+// disagree.
 export const LINK_MDU = Math.floor((500 - 1 - 19 - 48) / 16) * 16 - 1;
 export const RESOURCE_MAPHASH_LEN = 4;
 export const RESOURCE_RANDOM_HASH_LEN = 4;
@@ -824,23 +821,18 @@ export const RESOURCE_HASHMAP_MAX_LEN = Math.floor((LINK_MDU - 134) / RESOURCE_M
 // SDU makes the two sides disagree on how many parts there are, and RNS
 // silently drops the whole transfer as corrupt.
 export const RESOURCE_SDU = 500 - 35 - 1;
-// Caps a single *segment* on the send side: this project's own sender always
-// includes the whole hashmap in the initial advertisement packet rather than
-// truncating it to RESOURCE_HASHMAP_MAX_LEN and sending the rest via HMU
-// packets on request (both a real receiver and this project's own receiver
-// tolerate an advertisement's hashmap being larger than what real RNS itself
-// would ever send in one packet — the size limit is a real-RNS sender-side
-// packing choice, not a receiver-side validation rule). Real RNS instead
-// segments once transfer size exceeds MAX_EFFICIENT_SIZE (1MiB-1) — this
-// project segments much smaller and more often, at this per-segment
-// part-count limit. Receiving a segment larger than this from a *real* RNS
-// sender (which does truncate its hashmap and expects HMU requests) is
-// supported — see Link._onResourceAdvertisement/_onHashmapUpdate.
-export const RESOURCE_MAX_PARTS = 128;
-// The largest raw (pre-encryption) plaintext chunk that's guaranteed to fit
-// within RESOURCE_MAX_PARTS parts after the random-hash prefix, PKCS7
-// padding, and the link Token's IV+HMAC overhead — see resource_prepare().
-export const RESOURCE_SEGMENT_MAX_SIZE = RESOURCE_MAX_PARTS * RESOURCE_SDU - 128;
+// Matches RNS.Resource.MAX_EFFICIENT_SIZE (Resource.py:116): a transfer
+// larger than this is split into multiple segments, each its own
+// advertise/request/part/proof cycle. An advertisement carries at most
+// RESOURCE_HASHMAP_MAX_LEN map hashes; the rest of a segment's hashmap is
+// delivered via HMU packets on request — see build_resource_advertisement()
+// and Link._onResourceRequest()/_onHashmapUpdate().
+export const RESOURCE_SEGMENT_MAX_SIZE = 1 * 1024 * 1024 - 1;
+// Upper bound on parts per segment, used as a sanity check on both send and
+// receive: RESOURCE_SEGMENT_MAX_SIZE plaintext bytes plus the random-hash
+// prefix, PKCS7 padding, and the link Token's IV+HMAC overhead (< 128 bytes
+// total), split into RESOURCE_SDU-byte parts.
+export const RESOURCE_MAX_PARTS = Math.ceil((RESOURCE_SEGMENT_MAX_SIZE + 128) / RESOURCE_SDU);
 // Matches RNS.Resource's rate-adaptive request window (RNS/Resource.py):
 // starts small and grows by 1 each round the previous window was fully
 // satisfied, up to window_max — which itself starts modest and is promoted
@@ -858,6 +850,19 @@ export const RESOURCE_RATE_FAST = (50 * 1000) / 8; // bytes/sec (50kbit/s)
 export const RESOURCE_RATE_VERY_SLOW = (2 * 1000) / 8; // bytes/sec (2kbit/s)
 export const RESOURCE_FAST_RATE_THRESHOLD = RESOURCE_WINDOW_MAX_SLOW - RESOURCE_WINDOW - 2;
 export const RESOURCE_VERY_SLOW_RATE_THRESHOLD = 2;
+// Receiver-side retry timing, matching RNS.Resource (Resource.py:126-135):
+// a part request that isn't fully answered within
+// part_timeout_factor * RTT (factor 4 before the first response, 2 after)
+// plus a grace period is re-sent with a smaller window, up to
+// RESOURCE_MAX_RETRIES times; each used retry adds PER_RETRY_DELAY of extra
+// patience. Python scales the deadline by an estimated in-flight rate
+// (Resource.update_eifr()); this port scales by the link RTT alone — see
+// Link._resourceRetryDeadline().
+export const RESOURCE_PART_TIMEOUT_FACTOR = 4;
+export const RESOURCE_PART_TIMEOUT_FACTOR_AFTER_RTT = 2;
+export const RESOURCE_MAX_RETRIES = 16;
+export const RESOURCE_RETRY_GRACE_MS = 250;
+export const RESOURCE_PER_RETRY_DELAY_MS = 500;
 
 export function resource_map_hash(part_data, random_hash) {
     return crypto.sha256(crypto.concat(part_data, random_hash)).slice(0, RESOURCE_MAPHASH_LEN);
@@ -921,6 +926,11 @@ export function resource_prepare(plaintext, link_encrypt_fn, { compressed = fals
 // resourceHash (matching a first/only segment); a later segment passes the
 // *first* segment's resourceHash here instead, linking it back to the same
 // overall transfer.
+//
+// The m (hashmap) field carries at most RESOURCE_HASHMAP_MAX_LEN map
+// hashes, matching ResourceAdvertisement.pack(segment=0) — a receiver of a
+// transfer with more parts requests the rest via hashmap-exhausted part
+// requests, answered with HMU packets (see Link._onResourceRequest()).
 export function build_resource_advertisement({
     transferSize, dataSize, totalParts, resourceHash, randomHash, hashmap,
     segmentIndex = 1, totalSegments = 1, originalHash = resourceHash, compressed = false,
@@ -934,7 +944,8 @@ export function build_resource_advertisement({
         t: transferSize, d: dataSize, n: totalParts,
         h: resourceHash, r: randomHash, o: originalHash,
         i: segmentIndex, l: totalSegments, q: requestId,
-        f: 0x01 | split | compressedFlag | requestFlag | responseFlag, m: hashmap,
+        f: 0x01 | split | compressedFlag | requestFlag | responseFlag,
+        m: hashmap.slice(0, RESOURCE_HASHMAP_MAX_LEN * RESOURCE_MAPHASH_LEN),
     };
     return lxmfMsgpack.pack(dict);
 }

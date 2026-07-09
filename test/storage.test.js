@@ -88,6 +88,35 @@ test("Reticulum.saveState()/loadState() persist and reload the identity cache an
   });
 });
 
+test('Destination.saveRatchets()/loadRatchets() persist retained ratchets across a simulated restart, and rotation auto-saves once a storage is attached', async () => {
+  await withTempDir(async (dir) => {
+    const storage = new NodeFileStorage(dir);
+
+    const rns1 = new Reticulum();
+    rns1.addInterface(new (class extends Interface { connect() {} sendData() {} })('noop'));
+    const identity = Identity.create();
+    const dest1 = new Destination(rns1, identity, Destination.IN, Destination.SINGLE, 'test', 'ratchetstore');
+    await dest1.loadRatchets(storage); // nothing saved yet — attaches the storage
+
+    dest1.latestRatchetTime = Date.now() - Destination.RATCHET_INTERVAL_MS - 1;
+    dest1._rotateRatchets(); // auto-saves via the attached storage
+    assert.equal(dest1.ratchets.length, 2);
+    await new Promise((r) => setTimeout(r, 50)); // the auto-save is fire-and-forget
+
+    // Same identity after a "restart": the retained list must survive so
+    // messages encrypted against the pre-restart announce still decrypt.
+    const rns2 = new Reticulum();
+    rns2.addInterface(new (class extends Interface { connect() {} sendData() {} })('noop'));
+    const dest2 = new Destination(rns2, identity, Destination.IN, Destination.SINGLE, 'test', 'ratchetstore');
+    await dest2.loadRatchets(storage);
+
+    assert.equal(dest2.ratchets.length, 2);
+    assert.deepEqual(Array.from(dest2.ratchets[0]), Array.from(dest1.ratchets[0]));
+    assert.deepEqual(Array.from(dest2.ratchets[1]), Array.from(dest1.ratchets[1]));
+    assert.equal(dest2.latestRatchetTime, dest1.latestRatchetTime);
+  });
+});
+
 test('PropagationNode.saveState()/loadState() persist and reload the message store, and clean up files for purged messages', async () => {
   await withTempDir(async (dir) => {
     const storage = new NodeFileStorage(dir);

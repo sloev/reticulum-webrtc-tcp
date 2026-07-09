@@ -31,6 +31,8 @@ def main():
     parser.add_argument("--configdir", required=True)
     parser.add_argument("--tcp-target-host", default=None)
     parser.add_argument("--tcp-target-port", type=int, default=None)
+    parser.add_argument("--listen-port", type=int, default=None, help="also bind a TCPServerInterface, so a third real RNS process (e.g. NomadNet) can connect directly rather than through the JS gateway — this project's own packet forwarding is a simplified single-hop analog of RNS.Transport and doesn't rewrite transport_id when relaying, which a real transport-enabled node's packet_filter() rejects for non-announce packets (Transport.py's 'in transport for other transport instance')")
+    parser.add_argument("--propagation-cost", type=int, default=None, help="override LXMRouter's default propagation_cost (16) — real LXStamper PoW at the default cost can take many minutes in pure Python; LXMRouter.PROPAGATION_COST_MIN (13) is the lowest it accepts")
     args = parser.parse_args()
 
     import os
@@ -39,12 +41,20 @@ def main():
     if not os.path.isfile(config_path):
         interfaces = ""
         if args.tcp_target_host and args.tcp_target_port:
-            interfaces = f"""
+            interfaces += f"""
 [[Bridge]]
   type = TCPClientInterface
   interface_enabled = True
   target_host = {args.tcp_target_host}
   target_port = {args.tcp_target_port}
+"""
+        if args.listen_port:
+            interfaces += f"""
+[[Listener]]
+  type = TCPServerInterface
+  interface_enabled = True
+  listen_ip = 127.0.0.1
+  listen_port = {args.listen_port}
 """
         with open(config_path, "w") as f:
             f.write(f"""[reticulum]
@@ -62,7 +72,10 @@ loglevel = 3
     RNS.Reticulum(configdir=args.configdir)
 
     identity = RNS.Identity()
-    router = LXMF.LXMRouter(identity=identity, storagepath=args.configdir)
+    router_kwargs = {}
+    if args.propagation_cost is not None:
+        router_kwargs["propagation_cost"] = args.propagation_cost
+    router = LXMF.LXMRouter(identity=identity, storagepath=args.configdir, **router_kwargs)
     router.enable_propagation()
     # Real get_propagation_node_app_data()-carrying announce (Phase 5.3) —
     # fires after LXMRouter.NODE_ANNOUNCE_DELAY (20s), same as any real node.

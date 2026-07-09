@@ -486,6 +486,108 @@ test('LXMF propagation node rejects a sync request signed by the wrong identity'
   attackerLink.close();
 });
 
+test("PropagationNode serves a real-LXMF-client-style sync via syncFromRealPropagationNode(), matching LXMRouter.message_get_request()'s list-then-fetch-then-purge flow", async () => {
+  const rnsSender = new Reticulum();
+  const rnsPropNode = new Reticulum();
+  const rnsRecipient = new Reticulum();
+  makeBridgedPair(rnsSender, rnsPropNode);
+  makeBridgedPair(rnsPropNode, rnsRecipient);
+
+  const propNodeIdentity = Identity.create();
+  const propNode = new propagation.PropagationNode(rnsPropNode, propNodeIdentity);
+
+  const senderIdentity = Identity.create();
+  const senderSelf = new Destination(rnsSender, senderIdentity, Destination.IN, Destination.SINGLE, 'lxmf', 'delivery');
+
+  const recipientIdentity = Identity.create();
+  const recipientSelf = new Destination(rnsRecipient, recipientIdentity, Destination.IN, Destination.SINGLE, 'lxmf', 'delivery');
+
+  const senderKnowsPropNode = new Promise((resolve) => rnsSender.on('announce', (a) => { if (crypto.bytesToHex(a.destination_hash) === crypto.bytesToHex(propNode.destination.hash)) resolve(); }));
+  const senderKnowsRecipient = new Promise((resolve) => rnsSender.on('announce', (a) => { if (crypto.bytesToHex(a.destination_hash) === crypto.bytesToHex(recipientSelf.hash)) resolve(); }));
+  const recipientKnowsPropNode = new Promise((resolve) => rnsRecipient.on('announce', (a) => { if (crypto.bytesToHex(a.destination_hash) === crypto.bytesToHex(propNode.destination.hash)) resolve(); }));
+
+  propNode.announce();
+  senderSelf.announce();
+  recipientSelf.announce();
+  await Promise.all([senderKnowsPropNode, senderKnowsRecipient, recipientKnowsPropNode]);
+
+  const destOut = new Destination(rnsSender, recipientIdentity, Destination.OUT, Destination.SINGLE, 'lxmf', 'delivery');
+  const propNodeOutFromSender = new Destination(rnsSender, propNodeIdentity, Destination.OUT, Destination.SINGLE, 'lxmf', 'propagation');
+  const senderLink = new Link(rnsSender, propNodeOutFromSender);
+  await new Promise((resolve) => senderLink.once('established', resolve));
+
+  await propagation.propagateLXMF(senderLink, destOut, senderSelf, 'real client sync', 'served through the real-client /get handler', {});
+  senderLink.close();
+  assert.equal(propNode.messages.size, 1);
+
+  const propNodeOutFromRecipient = new Destination(rnsRecipient, propNodeIdentity, Destination.OUT, Destination.SINGLE, 'lxmf', 'propagation');
+  const recipientLink = new Link(rnsRecipient, propNodeOutFromRecipient);
+  await new Promise((resolve) => recipientLink.once('established', resolve));
+
+  const messages = await propagation.syncFromRealPropagationNode(recipientLink, recipientSelf);
+  assert.equal(messages.length, 1);
+  assert.equal(messages[0].valid, true);
+  assert.equal(new TextDecoder().decode(messages[0].title), 'real client sync');
+  assert.equal(new TextDecoder().decode(messages[0].content), 'served through the real-client /get handler');
+  assert.equal(crypto.bytesToHex(messages[0].source_hash), crypto.bytesToHex(senderSelf.hash));
+
+  // Fetched then purged, via syncFromRealPropagationNode()'s separate
+  // purge-after-fetch request (matching a real LXMF client's own two-request
+  // sequence, not this project's fetch-and-purge-together JS-only scheme).
+  assert.equal(propNode.messages.size, 0);
+
+  recipientLink.close();
+});
+
+test("PropagationNode's real-client /get handler (_onRealGetRequest) returns LXMPeer.ERROR_NO_IDENTITY for an unidentified link, lists smallest-message-first, and honors a client's transfer_limit_kb", async () => {
+  const rnsClient = new Reticulum();
+  const rnsPropNode = new Reticulum();
+  makeBridgedPair(rnsClient, rnsPropNode);
+
+  const propNodeIdentity = Identity.create();
+  const propNode = new propagation.PropagationNode(rnsPropNode, propNodeIdentity);
+
+  const clientIdentity = Identity.create();
+  const clientSelf = new Destination(rnsClient, clientIdentity, Destination.IN, Destination.SINGLE, 'lxmf', 'delivery');
+
+  const clientKnowsPropNode = new Promise((resolve) => rnsClient.on('announce', (a) => { if (crypto.bytesToHex(a.destination_hash) === crypto.bytesToHex(propNode.destination.hash)) resolve(); }));
+  propNode.announce();
+  await clientKnowsPropNode;
+
+  const propNodeOut = new Destination(rnsClient, propNodeIdentity, Destination.OUT, Destination.SINGLE, 'lxmf', 'propagation');
+  const link = new Link(rnsClient, propNodeOut);
+  await new Promise((resolve) => link.once('established', resolve));
+
+  // Without identify(), the handler has no identity to derive a delivery
+  // destination hash from — matches message_get_request()'s first check.
+  const unidentifiedResponse = await link.request('/get', [null, null]);
+  assert.equal(unidentifiedResponse, 0xf0);
+
+  link.identify(clientIdentity);
+
+  // Seed the store directly with one small and one large message addressed
+  // to this client (bypassing propagateLXMF()'s Resource upload — this test
+  // is only exercising the download/list side).
+  const smallEnvelope = propagation.build_propagated_envelope(clientSelf.hash, new Uint8Array(20), clientIdentity.public, clientIdentity.ratchetPublic);
+  const bigEnvelope = propagation.build_propagated_envelope(clientSelf.hash, new Uint8Array(4000), clientIdentity.public, clientIdentity.ratchetPublic);
+  const smallId = propagation.propagated_transient_id(smallEnvelope);
+  const bigId = propagation.propagated_transient_id(bigEnvelope);
+  propNode.messages.set(crypto.bytesToHex(bigId), { destinationHash: clientSelf.hash, envelope: bigEnvelope, stamp: new Uint8Array(32) });
+  propNode.messages.set(crypto.bytesToHex(smallId), { destinationHash: clientSelf.hash, envelope: smallEnvelope, stamp: new Uint8Array(32) });
+
+  const listing = await link.request('/get', [null, null]);
+  assert.equal(listing.length, 2);
+  assert.equal(crypto.bytesToHex(listing[0]), crypto.bytesToHex(smallId), 'smallest message listed first, matching message_get_request()\'s sort');
+
+  // A 1kb transfer limit fits the small message but not the big one, so the
+  // big one is skipped rather than truncated.
+  const fetched = await link.request('/get', [[smallId, bigId], null, 1]);
+  assert.equal(fetched.length, 1);
+  assert.deepEqual(Array.from(fetched[0]), Array.from(smallEnvelope));
+
+  link.close();
+});
+
 // --- LXStamper-compatible proof-of-work admission stamps ---
 
 test('stamp_workblock matches LXStamper.stamp_workblock byte-for-byte', () => {

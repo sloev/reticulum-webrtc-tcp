@@ -99,6 +99,69 @@ test('announce -> encrypted send -> decrypt works end to end over a loopback int
   assert.equal(await received, 'hello world');
 });
 
+test('announce() rotates the ratchet after RATCHET_INTERVAL and retains the old one for decryption, matching RNS.Destination.rotate_ratchets()', async () => {
+  const rnsA = new Reticulum();
+  const rnsB = new Reticulum();
+  class Bridge extends Interface {
+    connect() {}
+    sendData(data) { setTimeout(() => this.other.rns.onPacketReceived(data, this.other), 0); }
+  }
+  const ifaceA = new Bridge('A');
+  const ifaceB = new Bridge('B');
+  ifaceA.other = ifaceB;
+  ifaceB.other = ifaceA;
+  rnsA.addInterface(ifaceA);
+  rnsB.addInterface(ifaceB);
+
+  const identityB = Identity.create();
+  const destB = new Destination(rnsB, identityB, Destination.IN, Destination.SINGLE, 'test', 'ratchet');
+  const destHex = crypto.bytesToHex(destB.hash);
+
+  const aGotAnnounce1 = new Promise((resolve) => rnsA.once('announce', resolve));
+  destB.announce();
+  await aGotAnnounce1;
+  const ratchetBefore = rnsA.identities.get(destHex).ratchet;
+  assert.equal(destB.ratchets.length, 1, 'no rotation before RATCHET_INTERVAL elapses');
+
+  // Back-date the newest ratchet's timestamp so the next announce rotates.
+  destB.latestRatchetTime = Date.now() - Destination.RATCHET_INTERVAL_MS - 1;
+  const aGotAnnounce2 = new Promise((resolve) => rnsA.once('announce', resolve));
+  destB.announce();
+  await aGotAnnounce2;
+  const ratchetAfter = rnsA.identities.get(destHex).ratchet;
+
+  assert.equal(destB.ratchets.length, 2, 'the old ratchet is retained after rotation');
+  assert.notEqual(crypto.bytesToHex(ratchetAfter), crypto.bytesToHex(ratchetBefore), 'the re-announce advertises a fresh ratchet');
+
+  const outDest = new Destination(rnsA, identityB, Destination.OUT, Destination.SINGLE, 'test', 'ratchet');
+  outDest.hash = destB.hash;
+
+  // A sender still holding the pre-rotation announce encrypts against the
+  // old ratchet — the retained key must decrypt it.
+  rnsA.identities.set(destHex, { public_key: identityB.public, ratchet: ratchetBefore });
+  const gotStale = new Promise((resolve) => destB.once('packet', (e) => resolve(new TextDecoder().decode(e.data))));
+  outDest.send(new TextEncoder().encode('stale-ratchet message'));
+  assert.equal(await gotStale, 'stale-ratchet message');
+
+  // And a sender with the fresh announce works as usual.
+  rnsA.identities.set(destHex, { public_key: identityB.public, ratchet: ratchetAfter });
+  const gotFresh = new Promise((resolve) => destB.once('packet', (e) => resolve(new TextDecoder().decode(e.data))));
+  outDest.send(new TextEncoder().encode('fresh-ratchet message'));
+  assert.equal(await gotFresh, 'fresh-ratchet message');
+});
+
+test('the retained ratchet list trims at RATCHET_COUNT, matching RNS.Destination._clean_ratchets()', () => {
+  const rns = new Reticulum();
+  rns.addInterface(new (class extends Interface { connect() {} sendData() {} })('noop'));
+  const dest = new Destination(rns, Identity.create(), Destination.IN, Destination.SINGLE, 'test', 'trim');
+
+  for (let i = 0; i < Destination.RATCHET_COUNT + 20; i++) {
+    dest.latestRatchetTime = Date.now() - Destination.RATCHET_INTERVAL_MS - 1;
+    dest._rotateRatchets();
+  }
+  assert.equal(dest.ratchets.length, Destination.RATCHET_COUNT);
+});
+
 // --- RNS.Link: ground truth captured from a real rns.Link handshake between
 // a fixed test identity (destination owner/responder) and fixed ephemeral
 // link keys (initiator X25519 = 0x11*32, initiator Ed25519 seed = 0x22*32,
@@ -575,14 +638,19 @@ test('Link.sendResource() splits a payload bigger than one segment into multiple
   const responderLink = await responderLinkPromise;
   await new Promise((resolve) => (responderLink.status === Link.ACTIVE ? resolve() : responderLink.once('established', resolve)));
 
-  // Bigger than two full segments, forcing at least 3 segments — built from
-  // several smaller randomBytes() calls, since crypto.getRandomValues()
-  // (which crypto.randomBytes() wraps) rejects requests over 64KiB.
-  const payload = crypto.concat(crypto.randomBytes(60000), crypto.randomBytes(60000), crypto.randomBytes(1000));
+  // Bigger than two full segments (RESOURCE_SEGMENT_MAX_SIZE = 1MiB-1,
+  // matching RNS.Resource.MAX_EFFICIENT_SIZE), forcing 3 segments — built
+  // from several smaller randomBytes() calls, since crypto.getRandomValues()
+  // (which crypto.randomBytes() wraps) rejects requests over 64KiB. Random
+  // bytes keep every segment incompressible, so part counts stay put.
+  const chunks = [];
+  for (let i = 0; i < 33; i++) chunks.push(crypto.randomBytes(64000));
+  chunks.push(crypto.randomBytes(1000));
+  const payload = crypto.concat(...chunks);
   assert.ok(payload.length > protocol.RESOURCE_SEGMENT_MAX_SIZE * 2);
 
   const responderGot = new Promise((resolve) => responderLink.once('resource', resolve));
-  const sendPromise = initiatorLink.sendResource(payload);
+  const sendPromise = initiatorLink.sendResource(payload, { timeout: 120000 });
 
   const received = await responderGot;
   assert.equal(crypto.bytesToHex(received), crypto.bytesToHex(payload));
@@ -643,6 +711,118 @@ test('Link.sendResource()\'s receive window grows round over round, matching RNS
   for (let i = 1; i < observedWindows.length; i++) {
     assert.ok(observedWindows[i] >= observedWindows[i - 1], `window shrank unexpectedly: ${observedWindows}`);
   }
+
+  initiatorLink.close();
+});
+
+test('a Resource transfer recovers from dropped part packets via retries, shrinking the window, matching RNS.Resource\'s receiver watchdog', async () => {
+  const rnsA = new Reticulum();
+  const rnsB = new Reticulum();
+
+  // Drops the first `dropCount` RESOURCE part packets outright — the
+  // receiver's retry timer must notice the unanswered request, shrink its
+  // window, and re-request the missing parts.
+  let dropCount = 6;
+  class LossyBridge extends Interface {
+    connect() {}
+    sendData(data) {
+      const unpacked = protocol.packet_unpack(data);
+      if (unpacked && unpacked.context === protocol.CONTEXT_RESOURCE && dropCount > 0) {
+        dropCount--;
+        return;
+      }
+      setTimeout(() => this.other.rns.onPacketReceived(data, this.other), 0);
+    }
+  }
+  const ifaceA = new LossyBridge('A');
+  const ifaceB = new LossyBridge('B');
+  ifaceA.other = ifaceB;
+  ifaceB.other = ifaceA;
+  rnsA.addInterface(ifaceA);
+  rnsB.addInterface(ifaceB);
+
+  const identityB = Identity.create();
+  const destB = new Destination(rnsB, identityB, Destination.IN, Destination.SINGLE, 'test', 'retry');
+  const responderLinkPromise = new Promise((resolve) => destB.on('link', resolve));
+  const outDest = new Destination(rnsA, identityB, Destination.OUT, Destination.SINGLE, 'test', 'retry');
+  outDest.hash = destB.hash;
+  const initiatorLink = new Link(rnsA, outDest);
+  await new Promise((resolve) => initiatorLink.once('established', resolve));
+  const responderLink = await responderLinkPromise;
+  await new Promise((resolve) => (responderLink.status === Link.ACTIVE ? resolve() : responderLink.once('established', resolve)));
+
+  const payload = crypto.randomBytes(protocol.RESOURCE_SDU * 12);
+
+  let sawShrink = false;
+  const originalTick = responderLink._resourceRetryTick.bind(responderLink);
+  responderLink._resourceRetryTick = (hex) => {
+    const incoming = responderLink._incomingResources.get(hex);
+    const before = incoming ? incoming.window : null;
+    originalTick(hex);
+    if (incoming && before !== null && incoming.window < before) sawShrink = true;
+  };
+
+  const responderGot = new Promise((resolve) => responderLink.once('resource', resolve));
+  const sendPromise = initiatorLink.sendResource(payload, { timeout: 30000 });
+  const received = await responderGot;
+  await sendPromise;
+
+  assert.equal(crypto.bytesToHex(received), crypto.bytesToHex(payload), 'transfer completed despite dropped parts');
+  assert.equal(dropCount, 0, 'the lossy bridge really dropped packets');
+  assert.equal(sawShrink, true, 'a retry shrank the request window');
+
+  initiatorLink.close();
+});
+
+test('a Resource transfer whose parts never arrive fails after RESOURCE_MAX_RETRIES, matching RNS.Resource.cancel()', async () => {
+  const rnsA = new Reticulum();
+  const rnsB = new Reticulum();
+
+  // Drops every RESOURCE part packet: the transfer can never complete and
+  // the receiver must eventually give up and discard its state.
+  class DeadBridge extends Interface {
+    connect() {}
+    sendData(data) {
+      const unpacked = protocol.packet_unpack(data);
+      if (unpacked && unpacked.context === protocol.CONTEXT_RESOURCE) return;
+      setTimeout(() => this.other.rns.onPacketReceived(data, this.other), 0);
+    }
+  }
+  const ifaceA = new DeadBridge('A');
+  const ifaceB = new DeadBridge('B');
+  ifaceA.other = ifaceB;
+  ifaceB.other = ifaceA;
+  rnsA.addInterface(ifaceA);
+  rnsB.addInterface(ifaceB);
+
+  const identityB = Identity.create();
+  const destB = new Destination(rnsB, identityB, Destination.IN, Destination.SINGLE, 'test', 'deadretry');
+  const responderLinkPromise = new Promise((resolve) => destB.on('link', resolve));
+  const outDest = new Destination(rnsA, identityB, Destination.OUT, Destination.SINGLE, 'test', 'deadretry');
+  outDest.hash = destB.hash;
+  const initiatorLink = new Link(rnsA, outDest);
+  await new Promise((resolve) => initiatorLink.once('established', resolve));
+  const responderLink = await responderLinkPromise;
+  await new Promise((resolve) => (responderLink.status === Link.ACTIVE ? resolve() : responderLink.once('established', resolve)));
+
+  initiatorLink.sendResource(crypto.randomBytes(protocol.RESOURCE_SDU * 3), { timeout: 5000 }).catch(() => {});
+
+  // Wait for the receiver's state to appear, then burn through its retry
+  // budget by back-dating the deadline inputs and ticking directly, instead
+  // of waiting for real (seconds-long) retry timers.
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  const [hex, incoming] = responderLink._incomingResources.entries().next().value ?? [];
+  assert.ok(incoming, 'receiver created incoming-resource state from the advertisement');
+
+  while (responderLink._incomingResources.has(hex)) {
+    incoming.lastActivity = 0;
+    incoming.reqSentAt = 0;
+    clearTimeout(incoming.retryTimer);
+    responderLink._resourceRetryTick(hex);
+  }
+
+  assert.equal(responderLink._incomingResources.has(hex), false, 'receiver discarded the transfer after retries ran out');
+  assert.ok(incoming.retriesLeft <= 0, `retry budget was spent (retriesLeft=${incoming.retriesLeft})`);
 
   initiatorLink.close();
 });
@@ -712,53 +892,37 @@ test('a Resource transfer whose advertisement carries a truncated hashmap (fewer
   const responderLink = await responderLinkPromise;
   await new Promise((resolve) => (responderLink.status === Link.ACTIVE ? resolve() : responderLink.once('established', resolve)));
 
-  // Build a resource "by hand" with a hashmap deliberately truncated to
-  // fewer entries than totalParts, simulating a real RNS sender whose
-  // segment needs more parts than fit in one advertisement — then confirm
-  // this stack's own receiver correctly requests and applies an HMU packet
-  // to complete it, exactly like it would with a real Python sender.
-  const payload = crypto.randomBytes(protocol.RESOURCE_SDU * 6);
-  const prepared = protocol.resource_prepare(payload, (pt) => protocol.link_encrypt(initiatorLink.derivedKey, pt));
-  const truncateTo = 3;
-  assert.ok(prepared.totalParts > truncateTo, 'test payload must need more parts than the simulated truncation point');
+  // A payload needing more parts than fit in one advertisement's hashmap
+  // (RESOURCE_HASHMAP_MAX_LEN = 74 at default MTU). Random bytes are
+  // incompressible, so the part count stays above the threshold after the
+  // sender's compress-if-beneficial attempt. The sender truncates the
+  // advertised hashmap and answers the receiver's hashmap-exhausted request
+  // with an HMU packet; the receiver applies it and completes the transfer.
+  const payload = crypto.randomBytes(protocol.RESOURCE_SDU * (protocol.RESOURCE_HASHMAP_MAX_LEN + 10));
 
-  const advPayload = protocol.build_resource_advertisement({
-    transferSize: prepared.transferSize, dataSize: prepared.dataSize, totalParts: prepared.totalParts,
-    resourceHash: prepared.resourceHash, randomHash: prepared.randomHash,
-    hashmap: prepared.hashmap.slice(0, truncateTo * protocol.RESOURCE_MAPHASH_LEN),
-  });
-  const advPacket = protocol.build_link_packet(initiatorLink.linkId, initiatorLink.derivedKey, advPayload, protocol.CONTEXT_RESOURCE_ADV);
-
-  const responderGotResource = new Promise((resolve) => responderLink.once('resource', resolve));
-
-  // Manually stand in for the sender: serve part requests, and — since our
-  // hand-built advertisement only advertised `truncateTo` entries — answer
-  // the hashmap-exhausted request with the rest of the real hashmap via HMU.
-  // REQUEST packets flow responder (B) -> initiator (A), so they're
-  // intercepted on ifaceB's outgoing side; replies are sent via rnsA.sendData
-  // (A's own broadcast path, same as the advertisement above), which the
-  // Bridge delivers to B, exactly like a real sender's traffic would.
-  const originalBridgeSendData = Bridge.prototype.sendData;
-  ifaceB.sendData = function (data) {
+  // Intercept A's outgoing traffic to confirm the advertisement really was
+  // truncated and an HMU packet really was sent — not just that the
+  // transfer completed.
+  let advertisedEntries = null;
+  let hmuSent = false;
+  const originalSendData = ifaceA.sendData.bind(ifaceA);
+  ifaceA.sendData = (data) => {
     const unpacked = protocol.packet_unpack(data);
-    if (unpacked && unpacked.context === protocol.CONTEXT_RESOURCE_REQ) {
-      const plaintext = protocol.link_decrypt(initiatorLink.derivedKey, unpacked.data);
-      const req = protocol.parse_resource_request(plaintext);
-      for (const wantedHash of req.requestedHashes) {
-        const idx = prepared.hashmapEntries.findIndex((h) => crypto.bytesToHex(h) === crypto.bytesToHex(wantedHash));
-        if (idx !== -1) rnsA.sendData(protocol.build_resource_part_packet(initiatorLink.linkId, prepared.parts[idx]));
-      }
-      if (req.hashmapExhausted) {
-        const hmuPayload = protocol.build_resource_hmu(prepared.resourceHash, 1, prepared.hashmap.slice(truncateTo * protocol.RESOURCE_MAPHASH_LEN));
-        rnsA.sendData(protocol.build_link_packet(initiatorLink.linkId, initiatorLink.derivedKey, hmuPayload, protocol.CONTEXT_RESOURCE_HMU));
-      }
-      return;
+    if (unpacked && unpacked.context === protocol.CONTEXT_RESOURCE_ADV) {
+      const adv = protocol.parse_resource_advertisement(protocol.link_decrypt(initiatorLink.derivedKey, unpacked.data));
+      advertisedEntries = adv.hashmap.length / protocol.RESOURCE_MAPHASH_LEN;
     }
-    originalBridgeSendData.call(this, data);
+    if (unpacked && unpacked.context === protocol.CONTEXT_RESOURCE_HMU) hmuSent = true;
+    originalSendData(data);
   };
 
-  rnsA.sendData(advPacket);
+  const responderGotResource = new Promise((resolve) => responderLink.once('resource', resolve));
+  const sendPromise = initiatorLink.sendResource(payload);
   const received = await responderGotResource;
+  await sendPromise;
+
+  assert.equal(advertisedEntries, protocol.RESOURCE_HASHMAP_MAX_LEN, 'advertisement hashmap is truncated to RESOURCE_HASHMAP_MAX_LEN entries');
+  assert.equal(hmuSent, true, 'sender answered the hashmap-exhausted request with an HMU packet');
   assert.equal(crypto.bytesToHex(received), crypto.bytesToHex(payload));
 
   initiatorLink.close();

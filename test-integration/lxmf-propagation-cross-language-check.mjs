@@ -1,18 +1,16 @@
-// Manual, throwaway check: this JS stack's propagateLXMF() uploads a real
-// LXMF message to an actual LXMF.LXMRouter propagation node (the reference
-// implementation, with enable_propagation() — not this repo's own
-// PropagationNode), over a real RNS.Link + Resource transfer, with a real
-// proof-of-work admission stamp computed at the node's own required cost.
-// Confirms the real propagation node accepts, validates the stamp, and
-// stores the message under the same transient_id this JS stack computes
-// independently — genuine upload-side interop with the reference
-// implementation, not just this project's own PropagationNode.
+// Verifies propagateLXMF()/syncFromRealPropagationNode() (shared/rns/
+// propagation.js) against an actual LXMF.LXMRouter propagation node (the
+// reference implementation, enable_propagation() — not this project's own
+// PropagationNode): uploads a real LXMF message over a real RNS.Link +
+// Resource transfer with a real proof-of-work admission stamp computed at
+// the node's own required cost, confirming it's accepted and stored under
+// the same transient_id this stack computes independently; then downloads
+// it back using Link.identify() to prove the recipient's identity exactly
+// like a real LXMRouter client does, fetching over the node's real "/get"
+// request path and decrypting/parsing it.
 //
-// Also confirms the download/sync half now works too:
-// syncFromRealPropagationNode() (shared/rns/propagation.js) uses
-// Link.identify() to prove the recipient's identity to the node exactly
-// like a real LXMRouter client does, then fetches the same message back
-// over the node's real "/get" request path and decrypts/parses it.
+// Run with: PYLIBS=/path/to/site-packages npm run test:integration:lxmf-propagation
+// (requires: pip install --target=$PYLIBS rns lxmf)
 import { spawn } from 'node:child_process';
 import { rmSync } from 'node:fs';
 import { Reticulum, Identity, Destination, Link } from '../shared/rns/index.js';

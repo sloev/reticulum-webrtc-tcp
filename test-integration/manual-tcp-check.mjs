@@ -1,6 +1,11 @@
-// Manual, throwaway check: spawn a real Python RNS node, connect it to our
-// real TCP gateway over actual TCP+HDLC, and confirm an announce it sends
-// gets validated by our JS Reticulum stack.
+// Manual check: spawn a real Python RNS node, connect it to this project's
+// TCP gateway over actual TCP+HDLC, and confirm an announce it sends gets
+// validated by this stack's Reticulum implementation. A minimal smoke test;
+// the other test-integration/*-cross-language-check.mjs scripts cover this
+// wire format more thoroughly.
+//
+// Run with: PYLIBS=/path/to/site-packages node test-integration/manual-tcp-check.mjs
+// (requires: pip install --target=$PYLIBS rns)
 import { spawn } from 'node:child_process';
 import { Reticulum, Identity, Destination } from '../shared/rns/index.js';
 import { createTCPGateway } from '../node/tcp-gateway.js';

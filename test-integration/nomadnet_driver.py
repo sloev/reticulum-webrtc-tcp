@@ -22,10 +22,14 @@ constructor itself runs a blocking job loop once initialized, so this driver:
      means for the interop claim).
 
 Commands (stdin, one JSON object per line):
-  {"cmd": "send_to", "dest_hash": "<hex>", "title": "...", "content": "..."}
+  {"cmd": "send_to", "dest_hash": "<hex>", "title": "...", "content": "..."} — OPPORTUNISTIC, direct
+  {"cmd": "set_propagation_node", "dest_hash": "<hex>"} — message_router.set_outbound_propagation_node()
+  {"cmd": "sync"} — message_router.request_messages_from_propagation_node(), same call NomadNet's own "Sync now" menu item makes
+  {"cmd": "send_propagated", "dest_hash": "<hex>", "title": "...", "content": "..."} — routes via the configured propagation node instead of direct delivery
 
 Events (stdout, one JSON object per line):
   {"event": "ready", "dest_hash": "<hex>", "identity_hash": "<hex>", "public_key": "<hex>", "display_name": "..."}
+  {"event": "sync_state", "state": N} — message_router.propagation_transfer_state after each change (LXMRouter.PR_*)
 """
 import sys
 import json
@@ -56,7 +60,24 @@ def main():
         except Exception:
             return
 
-        if cmd.get("cmd") == "send_to":
+        try:
+            dispatch_command(cmd)
+        except Exception as e:
+            import traceback
+            emit("command_error", cmd=cmd.get("cmd"), error=str(e), traceback=traceback.format_exc())
+
+    def dispatch_command(cmd):
+        if cmd.get("cmd") == "debug_status":
+            emit(
+                "debug_status",
+                pending_outbound=len(app.message_router.pending_outbound),
+                pending_deferred=len(app.message_router.pending_deferred_stamps),
+                processing_count=app.message_router.processing_count,
+                stamp_gen_locked=app.message_router.stamp_gen_lock.locked(),
+                outbound_propagation_node=app.message_router.outbound_propagation_node.hex() if app.message_router.outbound_propagation_node else None,
+                outbound_link_status=app.message_router.outbound_propagation_link.status if app.message_router.outbound_propagation_link else None,
+            )
+        elif cmd.get("cmd") == "send_to":
             dest_hash = bytes.fromhex(cmd["dest_hash"])
             peer_identity = RNS.Identity.recall(dest_hash)
             if peer_identity is None:
@@ -69,6 +90,38 @@ def main():
                 desired_method=LXMF.LXMessage.OPPORTUNISTIC,
             )
             app.message_router.handle_outbound(message)
+        elif cmd.get("cmd") == "set_propagation_node":
+            dest_hash = bytes.fromhex(cmd["dest_hash"])
+            app.message_router.set_outbound_propagation_node(dest_hash)
+        elif cmd.get("cmd") == "sync":
+            app.message_router.request_messages_from_propagation_node(app.identity, LXMF.LXMRouter.PR_ALL_MESSAGES)
+        elif cmd.get("cmd") == "send_propagated":
+            dest_hash = bytes.fromhex(cmd["dest_hash"])
+            peer_identity = RNS.Identity.recall(dest_hash)
+            if peer_identity is None:
+                emit("send_failed", reason="identity not known")
+                return
+            peer_dest = RNS.Destination(peer_identity, RNS.Destination.OUT, RNS.Destination.SINGLE, LXMF.APP_NAME, "delivery")
+            message = LXMF.LXMessage(
+                peer_dest, app.lxmf_destination,
+                cmd.get("content", ""), cmd.get("title", ""),
+                desired_method=LXMF.LXMessage.PROPAGATED,
+            )
+            # Real LXMessage defaults defer_propagation_stamp=True: handle_outbound()
+            # queues it in pending_deferred_stamps rather than pending_outbound, and
+            # the real router's own background job loop (process_deferred_stamps(),
+            # JOB_STAMPS_INTERVAL) generates the actual LXStamper proof-of-work before
+            # it becomes sendable — the same path NomadNet's own compose flow uses.
+            app.message_router.handle_outbound(message)
+
+    def poll_sync_state():
+        last = None
+        while True:
+            state = app.message_router.propagation_transfer_state
+            if state != last:
+                emit("sync_state", state=state)
+                last = state
+            time.sleep(0.1)
 
     def stdin_loop():
         # Poll for the attributes NomadNetworkApp's __init__ sets once its
@@ -84,6 +137,8 @@ def main():
             public_key=app.identity.get_public_key().hex(),
             display_name=app.get_display_name(),
         )
+
+        threading.Thread(target=poll_sync_state, daemon=True).start()
 
         for line in sys.stdin:
             line = line.strip()
