@@ -652,6 +652,118 @@ test('Link.sendResource()\'s receive window grows round over round, matching RNS
   initiatorLink.close();
 });
 
+test('a Resource transfer recovers from dropped part packets via retries, shrinking the window, matching RNS.Resource\'s receiver watchdog', async () => {
+  const rnsA = new Reticulum();
+  const rnsB = new Reticulum();
+
+  // Drops the first `dropCount` RESOURCE part packets outright — the
+  // receiver's retry timer must notice the unanswered request, shrink its
+  // window, and re-request the missing parts.
+  let dropCount = 6;
+  class LossyBridge extends Interface {
+    connect() {}
+    sendData(data) {
+      const unpacked = protocol.packet_unpack(data);
+      if (unpacked && unpacked.context === protocol.CONTEXT_RESOURCE && dropCount > 0) {
+        dropCount--;
+        return;
+      }
+      setTimeout(() => this.other.rns.onPacketReceived(data, this.other), 0);
+    }
+  }
+  const ifaceA = new LossyBridge('A');
+  const ifaceB = new LossyBridge('B');
+  ifaceA.other = ifaceB;
+  ifaceB.other = ifaceA;
+  rnsA.addInterface(ifaceA);
+  rnsB.addInterface(ifaceB);
+
+  const identityB = Identity.create();
+  const destB = new Destination(rnsB, identityB, Destination.IN, Destination.SINGLE, 'test', 'retry');
+  const responderLinkPromise = new Promise((resolve) => destB.on('link', resolve));
+  const outDest = new Destination(rnsA, identityB, Destination.OUT, Destination.SINGLE, 'test', 'retry');
+  outDest.hash = destB.hash;
+  const initiatorLink = new Link(rnsA, outDest);
+  await new Promise((resolve) => initiatorLink.once('established', resolve));
+  const responderLink = await responderLinkPromise;
+  await new Promise((resolve) => (responderLink.status === Link.ACTIVE ? resolve() : responderLink.once('established', resolve)));
+
+  const payload = crypto.randomBytes(protocol.RESOURCE_SDU * 12);
+
+  let sawShrink = false;
+  const originalTick = responderLink._resourceRetryTick.bind(responderLink);
+  responderLink._resourceRetryTick = (hex) => {
+    const incoming = responderLink._incomingResources.get(hex);
+    const before = incoming ? incoming.window : null;
+    originalTick(hex);
+    if (incoming && before !== null && incoming.window < before) sawShrink = true;
+  };
+
+  const responderGot = new Promise((resolve) => responderLink.once('resource', resolve));
+  const sendPromise = initiatorLink.sendResource(payload, { timeout: 30000 });
+  const received = await responderGot;
+  await sendPromise;
+
+  assert.equal(crypto.bytesToHex(received), crypto.bytesToHex(payload), 'transfer completed despite dropped parts');
+  assert.equal(dropCount, 0, 'the lossy bridge really dropped packets');
+  assert.equal(sawShrink, true, 'a retry shrank the request window');
+
+  initiatorLink.close();
+});
+
+test('a Resource transfer whose parts never arrive fails after RESOURCE_MAX_RETRIES, matching RNS.Resource.cancel()', async () => {
+  const rnsA = new Reticulum();
+  const rnsB = new Reticulum();
+
+  // Drops every RESOURCE part packet: the transfer can never complete and
+  // the receiver must eventually give up and discard its state.
+  class DeadBridge extends Interface {
+    connect() {}
+    sendData(data) {
+      const unpacked = protocol.packet_unpack(data);
+      if (unpacked && unpacked.context === protocol.CONTEXT_RESOURCE) return;
+      setTimeout(() => this.other.rns.onPacketReceived(data, this.other), 0);
+    }
+  }
+  const ifaceA = new DeadBridge('A');
+  const ifaceB = new DeadBridge('B');
+  ifaceA.other = ifaceB;
+  ifaceB.other = ifaceA;
+  rnsA.addInterface(ifaceA);
+  rnsB.addInterface(ifaceB);
+
+  const identityB = Identity.create();
+  const destB = new Destination(rnsB, identityB, Destination.IN, Destination.SINGLE, 'test', 'deadretry');
+  const responderLinkPromise = new Promise((resolve) => destB.on('link', resolve));
+  const outDest = new Destination(rnsA, identityB, Destination.OUT, Destination.SINGLE, 'test', 'deadretry');
+  outDest.hash = destB.hash;
+  const initiatorLink = new Link(rnsA, outDest);
+  await new Promise((resolve) => initiatorLink.once('established', resolve));
+  const responderLink = await responderLinkPromise;
+  await new Promise((resolve) => (responderLink.status === Link.ACTIVE ? resolve() : responderLink.once('established', resolve)));
+
+  initiatorLink.sendResource(crypto.randomBytes(protocol.RESOURCE_SDU * 3), { timeout: 5000 }).catch(() => {});
+
+  // Wait for the receiver's state to appear, then burn through its retry
+  // budget by back-dating the deadline inputs and ticking directly, instead
+  // of waiting for real (seconds-long) retry timers.
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  const [hex, incoming] = responderLink._incomingResources.entries().next().value ?? [];
+  assert.ok(incoming, 'receiver created incoming-resource state from the advertisement');
+
+  while (responderLink._incomingResources.has(hex)) {
+    incoming.lastActivity = 0;
+    incoming.reqSentAt = 0;
+    clearTimeout(incoming.retryTimer);
+    responderLink._resourceRetryTick(hex);
+  }
+
+  assert.equal(responderLink._incomingResources.has(hex), false, 'receiver discarded the transfer after retries ran out');
+  assert.ok(incoming.retriesLeft <= 0, `retry budget was spent (retriesLeft=${incoming.retriesLeft})`);
+
+  initiatorLink.close();
+});
+
 test('resource_prepare() throws if a single segment alone would still need more than RESOURCE_MAX_PARTS parts', () => {
   // Link.sendResource() always chops at RESOURCE_SEGMENT_MAX_SIZE, which is
   // sized so no chunk it produces can ever hit this — so this guard is only

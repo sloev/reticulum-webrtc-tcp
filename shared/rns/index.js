@@ -922,6 +922,12 @@ export class Link extends EventEmitter {
             reqSentAt: 0,
             rttRxdBytes: 0,
             rttRxdBytesAtPartReq: 0,
+            // Retry state — matches RNS.Resource's receiver-side watchdog
+            // (see _resourceRetryTick()).
+            retriesLeft: protocol.RESOURCE_MAX_RETRIES,
+            partTimeoutFactor: protocol.RESOURCE_PART_TIMEOUT_FACTOR,
+            lastActivity: Date.now(),
+            retryTimer: null,
         });
 
         this._requestNextResourceParts(resourceHashHex);
@@ -938,6 +944,11 @@ export class Link extends EventEmitter {
         const resourceHashHex = crypto.bytesToHex(resourceHash);
         const incoming = this._incomingResources.get(resourceHashHex);
         if (!incoming) return;
+
+        // Matches RNS.Resource.hashmap_update_packet(): an HMU counts as
+        // activity and refills the retry budget.
+        incoming.lastActivity = Date.now();
+        incoming.retriesLeft = protocol.RESOURCE_MAX_RETRIES;
 
         const base = segment * protocol.RESOURCE_HASHMAP_MAX_LEN;
         for (let i = 0; i * protocol.RESOURCE_MAPHASH_LEN < hashmap.length; i++) {
@@ -980,6 +991,67 @@ export class Link extends EventEmitter {
         const requestPayload = protocol.build_resource_request(incoming.resourceHash, crypto.concat(...requested), { lastMapHash });
         const requestPacket = protocol.build_link_packet(this.linkId, this.derivedKey, requestPayload, protocol.CONTEXT_RESOURCE_REQ);
         this.rns.sendData(requestPacket);
+        this._armResourceRetry(resourceHashHex);
+    }
+
+    // The deadline after which an unanswered part request is retried —
+    // matches RNS.Resource.__watchdog_job()'s receiver branch: measured from
+    // the last received part (or the request, whichever is later), scaled by
+    // part_timeout_factor, plus a grace period and extra patience per used
+    // retry. Python scales by an estimated in-flight rate (update_eifr());
+    // this port scales by the link RTT, floored at 25ms so a local-loopback
+    // link doesn't retry spuriously.
+    _resourceRetryDeadline(incoming) {
+        const rttMs = Math.max((this.rtt || 0) * 1000, 25);
+        const retriesUsed = protocol.RESOURCE_MAX_RETRIES - incoming.retriesLeft;
+        return Math.max(incoming.lastActivity, incoming.reqSentAt)
+            + incoming.partTimeoutFactor * rttMs
+            + protocol.RESOURCE_RETRY_GRACE_MS
+            + retriesUsed * protocol.RESOURCE_PER_RETRY_DELAY_MS;
+    }
+
+    _armResourceRetry(resourceHashHex) {
+        const incoming = this._incomingResources.get(resourceHashHex);
+        if (!incoming) return;
+        clearTimeout(incoming.retryTimer);
+        const delay = Math.max(this._resourceRetryDeadline(incoming) - Date.now(), 10);
+        incoming.retryTimer = setTimeout(() => this._resourceRetryTick(resourceHashHex), delay);
+        if (typeof incoming.retryTimer.unref === 'function') incoming.retryTimer.unref();
+    }
+
+    // Matches the timeout branch of RNS.Resource.__watchdog_job() (receiver
+    // side): shrink the window (and window_max, twice if it has drifted more
+    // than window_flexibility above the window), spend a retry, and re-send
+    // the request for whatever is still missing; cancel the transfer once
+    // retries run out.
+    _resourceRetryTick(resourceHashHex) {
+        const incoming = this._incomingResources.get(resourceHashHex);
+        if (!incoming) return;
+
+        if (Date.now() < this._resourceRetryDeadline(incoming)) {
+            this._armResourceRetry(resourceHashHex);
+            return;
+        }
+
+        if (incoming.retriesLeft <= 0) {
+            clearTimeout(incoming.retryTimer);
+            this._incomingResources.delete(resourceHashHex);
+            return;
+        }
+
+        if (incoming.window > incoming.windowMin) {
+            incoming.window -= 1;
+            if (incoming.windowMax > incoming.windowMin) {
+                incoming.windowMax -= 1;
+                if ((incoming.windowMax - incoming.window) > (protocol.RESOURCE_WINDOW_FLEXIBILITY - 1)) {
+                    incoming.windowMax -= 1;
+                }
+            }
+        }
+
+        incoming.retriesLeft -= 1;
+        incoming.waitingForHmu = false;
+        this._requestNextResourceParts(resourceHashHex);
     }
 
     // Sender side: the receiver requested some parts of a resource we
@@ -1047,6 +1119,14 @@ export class Link extends EventEmitter {
                 }
             }
             if (matchedIndex === -1) continue;
+
+            // Matches RNS.Resource.receive_part(): every received part
+            // counts as activity, refills the retry budget, and (after the
+            // first response) relaxes the retry deadline's timeout factor.
+            incoming.lastActivity = Date.now();
+            incoming.retriesLeft = protocol.RESOURCE_MAX_RETRIES;
+            incoming.partTimeoutFactor = protocol.RESOURCE_PART_TIMEOUT_FACTOR_AFTER_RTT;
+
             if (incoming.parts[matchedIndex] !== null) return; // already have it
 
             incoming.parts[matchedIndex] = partData;
@@ -1073,9 +1153,8 @@ export class Link extends EventEmitter {
     // Grows the request window (and, if the measured transfer rate over
     // this round has been consistently fast or very slow, promotes/demotes
     // its ceiling) — matches RNS.Resource.receive_part()'s window-adaptation
-    // logic (RNS/Resource.py:900-924). Retry-driven window *shrinking* isn't
-    // implemented — this project's Resource has no per-part retry/timeout
-    // mechanism yet (see compliance.md).
+    // logic (RNS/Resource.py:900-924). The shrinking counterpart lives in
+    // _resourceRetryTick() above.
     _growResourceWindow(incoming) {
         if (incoming.window < incoming.windowMax) {
             incoming.window += 1;
@@ -1112,6 +1191,7 @@ export class Link extends EventEmitter {
     // verify it hashes to what was advertised, and — if it checks out —
     // emit it and send the sender a completion proof.
     _assembleResource(resourceHashHex, incoming) {
+        clearTimeout(incoming.retryTimer);
         this._incomingResources.delete(resourceHashHex);
 
         const cipherBlob = crypto.concat(...incoming.parts);
@@ -1441,6 +1521,9 @@ export class Link extends EventEmitter {
             pending.reject(new Error('Link closed before resource transfer completed'));
         }
         this._outgoingResources.clear();
+        for (const incoming of this._incomingResources.values()) {
+            clearTimeout(incoming.retryTimer);
+        }
         this._incomingResources.clear();
         this._resourceSegments.clear();
         for (const pending of this.pendingRequests.values()) {

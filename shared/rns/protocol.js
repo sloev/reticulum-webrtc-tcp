@@ -853,6 +853,19 @@ export const RESOURCE_RATE_FAST = (50 * 1000) / 8; // bytes/sec (50kbit/s)
 export const RESOURCE_RATE_VERY_SLOW = (2 * 1000) / 8; // bytes/sec (2kbit/s)
 export const RESOURCE_FAST_RATE_THRESHOLD = RESOURCE_WINDOW_MAX_SLOW - RESOURCE_WINDOW - 2;
 export const RESOURCE_VERY_SLOW_RATE_THRESHOLD = 2;
+// Receiver-side retry timing, matching RNS.Resource (Resource.py:126-135):
+// a part request that isn't fully answered within
+// part_timeout_factor * RTT (factor 4 before the first response, 2 after)
+// plus a grace period is re-sent with a smaller window, up to
+// RESOURCE_MAX_RETRIES times; each used retry adds PER_RETRY_DELAY of extra
+// patience. Python scales the deadline by an estimated in-flight rate
+// (Resource.update_eifr()); this port scales by the link RTT alone — see
+// Link._resourceRetryDeadline().
+export const RESOURCE_PART_TIMEOUT_FACTOR = 4;
+export const RESOURCE_PART_TIMEOUT_FACTOR_AFTER_RTT = 2;
+export const RESOURCE_MAX_RETRIES = 16;
+export const RESOURCE_RETRY_GRACE_MS = 250;
+export const RESOURCE_PER_RETRY_DELAY_MS = 500;
 
 export function resource_map_hash(part_data, random_hash) {
     return crypto.sha256(crypto.concat(part_data, random_hash)).slice(0, RESOURCE_MAPHASH_LEN);
