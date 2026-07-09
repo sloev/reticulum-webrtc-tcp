@@ -681,31 +681,45 @@ stored message down, validates its signature, and the node purges it once
 confirmed (3 consecutive runs). Committed as `e5e88be` (4b) and `4998527`
 (4a).
 
-**Known gap, root-caused but not fixable without modifying the real
-package**: 4a's NomadNet-send/JS-download direction never completes in
-this environment. Root cause, confirmed directly rather than assumed:
-`LXStamper.job_linux()` (the real, unmodified `lxmf` package's stamp
-generator, used unconditionally on Linux) forks `os.cpu_count()` worker
-processes via `multiprocessing.get_context("fork")` to search for a valid
-stamp in parallel. Inspecting `/proc/<pid>/stack` for those workers during
-a live run shows every one of them permanently parked in `futex_wait` —
-not computing at all, not merely slow. A minimal, isolated reproduction
-(a plain script with background threads, or a bare `RNS.Reticulum` +
-`LXMF.LXMRouter` with no real interface, calling `generate_stamp()`
-directly) completes in 1–5 seconds every time; only the full scenario —
-a real `NomadNetworkApp` with a real TCP interface, real Link
-establishment, and its own job-loop thread already running when
-`process_deferred_stamps()` forks the workers — reproduces the hang. This
-matches a well-known hazard of forking a multi-threaded process on
-Linux (a lock or resource held by a thread that doesn't exist in the
-child can leave the child unable to ever release it) that this specific
-sandboxed environment appears to trigger reliably where a bare-metal or
-conventionally-virtualized host might not. Nothing in this project's own
-code path is implicated — the same driver calling the same
-`message_router.handle_outbound()` real NomadNet's own UI calls is what
-deadlocks, and modifying `LXStamper`'s hardcoded fork behavior would mean
-testing against a patched package, defeating the point of this check. See
-README's Compliance table.
+**4a's NomadNet-send/JS-download direction — fixed.** An earlier pass
+diagnosed this direction's hang as an unfixable deadlock inside the real,
+unmodified `lxmf` package's own `LXStamper.job_linux()` fork()-based stamp
+generator. That diagnosis was wrong, and was disproven by verifying
+directly against the real `nomadnet` CLI entry point
+(`nomadnet.nomadnet:main()`), invoked with no modification: it completes
+`LXStamper`'s proof-of-work in a few seconds every time, no matter how
+many times it's run. The deadlock only reproduces when the app is driven
+by this project's own `test-integration/nomadnet_driver.py`, and only
+when that driver dispatches commands via a plain blocking
+`for line in sys.stdin: ...` loop.
+
+The mechanism: `_io.BufferedReader.readline()` holds an internal
+per-object lock for the duration of a blocked read (CPython releases the
+GIL for the underlying read syscall, but not that lock). `LXStamper.
+job_linux()` forks its worker pool via
+`multiprocessing.get_context("fork").Process(...)` from the router's own
+job-scheduler thread. If that fork lands while the driver's stdin-reading
+thread holds the buffered-reader lock, the forked child inherits the lock
+already held, with no thread in the child able to ever release it —
+confirmed live via `/proc/<pid>/stack` showing the worker processes
+permanently parked in `futex_wait`. This is a fork-safety hazard in this
+driver's own command-dispatch loop, not in the real `lxmf`/`nomadnet`
+packages.
+
+Fixed in `nomadnet_driver.py` by reading stdin via `select.select(...,
+0.1)` instead of a blocking readline loop, so the driver thread is never
+blocked inside the buffered reader's lock while another thread may fork.
+`propagation-node-nomadnet-interop-check.mjs` also had an independent,
+unrelated bug blocking this same direction: it waited for the real
+node's `propagation_entries` store count to reach `>= 2`, assuming the
+first (JS-uploaded) message was still present — but the real `LXMRouter`
+prunes an entry once a client has synced it, so the store's count drops
+back to 0 after NomadNet's sync in the first direction, and never reaches
+2. Fixed by tracking store keys instead of a raw count. With both fixes,
+`test:integration:propagation-nomadnet` passes both directions,
+end-to-end, against a real unmodified `LXMRouter` node and a real
+unmodified `nomadnet` client (3 consecutive runs). See README's
+Compliance table.
 
 Full regression after all four features: `npm test` (84/84), `npx vite
 build`, and the full `test:integration:*` set (including the two new
@@ -733,3 +747,4 @@ scripts) re-run clean.
 | 2026-07-09 | Part 1, Feature 3 | Ratchet rotation implemented (`Destination._rotateRatchets`/`saveRatchets`/`loadRatchets`, decrypt-fallback trying every retained ratchet). 84/84 unit tests pass (new rotation/trim/persistence tests); live `test:integration:lxmf` extended to confirm both a stale-ratchet and a fresh-ratchet message decrypt correctly against a real Python identity (3 consecutive runs). Committed as `f326ad5`. |
 | 2026-07-09 | Part 1, Feature 4 | Propagation-node/client interop closed on both fronts: `PropagationNode._onRealGetRequest()` makes this project's own node wire-compatible with a real LXMF client's sync protocol (committed as `e5e88be`), and a new live check confirms a real NomadNet client and this stack exchanging messages through a real external `LXMRouter` propagation node, with a real relay limitation (`transport_id` not rewritten when forwarding between two other real RNS processes) found and worked around (committed as `4998527`). One direction of the new check (NomadNet's own PROPAGATED send) is implemented and was observed correctly invoking real proof-of-work, but wasn't exercised to completion in this environment due to how long that PoW takes in pure Python — see the Part 1 writeup and README's Compliance table. 84/84 unit tests pass; `npx vite build` and the full `test:integration:*` set re-run clean. |
 | 2026-07-09 | Part 1, follow-up | Root-caused the Feature 4 gap precisely instead of leaving it at "takes a long time": `/proc/<pid>/stack` on the real `LXStamper.job_linux()` worker processes during a live run shows them permanently blocked in `futex_wait`, not computing — a fork-after-multithreading deadlock in the real `lxmf` package's own multiprocessing-based stamp generator, reproducible only with a real `NomadNetworkApp` (real TCP interface, real Link, its own job-loop thread) already running at fork time; isolated minimal repros (background threads, or a bare `RNS.Reticulum`+`LXMRouter` with no interface) complete in 1–5s every time. Not fixable without patching the real, unmodified package. Also closed the item-9 verification gap: every wired `test:integration:*` script (11 total, including `sparse-mesh` with `npm run dev` up) re-run individually and green, not just a 3-script spot check. README/compliance.md updated with the sharper diagnosis. |
+| 2026-07-09 | Part 1, correction | The prior entry's diagnosis was wrong, found by verifying directly against the real `nomadnet` CLI entry point (`nomadnet.nomadnet:main()`) as requested: it completes `LXStamper`'s PoW in a few seconds every time, with no modification. The deadlock only reproduces when driven by this project's own `nomadnet_driver.py`, specifically its blocking `for line in sys.stdin: ...` command-dispatch loop — a fork-safety hazard in that driver's own code (a buffered-reader lock held across a `fork()` on another thread), not in the real `lxmf`/`nomadnet` packages. Fixed by switching the driver to a `select()`-based non-blocking stdin poll. `propagation-node-nomadnet-interop-check.mjs` had an independent bug in the same direction (asserted the node's store count reached `>= 2`, not accounting for the real `LXMRouter` pruning a synced entry back out), fixed by tracking store keys instead. `test:integration:propagation-nomadnet` now passes both directions end-to-end (3 consecutive full runs). No bug report filed against `lxmf`/`nomadnet` — the earlier diagnosis that would have justified one didn't hold up. README/compliance.md corrected. |

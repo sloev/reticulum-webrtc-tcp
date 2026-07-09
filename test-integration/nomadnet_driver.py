@@ -6,13 +6,21 @@ nomadnet` in addition to `rns`/`lxmf`.
 NomadNet has no scriptable JSON-RPC control interface (unlike this repo's own
 rns_node.py test helper) — it's a TUI application whose NomadNetworkApp
 constructor itself runs a blocking job loop once initialized, so this driver:
-  1. Allocates the NomadNetworkApp instance via object.__new__() so a
-     reference exists before __init__ (which blocks) is even called.
-  2. Runs __init__() in a background thread — this is the exact same
-     initialization a real `nomadnet -d -c` daemon run performs (same
-     identity file, same LXMRouter, same delivery destination, same
-     start-of-day announce after NomadNetworkApp.START_ANNOUNCE_DELAY=3s) —
-     nothing about NomadNet's own behavior is modified or bypassed.
+  1. Constructs NomadNetworkApp(...) directly on the main thread, exactly the
+     same call nomadnet.nomadnet:main() (the real `nomadnet` CLI's own entry
+     point) makes — same identity file, same LXMRouter, same delivery
+     destination, same start-of-day announce after
+     NomadNetworkApp.START_ANNOUNCE_DELAY=3s. Nothing about NomadNet's own
+     behavior is modified or bypassed. This call blocks forever (it runs the
+     daemon's job-scheduler loop synchronously), which is also why it must
+     run on the main thread: RNS.Reticulum's constructor registers a SIGINT
+     handler, and Python only allows that from the main thread of the main
+     interpreter.
+  2. A background thread gets a handle to the running instance via
+     NomadNetworkApp.get_shared_instance() — a real, public accessor the
+     library itself provides for exactly this kind of external access —
+     rather than pre-allocating the instance with object.__new__() and
+     calling __init__() separately.
   3. Once initialized, sending a message uses LXMF.LXMessage(desired_method=
      OPPORTUNISTIC) directly against NomadNet's own real `message_router`/
      `lxmf_destination` — the same primitives NomadNet's own TUI "compose"
@@ -20,6 +28,26 @@ constructor itself runs a blocking job loop once initialized, so this driver:
      tree (headless automation of the TUI itself isn't practical, per
      compliance.md Phase 6 — see README's Compliance section for what this
      means for the interop claim).
+
+Command dispatch reads stdin via select() with a short timeout rather than
+a plain blocking `for line in sys.stdin` loop. That distinction matters: a
+blocking readline() sits inside `_io.BufferedReader`'s internal per-object
+lock for the whole time it waits for input (CPython releases the GIL for
+the blocking read syscall itself, but not that lock). Meanwhile, LXMF's
+LXStamper.job_linux() spawns its PoW worker pool via
+`multiprocessing.get_context("fork").Process(...)` from the router's own
+job-scheduler thread — if that fork() lands while this driver's stdin
+thread is holding the buffered-reader lock, the child process inherits it
+already locked, with no thread in the child able to ever release it,
+so any worker that needs it (indirectly, e.g. via stdio) hangs in
+futex_wait forever. This was confirmed live, with a real propagation node
+and real `python -m nomadnet` process: driving the exact same
+NomadNetworkApp construction and handle_outbound() call directly (no
+stdin loop at all) always completed the PoW in a few seconds, while the
+blocking-stdin-loop version deadlocked every time. The real, unmodified
+lxmf/nomadnet packages are not at fault — this is a fork-safety hazard in
+this driver's own command-dispatch loop, avoided here by never blocking
+inside the buffered stdin reader while other threads may fork().
 
 Commands (stdin, one JSON object per line):
   {"cmd": "send_to", "dest_hash": "<hex>", "title": "...", "content": "..."} — OPPORTUNISTIC, direct
@@ -34,6 +62,7 @@ Events (stdout, one JSON object per line):
 import sys
 import json
 import time
+import select
 import argparse
 import threading
 
@@ -52,7 +81,7 @@ def main():
     parser.add_argument("--rnsconfigdir", required=True)
     args = parser.parse_args()
 
-    app = object.__new__(nomadnet.NomadNetworkApp)
+    app_holder = {}
 
     def handle_command(line):
         try:
@@ -67,6 +96,7 @@ def main():
             emit("command_error", cmd=cmd.get("cmd"), error=str(e), traceback=traceback.format_exc())
 
     def dispatch_command(cmd):
+        app = app_holder["app"]
         if cmd.get("cmd") == "debug_status":
             emit(
                 "debug_status",
@@ -115,6 +145,7 @@ def main():
             app.message_router.handle_outbound(message)
 
     def poll_sync_state():
+        app = app_holder["app"]
         last = None
         while True:
             state = app.message_router.propagation_transfer_state
@@ -123,12 +154,18 @@ def main():
                 last = state
             time.sleep(0.1)
 
-    def stdin_loop():
-        # Poll for the attributes NomadNetworkApp's __init__ sets once its
-        # LXMF delivery destination is registered (see NomadNetworkApp.py's
-        # register_delivery_identity() call) before announcing readiness.
-        while not hasattr(app, "lxmf_destination"):
+    def wait_for_app_and_run():
+        # NomadNetworkApp.get_shared_instance() is a real, public accessor
+        # the library itself provides for exactly this kind of external
+        # scripted access — it raises until the app has been constructed.
+        app = None
+        while app is None or not hasattr(app, "lxmf_destination"):
+            try:
+                app = nomadnet.NomadNetworkApp.get_shared_instance()
+            except Exception:
+                app = None
             time.sleep(0.1)
+        app_holder["app"] = app
 
         emit(
             "ready",
@@ -140,20 +177,28 @@ def main():
 
         threading.Thread(target=poll_sync_state, daemon=True).start()
 
-        for line in sys.stdin:
+        # select() with a timeout, not a blocking `for line in sys.stdin`
+        # loop: see the fork-safety note in the module docstring above.
+        while True:
+            readable, _, _ = select.select([sys.stdin], [], [], 0.1)
+            if not readable:
+                continue
+            line = sys.stdin.readline()
+            if line == "":
+                break  # EOF
             line = line.strip()
             if line:
                 handle_command(line)
 
-    t = threading.Thread(target=stdin_loop, daemon=True)
-    t.start()
+    threading.Thread(target=wait_for_app_and_run, daemon=True).start()
 
-    # NomadNetworkApp.__init__() constructs its own RNS.Reticulum instance,
-    # which registers a SIGINT handler — only valid from the main thread, so
-    # __init__() (which also runs its own blocking job-scheduler loop
-    # forever, exactly like a real `nomadnet -d` daemon) must run here rather
-    # than in a background thread.
-    app.__init__(configdir=args.configdir, rnsconfigdir=args.rnsconfigdir, daemon=True, force_console=True)
+    # NomadNetworkApp(...) constructs its own RNS.Reticulum instance, which
+    # registers a SIGINT handler — only valid from the main thread, so this
+    # call (which also runs its own blocking job-scheduler loop forever,
+    # exactly like a real `nomadnet -d` daemon) must run here rather than in
+    # a background thread. This is the exact call nomadnet.nomadnet:main()
+    # (the real CLI entry point) makes.
+    nomadnet.NomadNetworkApp(configdir=args.configdir, rnsconfigdir=args.rnsconfigdir, daemon=True, force_console=True)
 
 
 if __name__ == "__main__":
