@@ -99,6 +99,69 @@ test('announce -> encrypted send -> decrypt works end to end over a loopback int
   assert.equal(await received, 'hello world');
 });
 
+test('announce() rotates the ratchet after RATCHET_INTERVAL and retains the old one for decryption, matching RNS.Destination.rotate_ratchets()', async () => {
+  const rnsA = new Reticulum();
+  const rnsB = new Reticulum();
+  class Bridge extends Interface {
+    connect() {}
+    sendData(data) { setTimeout(() => this.other.rns.onPacketReceived(data, this.other), 0); }
+  }
+  const ifaceA = new Bridge('A');
+  const ifaceB = new Bridge('B');
+  ifaceA.other = ifaceB;
+  ifaceB.other = ifaceA;
+  rnsA.addInterface(ifaceA);
+  rnsB.addInterface(ifaceB);
+
+  const identityB = Identity.create();
+  const destB = new Destination(rnsB, identityB, Destination.IN, Destination.SINGLE, 'test', 'ratchet');
+  const destHex = crypto.bytesToHex(destB.hash);
+
+  const aGotAnnounce1 = new Promise((resolve) => rnsA.once('announce', resolve));
+  destB.announce();
+  await aGotAnnounce1;
+  const ratchetBefore = rnsA.identities.get(destHex).ratchet;
+  assert.equal(destB.ratchets.length, 1, 'no rotation before RATCHET_INTERVAL elapses');
+
+  // Back-date the newest ratchet's timestamp so the next announce rotates.
+  destB.latestRatchetTime = Date.now() - Destination.RATCHET_INTERVAL_MS - 1;
+  const aGotAnnounce2 = new Promise((resolve) => rnsA.once('announce', resolve));
+  destB.announce();
+  await aGotAnnounce2;
+  const ratchetAfter = rnsA.identities.get(destHex).ratchet;
+
+  assert.equal(destB.ratchets.length, 2, 'the old ratchet is retained after rotation');
+  assert.notEqual(crypto.bytesToHex(ratchetAfter), crypto.bytesToHex(ratchetBefore), 'the re-announce advertises a fresh ratchet');
+
+  const outDest = new Destination(rnsA, identityB, Destination.OUT, Destination.SINGLE, 'test', 'ratchet');
+  outDest.hash = destB.hash;
+
+  // A sender still holding the pre-rotation announce encrypts against the
+  // old ratchet — the retained key must decrypt it.
+  rnsA.identities.set(destHex, { public_key: identityB.public, ratchet: ratchetBefore });
+  const gotStale = new Promise((resolve) => destB.once('packet', (e) => resolve(new TextDecoder().decode(e.data))));
+  outDest.send(new TextEncoder().encode('stale-ratchet message'));
+  assert.equal(await gotStale, 'stale-ratchet message');
+
+  // And a sender with the fresh announce works as usual.
+  rnsA.identities.set(destHex, { public_key: identityB.public, ratchet: ratchetAfter });
+  const gotFresh = new Promise((resolve) => destB.once('packet', (e) => resolve(new TextDecoder().decode(e.data))));
+  outDest.send(new TextEncoder().encode('fresh-ratchet message'));
+  assert.equal(await gotFresh, 'fresh-ratchet message');
+});
+
+test('the retained ratchet list trims at RATCHET_COUNT, matching RNS.Destination._clean_ratchets()', () => {
+  const rns = new Reticulum();
+  rns.addInterface(new (class extends Interface { connect() {} sendData() {} })('noop'));
+  const dest = new Destination(rns, Identity.create(), Destination.IN, Destination.SINGLE, 'test', 'trim');
+
+  for (let i = 0; i < Destination.RATCHET_COUNT + 20; i++) {
+    dest.latestRatchetTime = Date.now() - Destination.RATCHET_INTERVAL_MS - 1;
+    dest._rotateRatchets();
+  }
+  assert.equal(dest.ratchets.length, Destination.RATCHET_COUNT);
+});
+
 // --- RNS.Link: ground truth captured from a real rns.Link handshake between
 // a fixed test identity (destination owner/responder) and fixed ephemeral
 // link keys (initiator X25519 = 0x11*32, initiator Ed25519 seed = 0x22*32,

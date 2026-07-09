@@ -370,6 +370,13 @@ export class Destination extends EventEmitter {
     static SINGLE = protocol.DEST_SINGLE;
     static LINK = protocol.DEST_LINK;
 
+    // Matches RNS.Destination.RATCHET_COUNT / RATCHET_INTERVAL
+    // (RNS/Destination.py:85,90): how many old ratchet keys an IN
+    // destination retains for decrypting messages encrypted against an
+    // earlier announce, and how often announce() rotates in a fresh one.
+    static RATCHET_COUNT = 512;
+    static RATCHET_INTERVAL_MS = 30 * 60 * 1000;
+
     constructor(rns, identity, direction, type, appName, ...aspects) {
         super();
         this.rns = rns;
@@ -386,6 +393,55 @@ export class Destination extends EventEmitter {
 
         if (this.direction === Destination.IN) {
             this.rns.destinations.set(crypto.bytesToHex(this.hash), this);
+
+            // Retained ratchet private keys, newest first — ratchets[0] is
+            // what announce() advertises; the rest keep messages encrypted
+            // against an earlier announce decryptable (see onData()).
+            // Seeded with the identity's ratchet so a destination announced
+            // before its first rotation behaves as before.
+            if (identity && identity.ratchetPrivate) {
+                this.ratchets = [identity.ratchetPrivate];
+                this.latestRatchetTime = Date.now();
+                this._ratchetStorage = null;
+            }
+        }
+    }
+
+    // Matches RNS.Destination.rotate_ratchets(): called from announce() —
+    // once RATCHET_INTERVAL has elapsed, a fresh ratchet key is prepended
+    // and the retained list is trimmed to RATCHET_COUNT. Persisted if
+    // loadRatchets() attached a storage adapter.
+    _rotateRatchets() {
+        if (!this.ratchets) return;
+        const now = Date.now();
+        if (now > this.latestRatchetTime + Destination.RATCHET_INTERVAL_MS) {
+            this.ratchets.unshift(crypto.private_ratchet());
+            this.latestRatchetTime = now;
+            if (this.ratchets.length > Destination.RATCHET_COUNT) {
+                this.ratchets = this.ratchets.slice(0, Destination.RATCHET_COUNT);
+            }
+            if (this._ratchetStorage) this.saveRatchets(this._ratchetStorage).catch(() => {});
+        }
+    }
+
+    // Persists/reloads the retained ratchet list via a storage adapter (see
+    // shared/rns/storage.js) — without this, a restart would orphan messages
+    // encrypted against a pre-restart announce's ratchet. Own storage
+    // format, not RNS's on-disk one (like Reticulum.saveState()).
+    // loadRatchets() also attaches the adapter so later rotations persist
+    // automatically.
+    async saveRatchets(storage) {
+        await storage.save(`ratchets/${crypto.bytesToHex(this.hash)}`, {
+            ratchets: this.ratchets, latestRatchetTime: this.latestRatchetTime,
+        });
+    }
+
+    async loadRatchets(storage) {
+        this._ratchetStorage = storage;
+        const saved = await storage.load(`ratchets/${crypto.bytesToHex(this.hash)}`);
+        if (saved && Array.isArray(saved.ratchets) && saved.ratchets.length > 0) {
+            this.ratchets = saved.ratchets.map((r) => new Uint8Array(r));
+            this.latestRatchetTime = saved.latestRatchetTime;
         }
     }
 
@@ -456,10 +512,13 @@ export class Destination extends EventEmitter {
     onData(packet, rawBytes) {
         if (this.direction === Destination.OUT) return;
 
-        // Try the destination's current ratchet first, then fall back to the
-        // identity's own X25519 key, matching RNS.Identity.decrypt()'s fallback
-        // for senders who didn't have (or use) an announced ratchet.
-        const decrypted = protocol.message_decrypt(packet, this.identity.public, [this.identity.ratchetPrivate, this.identity.private.slice(0, 32)]);
+        // Try every retained ratchet, newest first, then fall back to the
+        // identity's own X25519 key — matching RNS.Identity.decrypt()'s
+        // candidate order (Identity.py:869): a sender may have encrypted
+        // against any ratchet this destination has announced, or against no
+        // ratchet at all.
+        const candidates = this.ratchets ? this.ratchets : [this.identity.ratchetPrivate];
+        const decrypted = protocol.message_decrypt(packet, this.identity.public, [...candidates, this.identity.private.slice(0, 32)]);
         if (decrypted) {
             const parsedLxmf = tryParseLxmf(this.rns, this.hash, decrypted);
 
@@ -499,12 +558,17 @@ export class Destination extends EventEmitter {
         this.emit('proof', packet);
     }
 
+    // Announces this destination, advertising the newest ratchet — rotating
+    // one in first when RATCHET_INTERVAL has elapsed, matching
+    // RNS.Destination.announce()'s rotate_ratchets() call.
     announce({ pathResponse = false, appData = new Uint8Array(0) } = {}) {
         if (this.identity) {
+            this._rotateRatchets();
+            const ratchetPrivate = this.ratchets ? this.ratchets[0] : this.identity.ratchetPrivate;
             const context = pathResponse ? protocol.CONTEXT_PATH_RESPONSE : protocol.CONTEXT_NONE;
             const packet = protocol.build_announce(
                 this.identity.private, this.identity.public, this.hash,
-                this.identity.ratchetPrivate, this.identity.ratchetPublic, this.fullName,
+                ratchetPrivate, crypto.public_ratchet(ratchetPrivate), this.fullName,
                 appData, context
             );
             this.rns.sendData(packet);

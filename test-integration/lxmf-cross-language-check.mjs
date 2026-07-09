@@ -181,6 +181,31 @@ assertEqual(pyDirect3.content, bigContent, 'Python received the correct content 
 assertEqual(pyDirect3.compressed, false, "the real RNS.Resource Python received reports compressed=False — JS genuinely read Python's real announce app_data and skipped compression, not just decoded it correctly either way");
 jsToPyLink3.close();
 
+// --- Ratchet rotation (RNS.Destination.rotate_ratchets): JS rotates its
+// destination's ratchet WITHOUT re-announcing — the situation of a peer
+// holding a stale announce. Python keeps encrypting against the previous
+// ratchet; the retained key must decrypt it. Then JS re-announces the fresh
+// ratchet and Python's next message uses it. ---
+self.latestRatchetTime = Date.now() - Destination.RATCHET_INTERVAL_MS - 1;
+self._rotateRatchets();
+assertEqual(self.ratchets.length, 2, 'JS destination rotated in a fresh ratchet and retained the old one');
+
+const jsGotStaleRatchetLxmf = new Promise((resolve) => self.once('lxmf', resolve));
+py.stdin.write(JSON.stringify({ cmd: 'send_lxmf', dest_hash: crypto.bytesToHex(self.hash), title: 'stale ratchet', content: 'encrypted against the pre-rotation announce' }) + '\n');
+const staleReceived = await jsGotStaleRatchetLxmf;
+assertTrue(staleReceived.valid, 'JS decrypted and validated a message Python encrypted against the pre-rotation ratchet (retained-key path)');
+assertEqual(new TextDecoder().decode(staleReceived.title), 'stale ratchet', 'stale-ratchet message content is intact');
+
+const pySawFreshAnnounce = waitFor((m) => m.event === 'announce_received' && m.dest_hash === crypto.bytesToHex(self.hash), 5000);
+self.announce();
+await pySawFreshAnnounce;
+
+const jsGotFreshRatchetLxmf = new Promise((resolve) => self.once('lxmf', resolve));
+py.stdin.write(JSON.stringify({ cmd: 'send_lxmf', dest_hash: crypto.bytesToHex(self.hash), title: 'fresh ratchet', content: 'encrypted against the post-rotation announce' }) + '\n');
+const freshReceived = await jsGotFreshRatchetLxmf;
+assertTrue(freshReceived.valid, "JS decrypted and validated a message Python encrypted against the rotated ratchet's announce");
+assertEqual(new TextDecoder().decode(freshReceived.title), 'fresh ratchet', 'fresh-ratchet message content is intact');
+
 py.kill();
 gateway.server.close();
 

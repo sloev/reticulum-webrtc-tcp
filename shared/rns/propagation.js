@@ -322,7 +322,11 @@ function _decryptEnvelopes(rns, envelopes, source) {
         const destinationHash = envelope.slice(0, 16);
         const cipherBlob = envelope.slice(16);
 
-        const decrypted = protocol.message_decrypt({ data: cipherBlob }, source.identity.public, [source.identity.ratchetPrivate, source.identity.private.slice(0, 32)]);
+        // Same decrypt-candidate order as Destination.onData(): every
+        // retained ratchet (a stored message may predate a rotation), then
+        // the identity's primary key.
+        const candidates = source.ratchets ? source.ratchets : [source.identity.ratchetPrivate];
+        const decrypted = protocol.message_decrypt({ data: cipherBlob }, source.identity.public, [...candidates, source.identity.private.slice(0, 32)]);
         if (!decrypted) continue;
 
         const parsed = tryParseLxmf(rns, destinationHash, decrypted);
