@@ -1,20 +1,28 @@
-// Manual, throwaway check: a real end-user LXMF client (NomadNet, driven via
+// Verifies propagateLXMF()/syncFromRealPropagationNode() (shared/rns/
+// propagation.js) against a real end-user LXMF client (NomadNet, driven via
 // nomadnet_driver.py — see that file and nomadnet-interop-check.mjs for why
-// NomadNet is driven this way rather than through its TUI) and this JS stack
-// exchange messages through a real, unmodified LXMF.LXMRouter propagation
-// node (enable_propagation(), test-integration/lxmf_propagation_node.py) —
-// three separate real/simulated parties on one shared TCP hub, none of them
-// this project's own PropagationNode.
+// NomadNet is driven this way rather than through its TUI) exchanging
+// messages with this stack through a real, unmodified LXMF.LXMRouter
+// propagation node (enable_propagation(), lxmf_propagation_node.py) — three
+// separate real/simulated parties, none of them this project's own
+// PropagationNode:
 //
-//   JS  --propagateLXMF()-->  real LXMRouter node  --sync-->  NomadNet
-//   NomadNet --PROPAGATED-->  real LXMRouter node  --syncFromRealPropagationNode()-->  JS
+//   JS       --propagateLXMF()-->               real LXMRouter node
+//   real LXMRouter node --sync-->                NomadNet
+//   NomadNet --PROPAGATED-->                     real LXMRouter node
+//   real LXMRouter node --syncFromRealPropagationNode()--> JS
 //
-// Confirms both directions of client<->propagation-node interop this
-// project's own PropagationNode already covers (lxmf-propagation-cross-
-// language-check.mjs, propagation-client-interop-check.mjs) also hold when
-// the node in the middle is the reference implementation and the other
-// client is a real end-user application, not just the bare rns/lxmf
-// packages.
+// JS connects to the node through the JS gateway; NomadNet connects to the
+// node's own second TCPServerInterface directly rather than through the
+// gateway (see lxmf_propagation_node.py's --listen-port and the topology
+// note further down) — confirms both directions of client<->propagation-
+// node interop this project's own PropagationNode already covers
+// (lxmf-propagation-cross-language-check.mjs, propagation-client-interop-
+// check.mjs) also hold when the node in the middle is the reference
+// implementation and the other client is a real end-user application.
+//
+// Run with: PYLIBS=/path/to/site-packages npm run test:integration:propagation-nomadnet
+// (requires: pip install --target=$PYLIBS rns lxmf nomadnet)
 import { spawn } from 'node:child_process';
 import { rmSync, mkdirSync, writeFileSync, readdirSync, existsSync } from 'node:fs';
 import { Reticulum, Identity, Destination, Link } from '../shared/rns/index.js';

@@ -1,14 +1,12 @@
-# Compliance execution plan: full RNS/LXMF parity
+# Compliance execution log
 
-A stepped, self-contained execution plan for closing every gap documented in
-[README#compliance](./README.md#compliance), ending in a fully compliant JavaScript
-port of the Reticulum Network Stack (`rns` 1.3.7) and LXMF (`lxmf` 1.0.1). It doubles
-as the living **feature parity checklist**: every feature, with a reference to where it
-lives in the real Python source and where it lives (or will live) here.
-
-This document is written to be executed by Claude (or any contributor) one phase at a
-time, in order. Update the checklist row and the README's Compliance section as part of
-completing each step — a step is not done until both say so.
+This is the historical execution log for the RNS/LXMF parity work on this project — the
+phase-by-phase record of what was implemented, read, and verified, in the order it
+happened. The current, canonical feature-parity table lives in
+[README#compliance](./README.md#compliance); this file is not updated as that table
+changes further. Read it for the reasoning behind a decision (why something was scoped
+out, what a live check actually exercises, a bug found along the way) that the README's
+table doesn't have room for.
 
 ## Ground rules
 
@@ -38,9 +36,9 @@ algorithms exactly, and only then implementing.
    `:lxmf-peer-sync`, `:path-request`, `:nomadnet`, `:sideband`, `:integration` for
    the sparse mesh).
 
-**Process.** After each completed step: update this file's checklist row, update the
-README Compliance section, commit with a descriptive message, push. Never open a PR
-unless the user asks. Never claim a step done without the verification it names.
+**Process.** After each completed step: update the README Compliance table, commit with a
+descriptive message, push. Never open a PR unless the user asks. Never claim a step done
+without the verification it names.
 
 **Sandbox notes.** Public Nostr relays are blocked by the environment's egress proxy —
 browser-demo verification uses an in-page loopback `Interface` bridging two `Reticulum`
@@ -48,98 +46,17 @@ instances, driven by Playwright (`/opt/pw-browsers/chromium`,
 `import ... from '/opt/node22/lib/node_modules/playwright/index.mjs'`). `pip` works
 through the proxy.
 
-## Feature parity checklist
-
-Status: **DONE** (implemented + verified) · **PARTIAL** (implemented with documented
-deviations) · **MISSING** (not implemented) · **N/A** (deliberately out of scope, with
-reason).
-
-### Core wire format & identity
-
-| Feature | Python reference | JS location | Status | Verified by |
-|---|---|---|---|---|
-| Packet framing (flags/hops/dest/context) | `RNS/Packet.py` `Packet.pack()/unpack()` | `shared/rns/protocol.js` `packet_pack/packet_unpack` | DONE | byte-exact tests |
-| Identity & destination hashing | `RNS/Identity.py` `full_hash/truncated_hash`, `RNS/Destination.py` `expand_name/hash` | `shared/rns/protocol.js` `identity_hash/destination_hash` | DONE | byte-exact tests |
-| Announces (ratchet, random_hash, Ed25519 sig) | `RNS/Destination.py` `announce()`, `RNS/Identity.py` `validate_announce()` | `shared/rns/protocol.js` `build_announce/validate_announce` | DONE | byte-exact tests |
-| Single-destination encryption (ratchet + fallback) | `RNS/Identity.py` `encrypt()/decrypt()` | `shared/rns/protocol.js` `build_data/message_decrypt` | DONE | byte-exact tests |
-| Packet delivery proofs (implicit form) | `RNS/Packet.py` `prove()`, `PacketReceipt.validate_proof()` | `shared/rns/protocol.js` `build_packet_proof/validate_packet_proof` | DONE | byte-exact tests |
-| MessagePack byte-compat with `umsgpack` | `RNS/vendor/umsgpack.py` | `shared/rns/msgpack.js` | DONE | byte-exact tests |
-| HDLC TCP framing | `RNS/Interfaces/TCPInterface.py` `HDLC` | `node/hdlc.js` | DONE | byte-exact tests |
-
-### Link
-
-| Feature | Python reference | JS location | Status | Verified by |
-|---|---|---|---|---|
-| Handshake (LINKREQUEST/PROOF/LRRTT), Token encryption, LINKCLOSE | `RNS/Link.py` | `shared/rns/index.js` `Link`, `shared/rns/protocol.js` | DONE | byte-exact + live |
-| `identify()` / `get_remote_identity()` | `RNS/Link.py` `identify()` | `shared/rns/index.js` `Link.identify/getRemoteIdentity` | DONE | live vs real `LXMRouter` |
-| Request/Response (single-packet) | `RNS/Link.py` `request()`, `RNS/Destination.py` `register_request_handler()` | `shared/rns/index.js` `Link.request`, `Destination.registerRequestHandler` | DONE | byte-exact + live |
-| RTT-adaptive keepalive/stale/timeout state machine | `RNS/Link.py:75–108` (constants), `__watchdog_job` (:710–775), `__update_keepalive` (:794) | `shared/rns/index.js` `Link._watchdogTick/_updateKeepalive/_noteInbound` | DONE | unit tests (formula + STALE transition/recovery/teardown) + live (`test:integration:resource/:channel/:lxmf-propagation/:lxmf-peer-sync` re-verified) |
-| Hop-scaled establishment timeout | `RNS/Link.py:75,206,284` (`ESTABLISHMENT_TIMEOUT_PER_HOP=6`) | `shared/rns/index.js` `Link` constructor/`fromRequest` | DONE | live (established links across the existing integration suite) |
-| Request/Response Resource fallback (oversized payloads) | `RNS/Link.py:506` (request), `:844–850` (response) | `shared/rns/index.js` `Link.request/_handleRequest` | DONE | `test:integration:lxmf-propagation` (real `LXMRouter` `/get` fallback), unit |
-
-### Resource / Channel / Buffer
-
-| Feature | Python reference | JS location | Status | Verified by |
-|---|---|---|---|---|
-| Resource send/receive, part hashmap, completion proof | `RNS/Resource.py` | `shared/rns/index.js` `Link.sendResource` + `shared/rns/protocol.js` | DONE | byte-exact + live both directions |
-| Multi-segment transfers (send) | `RNS/Resource.py:274–310` | `shared/rns/index.js` `_sendResourceSegment` | DONE | live (real peer reassembles) |
-| Incoming bz2 decompression | `RNS/Resource.py` assemble | `shared/rns/compression.js` `bz2_decompress` | DONE | live (real compressed data) |
-| Rate-adaptive request window | `RNS/Resource.py:58–99` (`WINDOW=4, WINDOW_MIN=2, WINDOW_MAX_SLOW=10, WINDOW_MAX_FAST=75, WINDOW_FLEXIBILITY=4, RATE_FAST=(50*1000)/8, RATE_VERY_SLOW=(2*1000)/8`), ramp at `:900–924` | `shared/rns/index.js` `Link._growResourceWindow/_requestNextResourceParts` | PARTIAL — growth + fast/very-slow-rate window_max promotion/demotion implemented; retry-driven shrinking not (no per-part retry/timeout mechanism exists) | unit test (window grows over multiple rounds, monotonic) + live (`test:integration:resource` re-verified, incl. a real `RNS.Resource` sender's ~180KB multi-segment transfer) |
-| Outgoing bz2 compression | `RNS/Resource.py` (compress-if-beneficial policy, :384-421, `AUTO_COMPRESS_MAX_SIZE=64MiB` :124,364) | `shared/rns/compression.js` `bz2_compress/bz2_compress_if_beneficial`, wired into `Link._sendResourceSegment` (Resource) and `buffer.js`'s `RawChannelWriter.write` (Buffer, per-chunk) | DONE | byte-exact (matches real `bz2.compress()` output exactly) + live (`test:integration:resource`/`:channel`: real `RNS.Resource`/`RNS.Buffer` explicitly report `compressed=True`) + real headless-Chromium production-build test |
-| HMU (hashmap update) receive path, large single segments | `RNS/Resource.py:483–499` `hashmap_update_packet`, `HASHMAP_IS_EXHAUSTED=0xFF` (:140), `:953–960` | `shared/rns/index.js` `Link._onHashmapUpdate/_requestNextResourceParts`, `shared/rns/protocol.js` `build/parse_resource_hmu`, `RESOURCE_HASHMAP_MAX_LEN` | DONE — receive side only (this project's own sender still never truncates its hashmap, so it never needs to *send* HMU) | unit tests (wire round-trip + a hand-built truncated-advertisement transfer) + live (`test:integration:resource`: a real 40000-byte/~87-part `RNS.Resource` transfer, which a real sender truncates past `RESOURCE_HASHMAP_MAX_LEN`=74 entries, completes correctly via a genuine HMU exchange) |
-| Channel (envelope, proofs, RTT-adaptive send window) | `RNS/Channel.py` | `shared/rns/channel.js` | DONE | byte-exact + live both directions |
-| Buffer (stream reader/writer, compressed chunks) | `RNS/Buffer.py` | `shared/rns/buffer.js` | DONE | live both directions |
-
-### Transport / routing
-
-| Feature | Python reference | JS location | Status | Verified by |
-|---|---|---|---|---|
-| Path requests/responses (wire format) | `RNS/Transport.py` `request_path/path_request_handler` (:2799–2939) | `shared/rns/index.js` `requestPath/_handlePathRequest` | DONE | byte-exact + live |
-| Multi-hop DATA/PROOF forwarding | `RNS/Transport.py` inbound/outbound | `shared/rns/index.js` `_forward` | PARTIAL — simplified single-destination analog | functional 3-peer test |
-| Multi-hop Link relaying (link table) | `RNS/Transport.py` link_table | `shared/rns/index.js` `_forwardLinkRequest/_forwardLinkTraffic` | DONE (functional) | 3-peer relay test |
-| Path-request throttling (`PATH_REQUEST_MI`) & table expiry (`DESTINATION_TIMEOUT`) | `RNS/Transport.py:83,91,2839` | `shared/rns/index.js` `Reticulum.requestPath/_cleanupPathTable` | DONE | unit + live `test:integration:path-request` |
-| Transport instance identity + 3-field path requests | `RNS/Transport.py:2811` (`dest+transport_identity.hash+tag`) | `shared/rns/index.js` `Reticulum.transportIdentity`, `protocol.js` `build_path_request` | DONE | byte-exact + live `test:integration:path-request` |
-| Announce rate table (timestamps, `MAX_RATE_TIMESTAMPS`) | `RNS/Transport.py:96,1890–1911` | `shared/rns/index.js` `Reticulum.announceRateTable` | PARTIAL — mechanism ported, enforcement not (matches RNS's own default-off `announce_rate_target`) | unit |
-| Path-request rebroadcast grace (`PATH_REQUEST_GRACE/RG`) & `LOCAL_REBROADCASTS_MAX` | `RNS/Transport.py:77,81–82,3012–3028` | — | SCOPED OUT | see Phase 4 writeup |
-
-### LXMF
-
-| Feature | Python reference | JS location | Status | Verified by |
-|---|---|---|---|---|
-| Message envelope + signature (OPPORTUNISTIC) | `LXMF/LXMessage.py` `pack()` | `shared/rns/protocol.js` `lxmf_build/lxmf_parse` | DONE | byte-exact + live both directions |
-| Admission stamps (message) | `LXMF/LXStamper.py` | `shared/rns/stamp.js` | DONE | byte-exact + live |
-| Peering-key stamps | `LXMF/LXStamper.py` `generate_peering_key` | `shared/rns/stamp.js` `generate/validate_peering_key` | DONE | byte-exact + live |
-| Propagation node store & client sync (`/get`) | `LXMF/LXMRouter.py` `message_get_request` | `shared/rns/propagation.js` `PropagationNode`, `syncFromRealPropagationNode` | DONE | live (upload + download vs real node) |
-| Node-to-node peer sync (`/offer`) | `LXMF/LXMPeer.py`, `LXMRouter.offer_request` | `shared/rns/propagation.js` `syncToPeer/_onOfferRequest` | DONE | live (real node accepts + stores) |
-| DIRECT delivery (over a Link; packet or Resource) | `LXMF/LXMessage.py:30–34` (methods), `:355–460` (`pack`), `:626–654` (`__as_packet`/`__as_resource`) | `shared/rns/protocol.js` `lxmf_build_direct/lxmf_parse_direct`, `shared/rns/index.js` `Link.sendLXMF` | DONE | byte-exact + live `test:integration:lxmf` (both directions, both representations) |
-| Delivery announce app_data (`[display_name, stamp_cost, [SF_COMPRESSION]]`) | `LXMF/LXMRouter.py:985–1000` `get_announce_app_data`, `LXMF/LXMF.py:174` `stamp_cost_from_app_data` | `shared/rns/protocol.js` `lxmf_build_announce_app_data/lxmf_stamp_cost_from_app_data` | DONE | byte-exact |
-| Compression negotiation (`SF_COMPRESSION` → `auto_compress`) | `LXMF/LXMessage.py:510–517` `determine_compression_support` | `shared/rns/protocol.js` `lxmf_compression_supported`, `shared/rns/index.js` `Link.sendLXMF` | DONE | unit + live `test:integration:lxmf` |
-| Propagation-node announce app_data (7-element list) | `LXMF/LXMRouter.py:300–318` `get_propagation_node_app_data`, `LXMF/LXMF.py:224` `pn_announce_data_is_valid` | `shared/rns/protocol.js` `lxmf_build_propagation_announce_app_data/lxmf_parse_propagation_announce_app_data` | DONE | byte-exact + live (`propagateLXMF`/`syncToPeer` auto-detect from a real `LXMRouter`'s own announce) |
-| Interop with end-user clients (NomadNet, Sideband) | n/a | `test-integration/nomadnet-interop-check.mjs`, `test-integration/sideband-interop-check.mjs` | DONE (both, both directions) | live, against real unmodified clients |
-| PAPER delivery method (QR-encoded messages) | `LXMF/LXMessage.py:33,446–456` | — | N/A — no meaningful use over WebRTC/TCP; revisit on request | — |
-
-### Persistence & environment
-
-| Feature | Python reference | JS location | Status | Verified by |
-|---|---|---|---|---|
-| Browser demo identity persistence | n/a (environment adaptation) | `browser/main.js` `loadOrCreateIdentity` (sessionStorage) | DONE | Playwright (reload keeps RID, new tab differs) |
-| Known-destinations / identity-cache / path-table persistence | `RNS/Identity.py:101–260` `remember/recall/save_known_destinations` | `shared/rns/storage.js`, `Reticulum.saveState/loadState` | DONE (adaptation — own format, not RNS's on-disk one) | unit |
-| Ratchet rotation & persistence | `RNS/Destination.py:210–243` `rotate_ratchets` | — (single static ratchet) | SCOPED OUT | see Phase 7 writeup |
-| Propagation store persistence | `LXMF/LXMRouter.py` storagepath handling | `PropagationNode.saveState/loadState` | DONE (adaptation — own format, one file per transient_id in spirit) | unit |
-| IFAC (interface access codes) | `RNS/Interfaces/Interface.py` | — | N/A — private-network access control for shared physical media; revisit on request | — |
-| Radio/serial interfaces (RNode, LoRa, I2P, …) | `RNS/Interfaces/*` | `shared/webrtc-rns-interface.js`, `node/tcp-gateway.js` | N/A — this project's transports are WebRTC + TCP by design | — |
-
 ## Execution phases
 
-Work strictly in order; each phase ends with the full regression suite green, this
-checklist updated, README updated, and a commit.
+Executed strictly in order; each phase ended with the full regression suite green,
+README's Compliance table updated, and a commit.
 
-### Phase 0 — housekeeping ✅
+### Phase 0 — housekeeping — done
 
 Commit the verified sessionStorage identity persistence (`browser/main.js`,
 `browser/index.html`). Done: commit `b3f95fe`.
 
-### Phase 1 — Link timing parity ✅
+### Phase 1 — Link timing parity — done
 
 Goal: replace the fixed 15 s establishment / 30 s keepalive timers with real RNS's
 state machine. **Done.**
@@ -199,7 +116,7 @@ updated.
 
 ### Phase 2 — Resource parity
 
-**2.1 Rate-adaptive window. ✅ Done (growth half; retry-shrink still open).**
+**2.1 Rate-adaptive window — done at the time (growth half only; retry-shrink added later, see below).**
 Implemented in `shared/rns/index.js`'s `Link._growResourceWindow()`/
 `_requestNextResourceParts()`/`_onResourcePart()`: each incoming Resource tracks its own
 `window` (starts at `RESOURCE_WINDOW=4`), `windowMax` (starts at
@@ -227,7 +144,7 @@ observed window sequence is monotonically non-decreasing and exceeds the initial
 4. Live: `test:integration:resource` re-verified in both directions, including a real
 `RNS.Resource` sender's ~180KB multi-segment transfer to our (window-adaptive) receiver.
 
-**2.2 Outgoing bz2 compression. ✅ Done.**
+**2.2 Outgoing bz2 compression — done.**
 
 `compressjs` (the obvious pure-JS bzip2 encoder, same author as `seek-bzip`) turned out to
 be GPL-licensed — bundling it would attach copyleft obligations to this project's
@@ -270,7 +187,7 @@ high-entropy one) and `test:integration:channel` (real `RNS.Buffer` correctly re
 compressed JS-sent stream); a real headless-Chromium session running the actual
 `vite build` production bundle.
 
-**2.3 HMU receive path. ✅ Done (receive side).**
+**2.3 HMU receive path — done at the time (receive side only; send side added later, see below).**
 
 Implemented in `shared/rns/protocol.js` (`CONTEXT_RESOURCE_HMU=0x04`, `RESOURCE_HASHMAP_MAX_LEN
 = floor((LINK_MDU-134)/RESOURCE_MAPHASH_LEN)` = 74 at the default MTU, matching
@@ -300,7 +217,7 @@ correctly end to end. Live: `test:integration:resource` — a real `RNS.Resource
 advertisement and this project's receiver correctly requests, receives, and applies the HMU
 packet to reassemble it (re-run twice for stability).
 
-### Phase 3 — Request/Response Resource fallback — ✅ Done
+### Phase 3 — Request/Response Resource fallback — done
 
 Read `RNS/Link.py:473–508` (request path) and `:842–850` (response path). A packed
 request or response that exceeds `LINK_MDU` is sent as a Resource instead of a single
@@ -326,13 +243,13 @@ through the Resource path in both directions (`'x'.repeat(LINK_MDU * 2)` used fo
 the request name and the handler's reply). Live: `test:integration:lxmf-propagation`
 extended to upload 4 LXMF messages (1 original + 3 padded "bulk" messages) to a real,
 unmodified `LXMF.LXMRouter` propagation node, then call `syncFromRealPropagationNode()`
-— its `/get` response now exceeds `LINK_MDU`, genuinely exercising the real reference
+— its `/get` response now exceeds `LINK_MDU`, exercising the real reference
 implementation's own oversized-response-as-Resource path (not a synthetic one); all 4
 messages downloaded and verified byte-for-byte (re-run 3× for stability). Full
 regression also re-run clean: 59/59 unit tests, `vite build`, and the resource/channel
 live checks.
 
-### Phase 4 — Transport parity — ✅ Done
+### Phase 4 — Transport parity — done
 
 Read `RNS/Transport.py`'s `request_path()`/`path_request_handler()` (:2799–2939) and
 the announce rate table (:1890–1911). Implemented in `shared/rns/index.js`'s
@@ -398,7 +315,7 @@ changes, still passing).
 
 ### Phase 5 — LXMF outbound parity
 
-**5.1 DIRECT delivery — ✅ Done.** Read `LXMF/LXMessage.py:355–460` (`pack()`) and
+**5.1 DIRECT delivery — done.** Read `LXMF/LXMessage.py:355–460` (`pack()`) and
 `:626–654` (`__as_packet`/`__as_resource`). Correction to the plan as originally
 written: reading the actual source shows the destination-hash prefix is the other
 way around from what's stated above — **OPPORTUNISTIC** is the one that omits it
@@ -438,7 +355,7 @@ DIRECT messages in both directions, both packet-sized and Resource-sized (re-run
 for stability). Full regression re-run clean: 66/66 unit tests, `vite build`, and the
 `resource`/`lxmf-propagation`/`lxmf-peer-sync` live checks (unaffected, still passing).
 
-**5.2 Delivery announce app_data + compression negotiation — ✅ Done.** Read
+**5.2 Delivery announce app_data + compression negotiation — done.** Read
 `LXMRouter.get_announce_app_data()` (LXMRouter.py:985–1000), `LXMF.stamp_cost_from_
 app_data()`/`compression_support_from_app_data()` (LXMF.py:174–200), and
 `LXMessage.determine_compression_support()` (LXMessage.py:510–517).
@@ -468,11 +385,11 @@ support. Live: `lxmf-cross-language-check.mjs` extended so a real, unmodified `r
 `lxmf` process re-announces its `lxmf.delivery` destination with a real
 `get_announce_app_data()`-shaped app_data declaring no compression support, and
 confirms — from the real `RNS.Resource`'s own `compressed` attribute on the
-Python side — that JS's next oversized DIRECT send genuinely skipped compression in
+Python side — that JS's next oversized DIRECT send skipped compression in
 response to that real announce (re-run 3× for stability). Full regression re-run
 clean: 69/69 unit tests, `vite build`.
 
-**5.3 Propagation-node announce app_data — ✅ Done.** Read `LXMRouter.
+**5.3 Propagation-node announce app_data — done.** Read `LXMRouter.
 get_propagation_node_app_data()` (LXMRouter.py:300–318) and `LXMF.pn_announce_data_
 is_valid()`/`pn_stamp_cost_from_app_data()` (LXMF.py:174–246).
 
@@ -505,7 +422,7 @@ the one being called through.
 Verified: unit tests (`test/lxmf-compliance.test.js`) — the app_data byte-exact
 match (cross-checked against a real fixed-timebase capture) and validation-rejection
 rules, plus two full JS-to-JS tests confirming `propagateLXMF()`/`syncToPeer()`
-genuinely read the cost from a `PropagationNode.announce()` rather than needing it
+read the cost from a `PropagationNode.announce()` rather than needing it
 passed. Live: both `lxmf-propagation-cross-language-check.mjs` and
 `lxmf-propagation-peer-sync-cross-language-check.mjs` extended to make
 `lxmf_propagation_node.py` call the real `LXMRouter.announce_propagation_node()`
@@ -516,10 +433,10 @@ values before using *only* the parsed announce to drive `propagateLXMF()`/
 timing dependency). Full regression re-run clean: 73/73 unit tests, `vite build`,
 and the `lxmf`/`resource`/`channel` live checks.
 
-### Phase 6 — end-user client interop — ✅ Done
+### Phase 6 — end-user client interop — done
 
 **NomadNet.** `pip install --target=$PYLIBS nomadnet`. Its real `-d`/`--daemon` mode
-runs genuinely headless (a `NomadNetworkApp` with `daemon=True` never touches its
+runs headless (a `NomadNetworkApp` with `daemon=True` never touches its
 TUI) — no TUI automation needed at all for the receiving direction, and for sending,
 `nomadnet.Conversation`'s own code calls exactly `app.message_router.
 handle_outbound(lxm)` (confirmed by reading `Conversation.py:320,394`), so this
@@ -532,7 +449,7 @@ lxmf-cross-language-check.mjs`'s pattern extends cleanly here too. Confirmed bot
 directions: JS's OPPORTUNISTIC send is received and written to NomadNet's own
 `storage/conversations/<hash>/` on disk; NomadNet's own outbound call is received and
 validated by this stack. Also confirmed NomadNet's real announce app_data
-(`[display_name, stamp_cost, [SF_COMPRESSION]]`) is genuinely parsed correctly by
+(`[display_name, stamp_cost, [SF_COMPRESSION]]`) is parsed correctly by
 this project's Phase 5.2 functions, cross-checked against NomadNet's own configured
 display name — not just against a synthetic byte vector.
 
@@ -551,7 +468,7 @@ Sideband's own real `lxmf_delivery` was the cleanest hook) to observe receipt wi
 touching Sideband's own logic. Sending uses Sideband's own public `send_message()` —
 the same method its UI's send button calls — which itself defaults to LXMF's DIRECT
 method (opening a real `Link`) rather than OPPORTUNISTIC when no ratchet is yet known
-for the recipient, so this also genuinely exercises this project's DIRECT delivery
+for the recipient, so this also exercises this project's DIRECT delivery
 (Phase 5.1) against a real end-user client, not just bare `lxmf`. Confirmed both
 directions, live, against the real unmodified client (re-run 3× each for stability).
 
@@ -568,7 +485,7 @@ against the reference implementation; a client-specific propagation test would
 mostly re-exercise the same code path through a heavier dependency, for limited
 additional confidence.
 
-### Phase 7 — persistence parity — ✅ Done (adaptation scope)
+### Phase 7 — persistence parity — done (adaptation scope)
 
 Implemented `shared/rns/storage.js`'s `NodeFileStorage` — a Node-only, one-file-
 per-key filesystem adapter (`save`/`load`/`listKeys`/`delete`, msgpack-encoded) —
@@ -614,7 +531,7 @@ storage code path itself, unrelated to WebRTC, was verified directly). 77/77
 unit tests pass; `vite build` confirms `storage.js` (Node-only, uses `node:fs/
 promises`) isn't pulled into the browser bundle (module count unchanged at 78).
 
-### Phase 8 — docs finalization — ✅ Done
+### Phase 8 — docs finalization — done
 
 Swept every checklist row above: none left `MISSING`/`UNTESTED`; the few `PARTIAL`
 rows (Resource window's retry-shrink, single-destination-only multi-hop forwarding,
@@ -637,10 +554,145 @@ copy (`browser/index.html`) was already kept accurate incrementally each phase
 
 Full regression re-run clean one final time: 77/77 unit tests, `vite build`, and a
 spot check of the live integration suite (`path-request`, `lxmf`, `resource`) —
-see the status log entry below. **Every phase in this document is now complete.**
-Any further work (ratchet rotation, propagation-node interop with an end-user
-client specifically, a browser storage adapter) is real, separable follow-up
-work, not a gap in what this document set out to close.
+see the status log entry below. Every phase in this document was complete at
+that point. What remained (ratchet rotation, send-side HMU, retry-driven
+window shrink, propagation-node interop with an end-user client) was left as
+real, separable follow-up work rather than a gap in what this document set
+out to close — see Part 1 below for that follow-up.
+
+## Part 1 — production readiness pass
+
+A later pass closed the four items left open at the end of Phase 8 above,
+plus re-verified and rewrote the documentation (this file included). Read
+first: whichever `RNS`/`LXMF` source file each feature below cites, from a
+fresh `pip install --target=/path/to/pylibs rns==1.3.7 lxmf==1.0.1
+nomadnet sbapp` — never from memory, same rule as every phase above.
+
+### Feature 1 — send-side HMU + advertisement hashmap truncation
+
+Read `RNS/Resource.py`'s advertisement construction and `hashmap_update_
+packet()`. `build_resource_advertisement()` (`shared/rns/protocol.js`) now
+truncates `m` to `RESOURCE_HASHMAP_MAX_LEN` entries when a transfer has more
+parts than that; `_onResourceRequest()` (`shared/rns/index.js`), on an
+exhausted-flagged request, locates the requested segment from the reported
+last map hash, validates it lands on a `RESOURCE_HASHMAP_MAX_LEN` boundary,
+and sends the next hashmap chunk as a `CONTEXT_RESOURCE_HMU` packet. With
+truncation implemented, the constraint that had capped
+`RESOURCE_SEGMENT_MAX_SIZE` at a small, hashmap-bound value no longer
+applied, so it was raised to match `RNS.Resource.MAX_EFFICIENT_SIZE` (1MiB−1).
+
+Verified: unit tests extended for a JS-to-JS transfer forcing hashmap
+truncation and a genuine HMU exchange, plus the multi-segment test rebuilt
+around the larger segment size. Live: `test:integration:resource` extended
+with a >74-part single-segment case (forcing a real `RNS.Resource` receiver
+to send exhausted requests this sender must answer) and a new >1MiB
+multi-segment case, both re-run for stability. Committed as `b42f9b4`.
+
+### Feature 2 — retry-driven Resource window shrink
+
+Read `RNS.Resource.__watchdog_job()`'s receiver branch and its
+`PART_TIMEOUT_FACTOR`/`_AFTER_RTT`/`MAX_RETRIES`/`RETRY_GRACE_TIME`
+constants. Each incoming Resource now tracks `retriesLeft`,
+`partTimeoutFactor`, `lastActivity`, and an armed retry timer
+(`_armResourceRetry`/`_resourceRetryTick` in `shared/rns/index.js`); a
+timeout shrinks the window (and, past a flexibility threshold,
+`windowMax`), decrements `retriesLeft`, and re-requests, until either a part
+arrives (resetting the retry state) or retries are exhausted (the transfer
+is discarded). One documented deviation: retry timing scales by measured
+link RTT (floored at 25ms) rather than Python's estimated in-flight transfer
+rate — chosen to avoid spurious retries on a low-latency loopback link,
+where an RTT-based deadline is more representative than an RNS-style rate
+estimate would be this early in a transfer.
+
+Verified: unit tests with a lossy bridge (drops early parts, confirms
+recovery with an observed window shrink) and a dead bridge (confirms
+discard after `MAX_RETRIES`). Live: `test:integration:resource` and
+`:channel` re-verified (no regression on a reliable transport). Committed
+as `08d254b`.
+
+### Feature 3 — ratchet rotation
+
+Read `RNS.Destination.rotate_ratchets()`, `RATCHET_COUNT`/`RATCHET_INTERVAL`
+(`Destination.py:85,90,227`), and `RNS.Identity.decrypt()`'s retained-ratchet
+candidate order (`Identity.py:869`). An IN `Destination` now keeps a
+retained ratchet list (newest first, seeded from the identity's own
+ratchet) and a `latestRatchetTime`; `announce()` rotates in a fresh ratchet
+once `RATCHET_INTERVAL_MS` has elapsed and trims the list to
+`RATCHET_COUNT`, before advertising the newest one. `onData()` (and
+`propagation.js`'s stored-envelope decrypt) try every retained ratchet
+newest-first, then the identity's primary key, matching real RNS's own
+fallback order — so a message encrypted against a pre-rotation announce
+still decrypts. `saveRatchets()`/`loadRatchets()` persist the retained list
+through the existing storage adapter, so a restart doesn't orphan messages
+encrypted against a pre-restart ratchet.
+
+Verified: unit tests for rotate-then-decrypt-via-the-old-ratchet,
+`RATCHET_COUNT` trimming, and save/load round-tripping across a simulated
+restart. Live: `test:integration:lxmf` extended so JS rotates without
+re-announcing, confirms a message Python encrypted against the
+pre-rotation ratchet still decrypts, then re-announces and confirms
+Python's next (post-rotation) message also decrypts (re-run 3× for
+stability). Committed as `f326ad5`.
+
+### Feature 4 — propagation-node / end-user-client interop
+
+Two parts.
+
+**4a — a real end-user client and this stack, through a real external
+propagation node.** New `test-integration/propagation-node-nomadnet-
+interop-check.mjs`: JS uploads via `propagateLXMF()` to a real
+`LXMF.LXMRouter` node (`enable_propagation()`); NomadNet (driven by
+`nomadnet_driver.py`, extended with `set_propagation_node`/`sync`/
+`send_propagated` commands calling the same `message_router` entry points
+its own UI uses) syncs it down via `request_messages_from_propagation_
+node()`. The reverse direction sends a message from NomadNet via
+`handle_outbound(desired_method=PROPAGATED)`, which JS then downloads via
+`syncFromRealPropagationNode()`. Found and worked around a real limitation
+of this project's own relay in the process: `_forward`/
+`_forwardLinkRequest` never rewrite `transport_id`, which a genuine
+transport-enabled RNS node's `Transport.packet_filter()` rejects for
+non-announce packets when relaying between two *other* real RNS processes
+— never exercised before, since every earlier live check had this
+project's own `Reticulum` instance as one Link endpoint. Worked around by
+giving `lxmf_propagation_node.py` a second `TCPServerInterface`
+(`--listen-port`) so NomadNet connects to the node directly rather than
+through the JS gateway — sidestepping the gap rather than fixing the
+underlying relay limitation, which remains open (see README's Routing
+section).
+
+**4b — this project's own `PropagationNode`, wire-compatible with a real
+client.** Read `LXMRouter.message_get_request()` (`LXMRouter.py:1426–1504`)
+in full: identify()-based auth (the requester's `lxmf.delivery` hash is
+derived from the proven identity, not passed in the request), the
+list/fetch/purge request shapes, and the cumulative-size accounting for
+`transfer_limit_kb`. Implemented as `PropagationNode._onRealGetRequest()`
+(`shared/rns/propagation.js`), dispatched from `_onGetRequest()` by request
+length (a real client's shapes are 2–3 elements; this project's own
+`syncLXMF()` protocol is always 4).
+
+Verified: unit tests — a full JS-to-JS round trip via
+`syncFromRealPropagationNode()` (previously only live-tested) against this
+project's own node, and direct `/get` calls covering the no-identity error
+and `transfer_limit_kb` skip behavior. Live: new `lxmf_propagation_
+client.py` (a bare `LXMF.LXMRouter` client, no `enable_propagation()`) and
+`test:integration:propagation-client` confirm a real client selects this
+project's `PropagationNode` as its outbound propagation node, syncs a
+stored message down, validates its signature, and the node purges it once
+confirmed (3 consecutive runs). Committed as `e5e88be` (4b) and `4998527`
+(4a).
+
+**Known gap, not fixed by this pass**: 4a's NomadNet-send/JS-download
+direction was implemented and observed correctly invoking real
+`LXStamper`'s proof-of-work (the router's own `stamp_gen_lock` held, its
+job-loop `processing_count` advancing normally), but wasn't exercised to
+completion in this environment — real PoW at the node's minimum accepted
+cost (`LXMRouter.PROPAGATION_COST_MIN=13`) takes several minutes in pure
+Python here, well past what's practical to hold up a commit for. See
+README's Compliance table.
+
+Full regression after all four features: `npm test` (84/84), `npx vite
+build`, and the full `test:integration:*` set (including the two new
+scripts) re-run clean.
 
 ## Status log
 
@@ -650,12 +702,16 @@ work, not a gap in what this document set out to close.
 | 2026-07-05 | Phase 1 | Link's RTT-adaptive keepalive/stale/timeout state machine implemented, plus a real bug fix (made `stamp.generate_stamp()`/`generate_peering_key()` non-blocking — see Phase 1 writeup). 51/51 unit tests pass; live `resource`/`channel`/`lxmf-propagation`/`lxmf-peer-sync` checks re-verified. |
 | 2026-07-05 | Phase 2.1 | Resource's rate-adaptive request window (growth + fast/very-slow-rate `window_max` promotion/demotion) implemented; retry-driven shrinking scoped out (no per-part retry mechanism exists). 52/52 unit tests pass; live `test:integration:resource` re-verified in both directions. |
 | 2026-07-05 | Phase 2.2 | Outgoing bz2 compression implemented for Resource and Buffer via `bzip2-wasm` (a WASM build of the real reference `libbzip2`, chosen over the GPL-licensed `compressjs`). Byte-exact vs real `bz2.compress()`; live checks confirm real `RNS.Resource`/`RNS.Buffer` explicitly recognize JS-compressed transfers; verified working in the actual production browser build via real headless Chromium (a dev-server-only WASM pre-bundling quirk was found and mitigated, doesn't affect the deployed demo). 54/54 unit tests pass. |
-| 2026-07-05 | Phase 2.3 | Resource HMU (hashmap update) receive path implemented — this project's receiver can now complete a transfer whose advertisement doesn't include the whole hashmap upfront, matching real RNS's `HASHMAP_MAX_LEN`-based truncation exactly. Send-side truncation/HMU-response scoped out (nothing currently needs it). 57/57 unit tests pass; live `test:integration:resource` confirms a genuine HMU exchange with a real ~87-part `RNS.Resource` sender (re-verified twice). Phase 2 (Resource parity) is now complete. |
+| 2026-07-05 | Phase 2.3 | Resource HMU (hashmap update) receive path implemented — this project's receiver can now complete a transfer whose advertisement doesn't include the whole hashmap upfront, matching real RNS's `HASHMAP_MAX_LEN`-based truncation exactly. Send-side truncation/HMU-response scoped out (nothing currently needs it). 57/57 unit tests pass; live `test:integration:resource` confirms a genuine HMU exchange with a real ~87-part `RNS.Resource` sender (re-verified twice). Phase 2 (Resource parity) was complete at that point (send-side HMU and retry-driven window shrink were added later — see README#compliance). |
 | 2026-07-05 | Phase 3 | Request/Response Resource fallback implemented for oversized payloads in both directions, matching `RNS.Link.request()`'s own fallback exactly (including its distinct `request_id` hash for the Resource form). 59/59 unit tests pass; live `test:integration:lxmf-propagation` extended to force a real, unmodified `LXMRouter`'s own `/get` response over `LINK_MDU` (4 uploaded messages) and confirms it downloads correctly via the new fallback (re-run 3× for stability). Full regression clean: unit tests, `vite build`, `resource`/`channel` live checks. |
 | 2026-07-06 | Phase 4 | Transport parity implemented: `requestPath()` throttling (`PATH_REQUEST_MI`), a persistent per-instance transport identity powering the 3-field path request form (previously 2-field only), path table expiry (`DESTINATION_TIMEOUT`), and an announce rate table mechanism (unenforced, matching RNS's own default-off `announce_rate_target`). Path-request rebroadcast grace and `LOCAL_REBROADCASTS_MAX` scoped out (LAN-collision-avoidance optimizations tied to RNS's announce-table retry machinery, not needed for correctness or interop). 62/62 unit tests pass; new live `test:integration:path-request` confirms a real, unmodified `rns` process's `path_request_handler()` correctly parses and answers the new 3-field form, and that repeat requests are suppressed (re-run 3× for stability). Full regression clean: unit tests, `vite build`, sparse-mesh live check. |
 | 2026-07-06 | Phase 5.1 | LXMF DIRECT delivery implemented (`Link.sendLXMF()`, packet or Resource, matching `LXMessage.pack()`'s own representation choice) — corrected a mistake in this plan's own original wording along the way (DIRECT keeps the destination-hash prefix; OPPORTUNISTIC is the one that omits it, confirmed by reading `LXMessage.__as_packet()` and capturing a real `.pack()` byte vector). 66/66 unit tests pass; live `lxmf-cross-language-check.mjs` extended to exchange DIRECT messages with a real, unmodified `lxmf`/`rns` process in both directions and both packet/Resource representations (re-run 3× for stability). Full regression clean: unit tests, `vite build`, `resource`/`lxmf-propagation`/`lxmf-peer-sync` live checks. |
-| 2026-07-06 | Phase 5.2 | LXMF delivery announce app_data (`lxmf_build_announce_app_data`/`lxmf_stamp_cost_from_app_data`/`lxmf_compression_supported`, byte-exact) and compression negotiation implemented — `Link.sendLXMF()` skips compression for a Resource-sized message when the recipient's cached announce explicitly declares no `SF_COMPRESSION` support. 69/69 unit tests pass; live `lxmf-cross-language-check.mjs` extended so a real, unmodified `rns`/`lxmf` process re-announces declaring no compression support, and JS's next oversized DIRECT send is confirmed (via the real `RNS.Resource`'s own `compressed` attribute on the Python side) to have genuinely honored it (re-run 3× for stability). Full regression clean: unit tests, `vite build`. |
-| 2026-07-06 | Phase 5.3 | Propagation-node announce app_data implemented (`lxmf_build_propagation_announce_app_data`/`lxmf_parse_propagation_announce_app_data`, byte-exact, including catching a would-be integer-vs-string msgpack key mismatch before it could break interop). `PropagationNode.announce()` now embeds real stamp/peering cost; `propagateLXMF()`/`syncToPeer()` default to reading it from a cached announce instead of a required argument. 73/73 unit tests pass; both propagation live checks extended to make a real `LXMRouter` fire its actual `announce_propagation_node()` (~20s delay) and drive JS's uploads/peer-sync using *only* the parsed real announce, cross-checked against the test harness's own values (re-run twice each for stability). Full regression clean: unit tests, `vite build`, `lxmf`/`resource`/`channel` live checks. **Phase 5 (LXMF outbound parity) is now complete.** |
+| 2026-07-06 | Phase 5.2 | LXMF delivery announce app_data (`lxmf_build_announce_app_data`/`lxmf_stamp_cost_from_app_data`/`lxmf_compression_supported`, byte-exact) and compression negotiation implemented — `Link.sendLXMF()` skips compression for a Resource-sized message when the recipient's cached announce explicitly declares no `SF_COMPRESSION` support. 69/69 unit tests pass; live `lxmf-cross-language-check.mjs` extended so a real, unmodified `rns`/`lxmf` process re-announces declaring no compression support, and JS's next oversized DIRECT send is confirmed (via the real `RNS.Resource`'s own `compressed` attribute on the Python side) to have honored it (re-run 3× for stability). Full regression clean: unit tests, `vite build`. |
+| 2026-07-06 | Phase 5.3 | Propagation-node announce app_data implemented (`lxmf_build_propagation_announce_app_data`/`lxmf_parse_propagation_announce_app_data`, byte-exact, including catching a would-be integer-vs-string msgpack key mismatch before it could break interop). `PropagationNode.announce()` now embeds real stamp/peering cost; `propagateLXMF()`/`syncToPeer()` default to reading it from a cached announce instead of a required argument. 73/73 unit tests pass; both propagation live checks extended to make a real `LXMRouter` fire its actual `announce_propagation_node()` (~20s delay) and drive JS's uploads/peer-sync using *only* the parsed real announce, cross-checked against the test harness's own values (re-run twice each for stability). Full regression clean: unit tests, `vite build`, `lxmf`/`resource`/`channel` live checks. Phase 5 (LXMF outbound parity) was complete. |
 | 2026-07-06 | Phase 6 | End-user client interop verified live against real, unmodified `nomadnet` and `sbapp` (Sideband) installs, both directions, both message directions confirmed via each client's own real code paths (`NomadNetworkApp`'s real disk storage / `message_router.handle_outbound()`; `SidebandCore`'s real `send_message()`/delivery callback). Corrected this plan's own assumption that Sideband would be infeasible headless — its daemon mode never imports Kivy at all, confirmed by actually running it. No code changes to `shared/rns/*` (investigation + test-integration only); 73/73 unit tests and `vite build` unaffected and still clean. |
-| 2026-07-06 | Phase 7 | Persistence parity implemented as an adaptation: `shared/rns/storage.js`'s `NodeFileStorage` plus `Reticulum`/`PropagationNode` `saveState()`/`loadState()`, wired opt-in into `node/index.js` via `RNS_STORAGE_DIR`. Ratchet rotation explicitly scoped out (a real, separable gap, large enough to warrant its own future phase rather than a shallow fit here). 77/77 unit tests pass (new `test/storage.test.js` covers round-tripping across a simulated restart and stale-file cleanup); `vite build` confirms the Node-only storage module isn't pulled into the browser bundle. **This closes every phase in this document except final docs polish (Phase 8).** |
-| 2026-07-06 | Phase 8 | Docs finalization: swept every checklist row (none left MISSING/UNTESTED), rewrote README's intro/summary/limitations sections against the finished checklist, and fixed five stale code comments left over from before Phases 1–5 landed (a "fixed-size window" note on the now-rate-adaptive Resource receiver, a "no outgoing compression" note, an "out of band" note on propagation stamp cost that Phase 5.3 made announce-derived, a "fallback is not implemented" note on the Phase-3 Request/Response Resource fallback, and a stale "LINKREQUEST packets aren't forwarded" README paragraph). 77/77 unit tests pass, `vite build` clean, spot-checked live integration suite still green. **Every phase in this document is complete.** |
+| 2026-07-06 | Phase 7 | Persistence parity implemented as an adaptation: `shared/rns/storage.js`'s `NodeFileStorage` plus `Reticulum`/`PropagationNode` `saveState()`/`loadState()`, wired opt-in into `node/index.js` via `RNS_STORAGE_DIR`. Ratchet rotation explicitly scoped out (a real, separable gap, large enough to warrant its own future phase rather than a shallow fit here). 77/77 unit tests pass (new `test/storage.test.js` covers round-tripping across a simulated restart and stale-file cleanup); `vite build` confirms the Node-only storage module isn't pulled into the browser bundle. This closed every phase in this document except final docs polish (Phase 8). |
+| 2026-07-06 | Phase 8 | Docs finalization: swept every checklist row (none left MISSING/UNTESTED), rewrote README's intro/summary/limitations sections against the finished checklist, and fixed five stale code comments left over from before Phases 1–5 landed (a "fixed-size window" note on the now-rate-adaptive Resource receiver, a "no outgoing compression" note, an "out of band" note on propagation stamp cost that Phase 5.3 made announce-derived, a "fallback is not implemented" note on the Phase-3 Request/Response Resource fallback, and a stale "LINKREQUEST packets aren't forwarded" README paragraph). 77/77 unit tests pass, `vite build` clean, spot-checked live integration suite still green. Every phase in this document was complete. |
+| 2026-07-09 | Part 1, Feature 1 | Send-side HMU (advertisement hashmap truncation + HMU response) implemented; `RESOURCE_SEGMENT_MAX_SIZE` raised to match real RNS's `MAX_EFFICIENT_SIZE` (1MiB−1) now that truncation removes the constraint that had capped it. Unit tests extended (truncation + HMU-sent assertions, multi-segment test rebuilt around the larger size); live `test:integration:resource` extended with a >74-part single-segment case and a new >1MiB multi-segment case (re-run 3×). Committed as `b42f9b4`. |
+| 2026-07-09 | Part 1, Feature 2 | Retry-driven Resource window shrink implemented (per-part retry/timeout matching `RNS.Resource.__watchdog_job()`'s receiver branch, with a documented RTT-vs-estimated-rate scaling deviation). Unit tests added (lossy-bridge recovery-with-shrink, dead-bridge exhaustion-after-`MAX_RETRIES`); live `resource`/`channel` re-verified with no regression. Committed as `08d254b`. |
+| 2026-07-09 | Part 1, Feature 3 | Ratchet rotation implemented (`Destination._rotateRatchets`/`saveRatchets`/`loadRatchets`, decrypt-fallback trying every retained ratchet). 84/84 unit tests pass (new rotation/trim/persistence tests); live `test:integration:lxmf` extended to confirm both a stale-ratchet and a fresh-ratchet message decrypt correctly against a real Python identity (3 consecutive runs). Committed as `f326ad5`. |
+| 2026-07-09 | Part 1, Feature 4 | Propagation-node/client interop closed on both fronts: `PropagationNode._onRealGetRequest()` makes this project's own node wire-compatible with a real LXMF client's sync protocol (committed as `e5e88be`), and a new live check confirms a real NomadNet client and this stack exchanging messages through a real external `LXMRouter` propagation node, with a real relay limitation (`transport_id` not rewritten when forwarding between two other real RNS processes) found and worked around (committed as `4998527`). One direction of the new check (NomadNet's own PROPAGATED send) is implemented and was observed correctly invoking real proof-of-work, but wasn't exercised to completion in this environment due to how long that PoW takes in pure Python — see the Part 1 writeup and README's Compliance table. 84/84 unit tests pass; `npx vite build` and the full `test:integration:*` set re-run clean. |

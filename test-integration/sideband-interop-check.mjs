@@ -1,14 +1,11 @@
-// Manual, throwaway check: this JS stack talking to a real, unmodified
-// `sbapp` (Sideband) client — an actual end-user LXMF client, not just the
-// bare `rns`/`lxmf` libraries this repo's other integration checks use
-// (compliance.md Phase 6).
+// Verifies this stack's LXMF wire compatibility against a real, unmodified
+// `sbapp` (Sideband) client — an actual end-user application, not just the
+// bare `rns`/`lxmf` libraries the other integration checks use.
 //
-// Corrects an assumption in compliance.md's own original Phase 6 plan:
-// Sideband (a Kivy/KivyMD GUI app) was expected to be infeasible headless.
-// It isn't — `sbapp/main.py`'s entire Kivy/KivyMD/LXST(audio) import block
-// is gated behind `if not args.daemon:`, so its real `-d`/`--daemon` mode
-// never touches Kivy's graphics stack at all (confirmed by running it
-// directly first, with no virtual display, before writing this check).
+// Sideband is a Kivy/KivyMD GUI app, but `sbapp/main.py`'s entire
+// Kivy/KivyMD/LXST(audio) import block is gated behind `if not
+// args.daemon:`, so its real `-d`/`--daemon` mode never touches Kivy's
+// graphics stack at all — it runs genuinely headless.
 //
 // Confirms:
 //   1. JS -> Sideband: Sideband's real, unmodified `SidebandCore` (the same
@@ -21,11 +18,11 @@
 //      calls internally — rather than a synthetic LXMF payload. Notably,
 //      send_message() itself defaults to LXMF's DIRECT method (a real
 //      Link) rather than OPPORTUNISTIC when no ratchet is yet known for the
-//      recipient, so this also genuinely exercises this stack's DIRECT
-//      delivery (Phase 5.1) against a real end-user client, not just
-//      bare `lxmf`.
+//      recipient, so this also exercises this stack's DIRECT delivery
+//      against a real end-user client, not just bare `lxmf`.
 //
-// Requires: pip install --target=$PYLIBS sbapp (in addition to rns/lxmf).
+// Run with: PYLIBS=/path/to/site-packages npm run test:integration:sideband
+// (requires: pip install --target=$PYLIBS rns lxmf sbapp)
 import { spawn } from 'node:child_process';
 import { rmSync, mkdirSync, writeFileSync } from 'node:fs';
 import { Reticulum, Identity, Destination } from '../shared/rns/index.js';

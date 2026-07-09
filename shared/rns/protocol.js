@@ -800,12 +800,9 @@ export function lxmf_parse_propagation_announce_app_data(app_data) {
 //
 // This is a *different*, smaller value than RESOURCE_SDU below — real RNS
 // computes them differently (Resource.sdu doesn't use this AES-block-
-// rounded formula at all, see below), a distinction easy to miss since both
-// are "the per-packet payload budget" in spirit. Conflating them silently
-// produced a resource part-count mismatch that only showed up once a
-// transfer's part count crossed a boundary where the two formulas disagree
-// (found via live testing with a large multi-segment transfer — small
-// transfers happened to land on the same part count either way).
+// rounded formula at all, see below). Conflating them breaks part counts
+// for a transfer whose size crosses the boundary where the two formulas
+// disagree.
 export const LINK_MDU = Math.floor((500 - 1 - 19 - 48) / 16) * 16 - 1;
 export const RESOURCE_MAPHASH_LEN = 4;
 export const RESOURCE_RANDOM_HASH_LEN = 4;

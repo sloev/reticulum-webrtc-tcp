@@ -85,8 +85,8 @@ export class PropagationNode {
 
     // Matches LXMRouter.announce()/get_propagation_node_app_data(): the
     // announce carries this node's real stamp/peering cost (and an optional
-    // display name) so a sender no longer needs to be told the required cost
-    // out of band — see propagateLXMF()/syncToPeer()'s stampCost/peeringCost
+    // display name) so a sender doesn't need the required cost out of band
+    // — see propagateLXMF()/syncToPeer()'s stampCost/peeringCost
     // auto-detection below.
     announce({ name = null } = {}) {
         const appData = protocol.lxmf_build_propagation_announce_app_data({
@@ -420,8 +420,8 @@ function _decryptEnvelopes(rns, envelopes, source) {
 // request payload — proving `source.identity` is what tells the node which
 // stored messages (filed by *their* recipient's delivery-destination hash)
 // belong to us — and its "/get" response shapes differ slightly (see below).
-// The stored envelope format itself turned out to be identical (confirmed
-// via propagateLXMF() uploading to a real node — see README's Compliance
+// The stored envelope format itself is identical (verified via
+// propagateLXMF() uploading to a real node — see README's Compliance
 // section), so the same decrypt/parse step applies once the envelopes are
 // back.
 //
@@ -433,13 +433,13 @@ function _decryptEnvelopes(rns, envelopes, source) {
 //    envelope bytes, the trailing admission stamp already stripped off.
 // Both are matched here by requesting the exact same shapes — except a real
 // node's request handler processes the "have" (purge) list *before* the
-// "want" (fetch) list within a single request (found by testing against a
-// live node: passing the same list as both, like this project's own
-// PropagationNode intentionally supports, silently purges everything before
-// it can be looked up to serve back — this project's own node was written
-// to fetch first specifically to avoid this footgun, but a real node has
-// the opposite order). So this fetches in one request, then purges what was
-// retrieved in a separate, later one — matching how LXMRouter's own client
+// "want" (fetch) list within a single request: passing the same list as
+// both, like this project's own PropagationNode intentionally supports,
+// would silently purge everything before it could be looked up to serve
+// back (this project's own node fetches first specifically to avoid this
+// footgun, but a real node has the opposite order). So this fetches in one
+// request, then purges what was retrieved in a separate, later one —
+// matching how LXMRouter's own client
 // code (message_list_response/message_get_response) does it.
 export async function syncFromRealPropagationNode(propagationLink, source) {
     if (!source || source.direction !== Destination.IN) {

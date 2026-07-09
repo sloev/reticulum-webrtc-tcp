@@ -1,9 +1,12 @@
-// Manual, throwaway check: a real Python `lxmf`/`rns` process and our JS
-// Reticulum + LXMF implementation exchange genuine LXMF messages over real
-// TCP + HDLC, in both directions, each side validating the other's Ed25519
-// signature. Confirms shared/rns/protocol.js's lxmf_build/lxmf_parse (and the
-// msgpack.js encoder they depend on) aren't just internally self-consistent,
-// but wire-compatible with the actual reference LXMF implementation.
+// Verifies shared/rns/protocol.js's lxmf_build/lxmf_parse (and the
+// msgpack.js encoder they depend on) against a real Python `lxmf`/`rns`
+// process: genuine LXMF messages exchanged over real TCP + HDLC, in both
+// directions, both delivery methods, each side validating the other's
+// Ed25519 signature; also covers compression negotiation and ratchet
+// rotation (see the relevant sections below).
+//
+// Run with: PYLIBS=/path/to/site-packages npm run test:integration:lxmf
+// (requires: pip install --target=$PYLIBS rns lxmf)
 import { spawn } from 'node:child_process';
 import { rmSync } from 'node:fs';
 import { Reticulum, Identity, Destination, Link } from '../shared/rns/index.js';

@@ -1,11 +1,12 @@
-// Manual, throwaway check: a real Python `rns` process and this JS stack
-// establish a genuine RNS.Link over real TCP + HDLC, then exchange both
-// RNS.Channel messages and RNS.Buffer streams in both directions — this
-// project's Channel/Buffer (shared/rns/channel.js, shared/rns/buffer.js)
-// were built to match RNS.Channel's exact wire format (envelope header,
-// windowed delivery via explicit packet proofs, StreamDataMessage framing)
-// specifically so they'd interoperate with a real RNS peer, not just with
-// themselves. This confirms that actually works in both directions.
+// Verifies Channel/Buffer (shared/rns/channel.js, shared/rns/buffer.js)
+// against a real Python `rns` process: a real RNS.Link over real TCP + HDLC,
+// then RNS.Channel messages and RNS.Buffer streams in both directions,
+// confirming this project's envelope header, windowed delivery (explicit
+// packet proofs), and StreamDataMessage framing interoperate with a real
+// RNS peer, not just with themselves.
+//
+// Run with: PYLIBS=/path/to/site-packages npm run test:integration:channel
+// (requires: pip install --target=$PYLIBS rns)
 import { spawn } from 'node:child_process';
 import { rmSync } from 'node:fs';
 import { Reticulum, Identity, Destination, Link } from '../shared/rns/index.js';

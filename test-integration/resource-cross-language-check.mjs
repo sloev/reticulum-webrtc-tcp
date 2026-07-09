@@ -1,13 +1,15 @@
-// Manual, throwaway check: a real Python `rns` process and this JS stack
-// establish a genuine RNS.Link over real TCP + HDLC, then exchange
-// RNS.Resource transfers in both directions — this JS stack's Resource
-// implementation was rewritten to use a fixed-size request window (matching
-// RNS.Resource.request_next()'s algorithm, just without its adaptive rate
-// scaling) specifically so it could interoperate with a real RNS peer,
-// instead of just with itself. This confirms that actually works: a real
-// Python RNS.Resource receiver correctly reassembles data sent by
-// Link.sendResource() here, and this stack's receiver correctly reassembles
-// a real RNS.Resource sent by Python.
+// Verifies Link.sendResource()/Resource receive (shared/rns/index.js,
+// shared/rns/protocol.js's "RNS.Resource" section) against a real Python
+// `rns` process: a real RNS.Link over real TCP + HDLC, then RNS.Resource
+// transfers in both directions — a real RNS.Resource receiver correctly
+// reassembling data sent by Link.sendResource() here (including a
+// multi-segment transfer, and one forcing the sender's own advertisement-
+// hashmap-truncation/HMU path), and this stack's receiver correctly
+// reassembling a real RNS.Resource sender's transfer (including one forcing
+// a receive-side HMU exchange, and a bz2-compressed one).
+//
+// Run with: PYLIBS=/path/to/site-packages npm run test:integration:resource
+// (requires: pip install --target=$PYLIBS rns)
 import { spawn } from 'node:child_process';
 import { rmSync } from 'node:fs';
 import { Reticulum, Identity, Destination, Link } from '../shared/rns/index.js';

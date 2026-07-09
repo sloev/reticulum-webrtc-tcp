@@ -1,16 +1,20 @@
-// Manual, throwaway check: this JS stack's own PropagationNode acts as the
-// *peer* in a node-to-node sync ("/offer" protocol, see propagation.js's
-// syncToPeer()) — offering a message it's holding to a real, unmodified
-// LXMF.LXMRouter propagation node (enable_propagation()), computing a real
-// peering-key proof-of-work at the node's own required peering_cost, and
-// confirming the reference implementation accepts the key, accepts the
-// offer, and stores the synced message (with its original admission stamp
-// still attached and re-validated, exactly like a fresh upload).
+// Verifies syncToPeer()/_onOfferRequest() (shared/rns/propagation.js): this
+// project's own PropagationNode acts as the *peer* in a node-to-node sync
+// ("/offer" protocol) — offering a message it's holding to a real,
+// unmodified LXMF.LXMRouter propagation node (enable_propagation()),
+// computing a real peering-key proof-of-work at the node's own required
+// peering_cost, and confirming the reference implementation accepts the
+// key, accepts the offer, and stores the synced message (with its original
+// admission stamp still attached and re-validated, exactly like a fresh
+// upload).
 //
 // This is the peer-sync counterpart to lxmf-propagation-cross-language-
 // check.mjs's client upload/download checks — same real node, different
 // request path ("/offer" instead of a plain Resource upload, and "/get"
 // with a peering key rather than a client's own request).
+//
+// Run with: PYLIBS=/path/to/site-packages npm run test:integration:lxmf-peer-sync
+// (requires: pip install --target=$PYLIBS rns lxmf)
 import { spawn } from 'node:child_process';
 import { rmSync } from 'node:fs';
 import { Reticulum, Identity, Destination, Link, Interface } from '../shared/rns/index.js';

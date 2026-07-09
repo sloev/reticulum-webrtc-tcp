@@ -602,10 +602,10 @@ export class Link extends EventEmitter {
 
     static DEFAULT_MTU = 500;
 
-    // RNS.Link's real RTT-adaptive keepalive/stale/timeout state machine
-    // (RNS/Link.py), replacing the fixed intervals this used to use — see
-    // _updateKeepalive()/_watchdogTick() below. Values match the Python
-    // constants (seconds); converted to ms at the point of use.
+    // Matches RNS.Link's RTT-adaptive keepalive/stale/timeout state machine
+    // (RNS/Link.py) — see _updateKeepalive()/_watchdogTick() below. Values
+    // match the Python constants (seconds); converted to ms at the point of
+    // use.
     static DEFAULT_PER_HOP_TIMEOUT = 6;
     static ESTABLISHMENT_TIMEOUT_PER_HOP = 6;
     static KEEPALIVE_MAX = 360;
@@ -862,19 +862,20 @@ export class Link extends EventEmitter {
     // peer is transparently decompressed the same way it always was.
     //
     // Payloads larger than one segment's worth (protocol.
-    // RESOURCE_SEGMENT_MAX_SIZE) are split into multiple segments, sent one
-    // at a time (each with its own full advertise/request/part/proof cycle,
-    // linked by a shared "original hash" — see protocol.js's "RNS.Resource"
-    // section) — real RNS peers handle this correctly since they only ever
-    // trust whatever segment size this sender advertises. The receiver's
-    // request window is rate-adaptive, matching RNS.Resource's own growth/
-    // fast-rate-promotion logic (see _growResourceWindow() below) — not yet
-    // implemented: retry-driven window *shrinking* (no per-part retry/
-    // timeout mechanism exists yet), and a segment size much smaller than
-    // real RNS's 1MiB-1 — so *sending* an arbitrarily large payload works,
-    // but *receiving* one bigger than a single segment from a real peer
-    // still doesn't, since that needs HMU packets this project doesn't
-    // implement. See compliance.md for the full parity checklist.
+    // RESOURCE_SEGMENT_MAX_SIZE, matching RNS.Resource.MAX_EFFICIENT_SIZE)
+    // are split into multiple segments, sent one at a time (each with its
+    // own full advertise/request/part/proof cycle, linked by a shared
+    // "original hash" — see protocol.js's "RNS.Resource" section) — real RNS
+    // peers handle this correctly since they only ever trust whatever
+    // segment size this sender advertises. The receiver's request window is
+    // rate-adaptive, matching RNS.Resource's own growth/fast-rate-promotion
+    // logic (see _growResourceWindow() below) and shrinks on a per-part
+    // retry/timeout (see _resourceRetryTick() below). Both directions
+    // truncate an oversized advertisement's hashmap and exchange the rest
+    // via HMU (hashmap update) packets, matching real RNS — see
+    // _onResourceRequest()'s hashmapExhausted handling (send side) and
+    // _onHashmapUpdate() (receive side). See compliance.md for the full
+    // parity checklist.
     sendResource(data, { timeout = 30000, requestId = null, isRequest = false, isResponse = false, autoCompress = true } = {}) {
         if (this.status !== Link.ACTIVE) return Promise.reject(new Error('Link is not active'));
 

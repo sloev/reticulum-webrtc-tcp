@@ -1,9 +1,13 @@
-// Manual, throwaway check: real WebRTC between 3 headless Chromium pages,
-// each running a real Reticulum + Destination (not just a bare WebRTC
-// interface), wired sparsely (1<->2<->3, no direct 1<->3). Signaling is
-// relayed directly by this script (bypassing Nostr, since public relays
-// aren't reachable here). Confirms an announce from page1 reaches page3
-// only via page2's real Reticulum.onPacketReceived rebroadcast logic.
+// Manual check: real WebRTC between 3 headless Chromium pages, each running
+// a real Reticulum + Destination (not just a bare WebRTC interface), wired
+// sparsely (1<->2<->3, no direct 1<->3). Signaling is relayed directly by
+// this script (bypassing Nostr, since public relays aren't reachable here).
+// Confirms an announce from page1 reaches page3 only via page2's real
+// Reticulum.onPacketReceived rebroadcast logic. A minimal smoke test;
+// sparse-mesh-check.mjs covers this more thoroughly (mixed transports, real
+// Python peers included).
+//
+// Run with: node test-integration/manual-webrtc-chain-check.mjs
 import { chromium } from '/opt/node22/lib/node_modules/playwright/index.mjs';
 
 const browser = await chromium.launch({ executablePath: '/opt/pw-browsers/chromium' });

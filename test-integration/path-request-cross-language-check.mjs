@@ -1,12 +1,14 @@
-// Manual, throwaway check: this JS stack's Reticulum.requestPath() now sends
-// RNS.Transport.request_path()'s 3-field form (destination_hash +
-// transport_id + tag) by default — matching real RNS's transport-enabled
-// behavior, using a persistent transportIdentity (compliance.md Phase 4).
-// Confirms a real Python `rns` process's own path_request_handler() parses
-// that 3-field payload correctly (rather than misreading the transport ID
-// bytes as part of the tag, or erroring) and answers with a valid announce
-// for a destination it owns — genuine wire-format interop, not just a
-// byte-exact unit test against a hand-built reference packet.
+// Verifies Reticulum.requestPath() (shared/rns/index.js) against a real
+// Python `rns` process: it sends RNS.Transport.request_path()'s 3-field
+// form (destination_hash + transport_id + tag) by default, matching real
+// RNS's transport-enabled behavior, using a persistent transportIdentity.
+// Confirms the real process's own path_request_handler() parses that
+// 3-field payload correctly (rather than misreading the transport ID bytes
+// as part of the tag, or erroring) and answers with a valid announce for a
+// destination it owns.
+//
+// Run with: PYLIBS=/path/to/site-packages npm run test:integration:path-request
+// (requires: pip install --target=$PYLIBS rns)
 import { spawn } from 'node:child_process';
 import { rmSync } from 'node:fs';
 import { Reticulum } from '../shared/rns/index.js';

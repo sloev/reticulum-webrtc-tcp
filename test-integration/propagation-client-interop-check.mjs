@@ -1,13 +1,15 @@
-// Manual, throwaway check: a real, unmodified LXMF client (LXMF.LXMRouter,
-// no enable_propagation()) syncs a stored message down from this project's
-// own PropagationNode, using the client's real propagation-node sync
-// protocol (set_outbound_propagation_node()/request_messages_from_
-// propagation_node(), the "/get" request path with Link.identify()-based
-// auth) rather than this project's JS-only syncLXMF() scheme. Exercises
-// PropagationNode._onRealGetRequest() (shared/rns/propagation.js) — the
-// counterpart to syncFromRealPropagationNode(), which already covers this
-// stack acting as the client against a real node (see
-// lxmf-propagation-cross-language-check.mjs).
+// Verifies PropagationNode._onRealGetRequest() (shared/rns/propagation.js)
+// against a real, unmodified LXMF client (LXMF.LXMRouter, no
+// enable_propagation()): it syncs a message stored on this project's own
+// PropagationNode using the client's real propagation-node sync protocol
+// (set_outbound_propagation_node()/request_messages_from_propagation_node(),
+// the "/get" request path with Link.identify()-based auth) rather than this
+// project's JS-only syncLXMF() scheme — the counterpart to
+// syncFromRealPropagationNode(), which covers this stack acting as the
+// client against a real node (see lxmf-propagation-cross-language-check.mjs).
+//
+// Run with: PYLIBS=/path/to/site-packages npm run test:integration:propagation-client
+// (requires: pip install --target=$PYLIBS rns lxmf)
 import { spawn } from 'node:child_process';
 import { rmSync } from 'node:fs';
 import { Reticulum, Identity, Destination, Link, Interface } from '../shared/rns/index.js';
@@ -158,7 +160,7 @@ await propagation.propagateLXMF(senderLink, destOut, senderSelf, 'real client in
 senderLink.close();
 assertTrue(propNode.messages.size === 1, `PropagationNode is holding the uploaded message (count=${propNode.messages.size})`);
 
-// The real client now selects our node and syncs — exercising
+// The real client selects our node and syncs — exercising
 // _onRealGetRequest()'s list/fetch/purge handling of the exact request
 // shapes LXMRouter.message_get_request()/message_list_response()/
 // message_get_response() send.
