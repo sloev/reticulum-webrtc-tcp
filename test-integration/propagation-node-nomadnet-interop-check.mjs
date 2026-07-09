@@ -264,6 +264,16 @@ assertTrue(nomadReceived, `NomadNet received and stored the JS message synced th
 jsSelf.announce();
 await new Promise((r) => setTimeout(r, 2000));
 
+// The real LXMRouter node prunes a propagation entry from its store once a
+// client has synced it (confirmed live: after NomadNet's sync above, the
+// store's count dropped back from 1 to 0) — so the store's raw count isn't
+// a reliable signal for "NomadNet's new message arrived" here. Track keys
+// instead: record what's in the store right before triggering the send,
+// then wait for a key that wasn't there before.
+node.stdin.write(`${JSON.stringify({ cmd: 'check_store' })}\n`);
+const storeBeforeNomadSend = await waitForNextNode((m) => m.event === 'store_status', 5000);
+const keysBeforeNomadSend = new Set(storeBeforeNomadSend.keys);
+
 nomad.stdin.write(`${JSON.stringify({ cmd: 'send_propagated', dest_hash: crypto.bytesToHex(jsSelf.hash), title: 'nomadnet via real node', content: 'hello js, relayed the other way through the same real propagation node' })}\n`);
 
 console.log("waiting for the real node's store to gain the NomadNet-uploaded message (real LXStamper PoW, even at LXMRouter.PROPAGATION_COST_MIN, can take several minutes in pure Python)...");
@@ -271,13 +281,13 @@ let nodeGotNomadMessage = false;
 for (let i = 0; i < 1200; i++) {
   node.stdin.write(`${JSON.stringify({ cmd: 'check_store' })}\n`);
   const status = await waitForNextNode((m) => m.event === 'store_status', 5000);
-  if (status.count >= 2) { nodeGotNomadMessage = true; break; }
+  if (status.keys.some((k) => !keysBeforeNomadSend.has(k))) { nodeGotNomadMessage = true; break; }
   if (i % 10 === 0) {
     nomad.stdin.write(`${JSON.stringify({ cmd: 'debug_status' })}\n`);
   }
   await new Promise((r) => setTimeout(r, 1000));
 }
-assertTrue(nodeGotNomadMessage, "the real node's store gained a second message (NomadNet's PROPAGATED send)");
+assertTrue(nodeGotNomadMessage, "the real node's store gained a new message (NomadNet's PROPAGATED send)");
 
 const downloadLink = new Link(rns, nodeOutFromJs);
 await new Promise((resolve) => downloadLink.once('established', resolve));
