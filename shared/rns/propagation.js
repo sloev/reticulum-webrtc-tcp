@@ -155,6 +155,15 @@ export class PropagationNode {
         }
     }
 
+    // Two request shapes arrive at "/get", distinguished by element count:
+    //
+    // Real LXMF clients (LXMPeer.MESSAGE_GET_PATH, handled by
+    // LXMRouter.message_get_request(), LXMRouter.py:1426) send 2-3 elements
+    // — [null, null] to list, [wants, haves(, transfer_limit_kb)] to
+    // fetch/purge — authenticated by Link.identify(). Handled by
+    // _onRealGetRequest() below.
+    //
+    // This project's own syncLXMF() sends 4 elements:
     // [wantList, haveList, sourceHash, proof]. sourceHash/proof authenticate
     // the requester as the owner of that destination hash (proof = their
     // real identity's Ed25519 signature over linkId+sourceHash) — without
@@ -163,7 +172,8 @@ export class PropagationNode {
     // wantList == null && haveList == null lists available messages instead
     // of fetching/purging any.
     _onGetRequest(data, link) {
-        if (!Array.isArray(data) || data.length < 4) return null;
+        if (!Array.isArray(data)) return null;
+        if (data.length <= 3) return this._onRealGetRequest(data, link);
         const [wantList, haveList, sourceHash, proof] = data;
         if (!(sourceHash instanceof Uint8Array) || !(proof instanceof Uint8Array)) return null;
 
@@ -209,6 +219,72 @@ export class PropagationNode {
             }
         }
 
+        return response;
+    }
+
+    // Matches LXMRouter.message_get_request() (LXMRouter.py:1426-1504), the
+    // handler an unmodified LXMF client's propagation-node sync talks to.
+    // The requester is authenticated by Link.identify(); its lxmf.delivery
+    // destination hash is derived from the identified identity, and only
+    // messages addressed to that hash are listed, served, or purged.
+    //  - [null, null] lists stored transient_ids, smallest message first.
+    //  - [wants, haves(, transfer_limit_kb)] purges `haves`, then returns
+    //    the wanted envelopes (admission stamps stripped, matching
+    //    lxmf_data[:-STAMP_SIZE]) within the client's transfer limit.
+    // Returns LXMPeer.ERROR_NO_IDENTITY (0xf0) if the link was never
+    // identified.
+    _onRealGetRequest(data, link) {
+        const remoteIdentity = link.getRemoteIdentity();
+        if (!remoteIdentity) return 0xf0;
+        const remoteDeliveryHex = crypto.bytesToHex(
+            protocol.get_identity_destination_hash(remoteIdentity.public, 'lxmf.delivery')
+        );
+
+        const [wants, haves, transferLimitKb] = data;
+
+        if (wants == null && haves == null) {
+            const available = [];
+            for (const [key, entry] of this.messages.entries()) {
+                if (crypto.bytesToHex(entry.destinationHash) === remoteDeliveryHex) {
+                    available.push([crypto.hexToBytes(key), entry.envelope.length]);
+                }
+            }
+            available.sort((a, b) => a[1] - b[1]);
+            return available.map(([transientId]) => transientId);
+        }
+
+        if (Array.isArray(haves)) {
+            for (const transientId of haves) {
+                if (!(transientId instanceof Uint8Array)) continue;
+                const key = crypto.bytesToHex(transientId);
+                const entry = this.messages.get(key);
+                if (entry && crypto.bytesToHex(entry.destinationHash) === remoteDeliveryHex) {
+                    this.messages.delete(key);
+                }
+            }
+        }
+
+        const response = [];
+        if (Array.isArray(wants)) {
+            // Cumulative-size accounting matches LXMRouter.py:1476-1494:
+            // 24 bytes of assumed structure overhead plus 16 per message,
+            // skipping (not truncating) anything that would cross the
+            // client's declared limit. Python measures lxm_size from the
+            // on-disk file, which still has the admission stamp attached;
+            // this store keeps the stamp separately (see _onUpload), so add
+            // it back in for a size estimate that matches.
+            const transferLimit = typeof transferLimitKb === 'number' ? transferLimitKb * 1000 : null;
+            let cumulativeSize = 24;
+            for (const transientId of wants) {
+                if (!(transientId instanceof Uint8Array)) continue;
+                const entry = this.messages.get(crypto.bytesToHex(transientId));
+                if (!entry || crypto.bytesToHex(entry.destinationHash) !== remoteDeliveryHex) continue;
+                const nextSize = cumulativeSize + entry.envelope.length + stamp.STAMP_SIZE + 16;
+                if (transferLimit !== null && nextSize > transferLimit) continue;
+                response.push(entry.envelope);
+                cumulativeSize = nextSize;
+            }
+        }
         return response;
     }
 
