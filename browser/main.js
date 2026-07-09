@@ -69,8 +69,12 @@ console.log('My Public Key:', crypto.bytesToHex(identity.public));
 log('system', `Your RID is ${ridHex}`);
 log('system', 'Announcing every 10s and connecting to Nostr relays for signaling…');
 
-// Track peers we've received an announce from, keyed by RID hex.
-const knownPeers = new Set();
+// Peers we've received an announce from, keyed by RID hex, storing the
+// announced public key — needed to build a correct OUT Destination for
+// establishing a Link to them (Link.onProof() validates the responder's
+// proof signature against destination.identity.public, so this must be
+// the peer's own public key, not the local identity's).
+const knownPeers = new Map();
 
 const renderKnownPeers = () => {
   knownCountEl.textContent = knownPeers.size;
@@ -82,7 +86,7 @@ const renderKnownPeers = () => {
     knownPeersEl.appendChild(hint);
     return;
   }
-  for (const rid of knownPeers) {
+  for (const rid of knownPeers.keys()) {
     const chip = document.createElement('button');
     chip.type = 'button';
     chip.className = 'peer-chip';
@@ -98,7 +102,7 @@ const renderKnownPeers = () => {
 rns.on('announce', (announce) => {
   const rid = crypto.bytesToHex(announce.destination_hash);
   if (rid === ridHex || knownPeers.has(rid)) return;
-  knownPeers.add(rid);
+  knownPeers.set(rid, announce.public_key);
   log('system', `Announce received from ${rid.slice(0, 12)}…`);
   renderKnownPeers();
 });
@@ -170,9 +174,7 @@ function getOrCreateChatLink(toHex) {
     });
   }
 
-  const toHash = crypto.hexToBytes(toHex);
-  const outDest = new Destination(rns, identity, Destination.OUT, Destination.SINGLE, 'webrtc_demo', 'chat');
-  outDest.hash = toHash;
+  const outDest = new Destination(rns, { public: knownPeers.get(toHex) }, Destination.OUT, Destination.SINGLE, 'webrtc_demo', 'chat');
 
   const link = new Link(rns, outDest);
   outgoingLinks.set(toHex, link);
