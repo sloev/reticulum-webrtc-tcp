@@ -9,6 +9,7 @@ if (typeof globalThis.Buffer === 'undefined') globalThis.Buffer = Buffer;
 import { Reticulum, Destination, Identity, Link } from '../shared/rns/index.js';
 import { WebRTCBrowser } from './webrtc-browser.js';
 import * as crypto from '../shared/rns/crypto.js';
+import { get_identity_destination_hash } from '../shared/rns/protocol.js';
 
 // Chat messages are sent as a Channel message over an established Link, not
 // as one-shot LXMF packets — this is what actually exercises Link/Channel's
@@ -146,7 +147,12 @@ dest.on('link', (link) => {
   log('system', 'Incoming chat link established');
   let fromRid = null;
   link.on('remote-identified', (remoteIdentity) => {
-    fromRid = crypto.bytesToHex(remoteIdentity.hash).slice(0, 12);
+    // remoteIdentity.hash is the raw identity hash, not this chat
+    // destination's RID (get_identity_destination_hash salts it with the
+    // app/aspect name) — derive the same RID shown everywhere else in the
+    // UI so a received message's "from" matches the sender's own RID.
+    const remoteRid = get_identity_destination_hash(remoteIdentity.public, 'webrtc_demo.chat');
+    fromRid = crypto.bytesToHex(remoteRid).slice(0, 12);
   });
   link.getChannel().addMessageHandler((msgtype, data) => {
     if (msgtype !== CHAT_MSGTYPE) return false;
